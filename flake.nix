@@ -35,19 +35,19 @@
       }: let
         /*
         Toolchain selection:
-        - This uses rust-overlay's latest stable channel.
-        - `default` profile includes rustc, cargo, rustfmt, and clippy.
+        - Load the Rust toolchain from `rust-toolchain.toml` so Nix and rustup
+          users share the same channel/components.
         */
         rustPkgs = import inputs.nixpkgs {
           inherit system;
           overlays = [inputs.rust-overlay.overlays.default];
         };
-        toolchain = rustPkgs.rust-bin.stable.latest.default;
+        toolchain = rustPkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
         rustc = toolchain;
         cargo = toolchain;
         rustfmt = toolchain;
         clippy = toolchain;
-        analyzer = pkgs.rust-analyzer;
+        analyzer = toolchain;
 
         # Helpful extras—adjust to taste
         cargoComponents = with pkgs; [
@@ -57,9 +57,6 @@
           cargo-audit
           pkg-config
         ];
-
-        # Displayed in the shell greeting
-        rustVersion = rustc.version;
       in {
         # Pre-commit hooks configuration (mirrors your Python setup’s style)
         pre-commit.settings = {
@@ -99,7 +96,7 @@
             # Ensure cargo/rustc/clippy all resolve from the same pinned toolchain.
             export PATH=${toolchain}/bin:$PATH
             ${config.pre-commit.installationScript}
-            echo 1>&2 "Welcome to the development shell (Rust ${rustVersion})!"
+            echo 1>&2 "Welcome to the development shell ($( ${rustc}/bin/rustc --version ))!"
             echo 1>&2 "  - rustc:   $(${pkgs.coreutils}/bin/printf '%s' "$(${rustc}/bin/rustc --version)")"
             echo 1>&2 "  - cargo:   $(${pkgs.coreutils}/bin/printf '%s' "$(${cargo}/bin/cargo --version)")"
             echo 1>&2 "  - clippy:  $(${pkgs.coreutils}/bin/printf '%s' "$(${clippy}/bin/cargo-clippy --version 2>/dev/null || echo 'available via cargo clippy')")"
