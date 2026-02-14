@@ -135,3 +135,10 @@ What We Are Building
   - [x] Expand `crates/codex_app_server` with initialize/session/thread lifecycle primitives.
   - [x] Add deterministic mapping for turn start/delta/complete and approval-required runtime events.
   - [x] Implement abort + replay-tested resume behavior for interrupted turns.
+
+  Current Sprint (M5 Kickoff)
+
+  - [x] Implement `crabbot codex` CLI workflows: `start`, `resume`, `interrupt`, and `status`.
+  - [x] Add local CLI config/auth management for API/daemon endpoints and auth token persistence.
+  - [ ] Replace local attach mirroring with real daemon stream integration.
+  - [ ] Add end-to-end CLI-to-daemon and CLI-to-API happy path tests.
