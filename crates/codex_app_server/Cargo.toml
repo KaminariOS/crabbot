@@ -1,0 +1,10 @@
+[package]
+name = "crabbot_codex_app_server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+url.workspace = true

@@ -70,8 +70,20 @@
             alejandra.enable = true;
 
             # Rust format/lints
-            rustfmt.enable = true;
-            clippy.enable = true;
+            rustfmt = {
+              enable = true;
+              packageOverrides = {
+                cargo = toolchain;
+                rustfmt = toolchain;
+              };
+            };
+            clippy = {
+              enable = true;
+              packageOverrides = {
+                cargo = toolchain;
+                clippy = toolchain;
+              };
+            };
 
             # Optional: run a fast build check (uncomment if desired)
             # cargo-check.enable = true;
@@ -84,6 +96,8 @@
         # Dev shell with shellHook installing pre-commit
         devShells.default = pkgs.mkShell {
           shellHook = ''
+            # Ensure cargo/rustc/clippy all resolve from the same pinned toolchain.
+            export PATH=${toolchain}/bin:$PATH
             ${config.pre-commit.installationScript}
             echo 1>&2 "Welcome to the development shell (Rust ${rustVersion})!"
             echo 1>&2 "  - rustc:   $(${pkgs.coreutils}/bin/printf '%s' "$(${rustc}/bin/rustc --version)")"

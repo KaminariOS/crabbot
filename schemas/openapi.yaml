@@ -1,0 +1,221 @@
+openapi: 3.1.0
+info:
+  title: Crabbot API
+  version: 0.1.0
+  description: Contract source for Crabbot Rust API + RN client generation.
+servers:
+  - url: https://api.crabbot.local
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: API health probe
+      responses:
+        '200':
+          description: Service health
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HealthResponse'
+  /auth/login:
+    post:
+      operationId: postAuthLogin
+      summary: Exchange upstream token for Crabbot session credentials
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/LoginRequest'
+      responses:
+        '200':
+          description: Login success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid credentials
+  /auth/refresh:
+    post:
+      operationId: postAuthRefresh
+      summary: Refresh session token
+      responses:
+        '501':
+          description: Refresh stub is not implemented yet
+components:
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, service, version]
+      properties:
+        status:
+          type: string
+          enum: [ok]
+        service:
+          type: string
+        version:
+          type: string
+    LoginRequest:
+      type: object
+      required: [provider, access_token]
+      properties:
+        provider:
+          type: string
+        access_token:
+          type: string
+    LoginResponse:
+      type: object
+      required: [user_id, session_token, refresh_token, expires_at_unix_ms]
+      properties:
+        user_id:
+          type: string
+        session_token:
+          type: string
+        refresh_token:
+          type: string
+        expires_at_unix_ms:
+          type: integer
+          format: uint64
+    WebSocketEnvelope:
+      type: object
+      required: [sequence, event]
+      properties:
+        sequence:
+          type: integer
+          format: uint64
+        event:
+          $ref: '#/components/schemas/ApiEvent'
+    ApiEvent:
+      oneOf:
+        - $ref: '#/components/schemas/SessionCreatedEvent'
+        - $ref: '#/components/schemas/SessionUpdatedEvent'
+        - $ref: '#/components/schemas/MessageAppendedEvent'
+        - $ref: '#/components/schemas/TurnStreamDeltaEvent'
+        - $ref: '#/components/schemas/TurnCompletedEvent'
+        - $ref: '#/components/schemas/ApprovalRequiredEvent'
+        - $ref: '#/components/schemas/HeartbeatEvent'
+      discriminator:
+        propertyName: type
+    SessionCreatedEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [session_created]
+        payload:
+          type: object
+          required: [session_id, machine_id, created_at_unix_ms]
+          properties:
+            session_id:
+              type: string
+            machine_id:
+              type: string
+            created_at_unix_ms:
+              type: integer
+              format: uint64
+    SessionUpdatedEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [session_updated]
+        payload:
+          type: object
+          required: [session_id, optimistic_version, state]
+          properties:
+            session_id:
+              type: string
+            optimistic_version:
+              type: integer
+              format: uint64
+            state:
+              type: string
+    MessageAppendedEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [message_appended]
+        payload:
+          type: object
+          required: [session_id, message_id, role, ciphertext]
+          properties:
+            session_id:
+              type: string
+            message_id:
+              type: string
+            role:
+              type: string
+            ciphertext:
+              type: string
+    TurnStreamDeltaEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [turn_stream_delta]
+        payload:
+          type: object
+          required: [session_id, turn_id, delta]
+          properties:
+            session_id:
+              type: string
+            turn_id:
+              type: string
+            delta:
+              type: string
+    TurnCompletedEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [turn_completed]
+        payload:
+          type: object
+          required: [session_id, turn_id, output_message_id]
+          properties:
+            session_id:
+              type: string
+            turn_id:
+              type: string
+            output_message_id:
+              type: string
+    ApprovalRequiredEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [approval_required]
+        payload:
+          type: object
+          required: [session_id, turn_id, approval_id, action_kind]
+          properties:
+            session_id:
+              type: string
+            turn_id:
+              type: string
+            approval_id:
+              type: string
+            action_kind:
+              type: string
+    HeartbeatEvent:
+      type: object
+      required: [type, payload]
+      properties:
+        type:
+          type: string
+          enum: [heartbeat]
+        payload:
+          type: object
+          required: [unix_ms]
+          properties:
+            unix_ms:
+              type: integer
+              format: uint64

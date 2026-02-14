@@ -1,0 +1,12 @@
+{
+  "name": "@crabbot/api-client",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "generate": "node ./scripts/generate.mjs"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.10.1"
+  }
+}
