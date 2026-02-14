@@ -192,7 +192,11 @@ fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
     {
         bail!("session_id cannot be empty");
     }
-    let daemon_session = daemon_start_session(&state.config.daemon_endpoint, args.session_id)?;
+    let daemon_session = daemon_start_session(
+        &state.config.daemon_endpoint,
+        args.session_id,
+        state.config.auth_token.as_deref(),
+    )?;
     persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
@@ -211,7 +215,11 @@ fn handle_resume(args: SessionArgs, state: &mut CliState) -> Result<Value> {
     if args.session_id.trim().is_empty() {
         bail!("session_id cannot be empty");
     }
-    let daemon_session = daemon_resume_session(&state.config.daemon_endpoint, &args.session_id)?;
+    let daemon_session = daemon_resume_session(
+        &state.config.daemon_endpoint,
+        &args.session_id,
+        state.config.auth_token.as_deref(),
+    )?;
     persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
@@ -228,7 +236,11 @@ fn handle_interrupt(args: SessionArgs, state: &mut CliState) -> Result<Value> {
     if args.session_id.trim().is_empty() {
         bail!("session_id cannot be empty");
     }
-    let daemon_session = daemon_interrupt_session(&state.config.daemon_endpoint, &args.session_id)?;
+    let daemon_session = daemon_interrupt_session(
+        &state.config.daemon_endpoint,
+        &args.session_id,
+        state.config.auth_token.as_deref(),
+    )?;
     persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
@@ -243,13 +255,20 @@ fn handle_interrupt(args: SessionArgs, state: &mut CliState) -> Result<Value> {
 
 fn handle_status(args: StatusArgs, state: &mut CliState) -> Result<Value> {
     let api_health = if args.check_api {
-        Some(fetch_api_health(&state.config.api_endpoint)?)
+        Some(fetch_api_health(
+            &state.config.api_endpoint,
+            state.config.auth_token.as_deref(),
+        )?)
     } else {
         None
     };
 
     if let Some(session_id) = args.session_id {
-        let daemon_session = daemon_get_session_status(&state.config.daemon_endpoint, &session_id)?;
+        let daemon_session = daemon_get_session_status(
+            &state.config.daemon_endpoint,
+            &session_id,
+            state.config.auth_token.as_deref(),
+        )?;
         persist_daemon_session(state, &daemon_session)?;
         return Ok(json!({
             "ok": true,
@@ -277,7 +296,11 @@ fn handle_attach(args: SessionArgs, state: &mut CliState) -> Result<Value> {
         bail!("session_id cannot be empty");
     }
 
-    let stream_events = fetch_daemon_stream(&state.config.daemon_endpoint, &args.session_id)?;
+    let stream_events = fetch_daemon_stream(
+        &state.config.daemon_endpoint,
+        &args.session_id,
+        state.config.auth_token.as_deref(),
+    )?;
     if let Some(latest_state) = stream_events
         .iter()
         .rev()
@@ -402,11 +425,22 @@ fn endpoint_url(base: &str, path: &str) -> String {
     )
 }
 
-fn fetch_api_health(api_endpoint: &str) -> Result<HealthResponse> {
+fn apply_auth(
+    request: reqwest::blocking::RequestBuilder,
+    auth_token: Option<&str>,
+) -> reqwest::blocking::RequestBuilder {
+    if let Some(token) = auth_token {
+        if !token.trim().is_empty() {
+            return request.bearer_auth(token);
+        }
+    }
+    request
+}
+
+fn fetch_api_health(api_endpoint: &str, auth_token: Option<&str>) -> Result<HealthResponse> {
     let client = http_client()?;
     let url = endpoint_url(api_endpoint, "/health");
-    let response = client
-        .get(url)
+    let response = apply_auth(client.get(url), auth_token)
         .send()
         .context("request api health")?
         .error_for_status()
@@ -419,11 +453,11 @@ fn fetch_api_health(api_endpoint: &str) -> Result<HealthResponse> {
 fn daemon_start_session(
     daemon_endpoint: &str,
     session_id: Option<String>,
+    auth_token: Option<&str>,
 ) -> Result<DaemonSessionStatusResponse> {
     let client = http_client()?;
     let url = endpoint_url(daemon_endpoint, "/v1/sessions/start");
-    let response = client
-        .post(url)
+    let response = apply_auth(client.post(url), auth_token)
         .json(&DaemonStartSessionRequest { session_id })
         .send()
         .context("request daemon session start")?
@@ -437,12 +471,12 @@ fn daemon_start_session(
 fn daemon_resume_session(
     daemon_endpoint: &str,
     session_id: &str,
+    auth_token: Option<&str>,
 ) -> Result<DaemonSessionStatusResponse> {
     let client = http_client()?;
     let path = format!("/v1/sessions/{session_id}/resume");
     let url = endpoint_url(daemon_endpoint, &path);
-    let response = client
-        .post(url)
+    let response = apply_auth(client.post(url), auth_token)
         .send()
         .context("request daemon session resume")?
         .error_for_status()
@@ -455,12 +489,12 @@ fn daemon_resume_session(
 fn daemon_interrupt_session(
     daemon_endpoint: &str,
     session_id: &str,
+    auth_token: Option<&str>,
 ) -> Result<DaemonSessionStatusResponse> {
     let client = http_client()?;
     let path = format!("/v1/sessions/{session_id}/interrupt");
     let url = endpoint_url(daemon_endpoint, &path);
-    let response = client
-        .post(url)
+    let response = apply_auth(client.post(url), auth_token)
         .send()
         .context("request daemon session interrupt")?
         .error_for_status()
@@ -473,12 +507,12 @@ fn daemon_interrupt_session(
 fn daemon_get_session_status(
     daemon_endpoint: &str,
     session_id: &str,
+    auth_token: Option<&str>,
 ) -> Result<DaemonSessionStatusResponse> {
     let client = http_client()?;
     let path = format!("/v1/sessions/{session_id}/status");
     let url = endpoint_url(daemon_endpoint, &path);
-    let response = client
-        .get(url)
+    let response = apply_auth(client.get(url), auth_token)
         .send()
         .context("request daemon session status")?
         .error_for_status()
@@ -491,12 +525,12 @@ fn daemon_get_session_status(
 fn fetch_daemon_stream(
     daemon_endpoint: &str,
     session_id: &str,
+    auth_token: Option<&str>,
 ) -> Result<Vec<DaemonStreamEnvelope>> {
     let client = http_client()?;
     let path = format!("/v1/sessions/{session_id}/stream");
     let url = endpoint_url(daemon_endpoint, &path);
-    let body = client
-        .get(url)
+    let body = apply_auth(client.get(url), auth_token)
         .send()
         .context("request daemon stream")?
         .error_for_status()
@@ -577,8 +611,34 @@ mod tests {
         serde_json::from_str(&output).expect("parse command output")
     }
 
+    #[derive(Debug)]
+    struct MockExpectation {
+        request_line: String,
+        status_line: String,
+        content_type: String,
+        body: String,
+        auth_token: Option<String>,
+    }
+
+    fn assert_auth_header(request: &str, auth_token: Option<&str>) {
+        let auth_line = request
+            .lines()
+            .find(|line| line.to_ascii_lowercase().starts_with("authorization:"));
+        match auth_token {
+            Some(token) => {
+                let actual = auth_line.expect("missing authorization header");
+                assert_eq!(actual, format!("authorization: Bearer {token}"));
+            }
+            None => assert!(
+                auth_line.is_none(),
+                "unexpected authorization header: {auth_line:?}"
+            ),
+        }
+    }
+
     fn spawn_mock_get_server(
         expected_path: &str,
+        expected_auth_token: Option<&str>,
         content_type: &str,
         body: String,
     ) -> (String, JoinHandle<()>) {
@@ -586,6 +646,7 @@ mod tests {
         let addr = listener.local_addr().expect("mock server local addr");
         let expected_request_line = format!("GET {expected_path} HTTP/1.1");
         let content_type = content_type.to_string();
+        let expected_auth_token = expected_auth_token.map(|token| token.to_string());
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept mock request");
             let mut buffer = [0_u8; 8 * 1024];
@@ -593,6 +654,7 @@ mod tests {
             let request = String::from_utf8_lossy(&buffer[..read]);
             let first_line = request.lines().next().unwrap_or_default();
             assert_eq!(first_line, expected_request_line);
+            assert_auth_header(&request, expected_auth_token.as_deref());
 
             let response = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -607,23 +669,25 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
-    fn spawn_mock_sequence_server(
-        expectations: Vec<(String, String, String, String)>,
-    ) -> (String, JoinHandle<()>) {
+    fn spawn_mock_sequence_server(expectations: Vec<MockExpectation>) -> (String, JoinHandle<()>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sequence server");
         let addr = listener.local_addr().expect("mock server local addr");
         let handle = std::thread::spawn(move || {
-            for (expected_request_line, status_line, content_type, body) in expectations {
+            for expectation in expectations {
                 let (mut stream, _) = listener.accept().expect("accept mock request");
                 let mut buffer = [0_u8; 8 * 1024];
                 let read = stream.read(&mut buffer).expect("read request");
                 let request = String::from_utf8_lossy(&buffer[..read]);
                 let first_line = request.lines().next().unwrap_or_default();
-                assert_eq!(first_line, expected_request_line);
+                assert_eq!(first_line, expectation.request_line);
+                assert_auth_header(&request, expectation.auth_token.as_deref());
 
                 let response = format!(
-                    "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                    body.len()
+                    "{}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    expectation.status_line,
+                    expectation.content_type,
+                    expectation.body.len(),
+                    expectation.body,
                 );
                 stream
                     .write_all(response.as_bytes())
@@ -638,35 +702,40 @@ mod tests {
     #[test]
     fn start_interrupt_resume_and_status_roundtrip() {
         let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_m5";
         let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
-            (
-                "POST /v1/sessions/start HTTP/1.1".to_string(),
-                "HTTP/1.1 201 Created".to_string(),
-                "application/json".to_string(),
-                r#"{"session_id":"sess_cli_1","state":"active","last_event":"started","updated_at_unix_ms":10}"#
+            MockExpectation {
+                request_line: "POST /v1/sessions/start HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 201 Created".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_cli_1","state":"active","last_event":"started","updated_at_unix_ms":10}"#
                     .to_string(),
-            ),
-            (
-                "POST /v1/sessions/sess_cli_1/interrupt HTTP/1.1".to_string(),
-                "HTTP/1.1 200 OK".to_string(),
-                "application/json".to_string(),
-                r#"{"session_id":"sess_cli_1","state":"interrupted","last_event":"interrupted","updated_at_unix_ms":20}"#
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "POST /v1/sessions/sess_cli_1/interrupt HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_cli_1","state":"interrupted","last_event":"interrupted","updated_at_unix_ms":20}"#
                     .to_string(),
-            ),
-            (
-                "POST /v1/sessions/sess_cli_1/resume HTTP/1.1".to_string(),
-                "HTTP/1.1 200 OK".to_string(),
-                "application/json".to_string(),
-                r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":30}"#
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "POST /v1/sessions/sess_cli_1/resume HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":30}"#
                     .to_string(),
-            ),
-            (
-                "GET /v1/sessions/sess_cli_1/status HTTP/1.1".to_string(),
-                "HTTP/1.1 200 OK".to_string(),
-                "application/json".to_string(),
-                r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":31}"#
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "GET /v1/sessions/sess_cli_1/status HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":31}"#
                     .to_string(),
-            ),
+                auth_token: Some(auth_token.to_string()),
+            },
         ]);
 
         let _ = run_json(
@@ -676,7 +745,7 @@ mod tests {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: None,
                             daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: None,
+                            auth_token: Some(auth_token.to_string()),
                             clear_auth_token: false,
                         }),
                     }),
@@ -781,6 +850,7 @@ mod tests {
     #[test]
     fn attach_uses_daemon_stream_and_status_can_check_api_health() {
         let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_attach";
 
         let daemon_events = vec![
             DaemonStreamEnvelope {
@@ -815,11 +885,13 @@ mod tests {
             + "\n";
         let (daemon_endpoint, daemon_handle) = spawn_mock_get_server(
             "/v1/sessions/sess_cli_attach/stream",
+            Some(auth_token),
             "application/x-ndjson",
             daemon_body,
         );
         let (api_endpoint, api_handle) = spawn_mock_get_server(
             "/health",
+            Some(auth_token),
             "application/json",
             r#"{"status":"ok","service":"mock_api","version":"1.2.3"}"#.to_string(),
         );
@@ -831,7 +903,7 @@ mod tests {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: Some(api_endpoint),
                             daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: None,
+                            auth_token: Some(auth_token.to_string()),
                             clear_auth_token: false,
                         }),
                     }),

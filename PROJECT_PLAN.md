@@ -145,3 +145,4 @@ What We Are Building
   - [x] Route CLI `start`/`resume`/`interrupt` through daemon control endpoints with persisted local status cache.
   - [x] Route CLI `status --session-id ...` through daemon status endpoint with cache refresh semantics.
   - [x] Refresh local status cache from daemon stream session-state events during `attach`.
+  - [x] Forward configured CLI auth token as `Authorization: Bearer` on daemon and API control requests.
