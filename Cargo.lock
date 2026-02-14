@@ -184,6 +184,10 @@ dependencies = [
 [[package]]
 name = "crabbot_storage"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "thiserror",
+]
 
 [[package]]
 name = "crypto-common"

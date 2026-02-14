@@ -119,3 +119,10 @@ What We Are Building
   - [x] Build codex_app_server crate skeleton with connection smoke test.
   - [x] Create RN API client package from OpenAPI generation.
   - [x] Create milestone issues M0-M8 with acceptance criteria.
+
+  Current Sprint (M3 Kickoff)
+
+  - [x] Implement storage domain records and in-memory adapters for accounts/sessions/messages/machines/artifacts.
+  - [x] Add clear presence and object storage adapters for reliability-layer integration points.
+  - [x] Enforce `Idempotency-Key` replay semantics on write APIs for sessions/messages with conflict detection.
+  - [ ] Add load/soak harness for websocket fanout and retry-heavy traffic patterns.

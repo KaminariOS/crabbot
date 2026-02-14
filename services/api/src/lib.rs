@@ -50,6 +50,18 @@ struct AuthSession {
     expires_at_unix_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct IdempotentCreateSession {
+    request_fingerprint: String,
+    response: CreateSessionResponse,
+}
+
+#[derive(Debug, Clone)]
+struct IdempotentAppendMessage {
+    request_fingerprint: String,
+    response: AppendMessageResponse,
+}
+
 #[derive(Default)]
 struct InMemoryStore {
     next_session_id: u64,
@@ -59,6 +71,8 @@ struct InMemoryStore {
     session_token_by_refresh_token: HashMap<String, String>,
     sessions_by_user: HashMap<String, Vec<Session>>,
     messages_by_session: HashMap<String, Vec<Message>>,
+    create_session_idempotency_by_user: HashMap<String, HashMap<String, IdempotentCreateSession>>,
+    append_message_idempotency_by_user: HashMap<String, HashMap<String, IdempotentAppendMessage>>,
     sequence_by_user: HashMap<String, u64>,
     event_log_by_user: HashMap<String, Vec<WebSocketEnvelope>>,
     realtime_by_user: HashMap<String, broadcast::Sender<WebSocketEnvelope>>,
@@ -215,6 +229,18 @@ fn parse_if_match(headers: &HeaderMap) -> Result<Option<u64>, StatusCode> {
     Ok(Some(parsed))
 }
 
+fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, StatusCode> {
+    let Some(value) = headers.get("idempotency-key") else {
+        return Ok(None);
+    };
+    let raw = value.to_str().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let normalized = raw.trim();
+    if normalized.is_empty() || normalized.len() > 128 {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok(Some(normalized.to_string()))
+}
+
 async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Authenticated, StatusCode> {
     let token = bearer_token(headers).ok_or(StatusCode::UNAUTHORIZED)?;
     authenticate_token(token, state).await
@@ -368,12 +394,27 @@ async fn create_session(
     headers: HeaderMap,
     Json(payload): Json<CreateSessionRequest>,
 ) -> Result<(StatusCode, Json<CreateSessionResponse>), StatusCode> {
+    let idempotency_key = parse_idempotency_key(&headers)?;
     let auth = authenticate(&headers, &state).await?;
     if payload.machine_id.trim().is_empty() || payload.title_ciphertext.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let request_fingerprint = format!("{}|{}", payload.machine_id, payload.title_ciphertext);
 
     let mut store = state.store.write().await;
+    if let Some(key) = idempotency_key.as_deref() {
+        let response = store
+            .create_session_idempotency_by_user
+            .get(&auth.user_id)
+            .and_then(|entries| entries.get(key));
+        if let Some(existing) = response {
+            if existing.request_fingerprint != request_fingerprint {
+                return Err(StatusCode::CONFLICT);
+            }
+            return Ok((StatusCode::CREATED, Json(existing.response.clone())));
+        }
+    }
+
     store.next_session_id += 1;
     let now = now_unix_ms();
     let session = Session {
@@ -404,7 +445,22 @@ async fn create_session(
         }),
     );
 
-    Ok((StatusCode::CREATED, Json(CreateSessionResponse { session })))
+    let response = CreateSessionResponse { session };
+    if let Some(key) = idempotency_key {
+        store
+            .create_session_idempotency_by_user
+            .entry(auth.user_id)
+            .or_default()
+            .insert(
+                key,
+                IdempotentCreateSession {
+                    request_fingerprint,
+                    response: response.clone(),
+                },
+            );
+    }
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn get_session(
@@ -468,12 +524,36 @@ async fn append_message(
     Json(payload): Json<AppendMessageRequest>,
 ) -> Result<(StatusCode, Json<AppendMessageResponse>), StatusCode> {
     let expected_version = parse_if_match(&headers)?;
+    let idempotency_key = parse_idempotency_key(&headers)?;
     let auth = authenticate(&headers, &state).await?;
     if payload.role.trim().is_empty() || payload.ciphertext.trim().is_empty() {
         return Err(StatusCode::BAD_REQUEST);
     }
+    let expected_version_fingerprint = expected_version
+        .map(|value| value.to_string())
+        .unwrap_or_else(|| "none".to_string());
+    let request_fingerprint = format!(
+        "{}|{}|{}|{}|{}",
+        session_id,
+        expected_version_fingerprint,
+        payload.role,
+        payload.ciphertext,
+        payload.client_message_id.as_deref().unwrap_or_default(),
+    );
 
     let mut store = state.store.write().await;
+    if let Some(key) = idempotency_key.as_deref() {
+        let response = store
+            .append_message_idempotency_by_user
+            .get(&auth.user_id)
+            .and_then(|entries| entries.get(key));
+        if let Some(existing) = response {
+            if existing.request_fingerprint != request_fingerprint {
+                return Err(StatusCode::CONFLICT);
+            }
+            return Ok((StatusCode::CREATED, Json(existing.response.clone())));
+        }
+    }
 
     let next_version = {
         let sessions = store
@@ -528,7 +608,22 @@ async fn append_message(
         }),
     );
 
-    Ok((StatusCode::CREATED, Json(AppendMessageResponse { message })))
+    let response = AppendMessageResponse { message };
+    if let Some(key) = idempotency_key {
+        store
+            .append_message_idempotency_by_user
+            .entry(auth.user_id)
+            .or_default()
+            .insert(
+                key,
+                IdempotentAppendMessage {
+                    request_fingerprint,
+                    response: response.clone(),
+                },
+            );
+    }
+
+    Ok((StatusCode::CREATED, Json(response)))
 }
 
 async fn realtime_bootstrap(
@@ -686,24 +781,36 @@ mod tests {
         parse_json(response).await
     }
 
-    async fn create_session_for(app: Router, session_token: &str) -> CreateSessionResponse {
+    async fn create_session_request_for(
+        app: Router,
+        session_token: &str,
+        idempotency_key: Option<&str>,
+    ) -> axum::response::Response {
         let payload = serde_json::json!({
             "machine_id": "machine_abc",
             "title_ciphertext": "encrypted:title",
         });
 
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/sessions")
-                    .header("authorization", format!("Bearer {session_token}"))
-                    .header("content-type", "application/json")
-                    .body(Body::from(payload.to_string()))
-                    .expect("build create session request"),
-            )
-            .await
-            .expect("create session request should succeed");
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/sessions")
+            .header("authorization", format!("Bearer {session_token}"))
+            .header("content-type", "application/json");
+        if let Some(key) = idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
+
+        app.oneshot(
+            builder
+                .body(Body::from(payload.to_string()))
+                .expect("build create session request"),
+        )
+        .await
+        .expect("create session request should succeed")
+    }
+
+    async fn create_session_for(app: Router, session_token: &str) -> CreateSessionResponse {
+        let response = create_session_request_for(app, session_token, None).await;
         assert_eq!(response.status(), StatusCode::CREATED);
         parse_json(response).await
     }
@@ -714,6 +821,25 @@ mod tests {
         session_id: &str,
         client_message_id: &str,
         if_match: Option<u64>,
+    ) -> axum::response::Response {
+        append_message_request_for(
+            app,
+            session_token,
+            session_id,
+            client_message_id,
+            if_match,
+            None,
+        )
+        .await
+    }
+
+    async fn append_message_request_for(
+        app: Router,
+        session_token: &str,
+        session_id: &str,
+        client_message_id: &str,
+        if_match: Option<u64>,
+        idempotency_key: Option<&str>,
     ) -> axum::response::Response {
         let payload = serde_json::json!({
             "role": "user",
@@ -729,6 +855,9 @@ mod tests {
         if let Some(version) = if_match {
             builder = builder.header("if-match", version.to_string());
         }
+        if let Some(key) = idempotency_key {
+            builder = builder.header("idempotency-key", key);
+        }
 
         app.oneshot(
             builder
@@ -737,6 +866,26 @@ mod tests {
         )
         .await
         .expect("append request should succeed")
+    }
+
+    async fn list_messages_for(
+        app: Router,
+        session_token: &str,
+        session_id: &str,
+    ) -> ListMessagesResponse {
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/sessions/{session_id}/messages"))
+                    .header("authorization", format!("Bearer {session_token}"))
+                    .body(Body::empty())
+                    .expect("build list messages request"),
+            )
+            .await
+            .expect("list messages request should succeed");
+        assert_eq!(response.status(), StatusCode::OK);
+        parse_json(response).await
     }
 
     async fn spawn_server(app: Router) -> (std::net::SocketAddr, JoinHandle<()>) {
@@ -977,6 +1126,122 @@ mod tests {
         let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
         assert_eq!(bootstrap_payload.last_sequence, 2);
         assert_eq!(bootstrap_payload.schema_version, WEBSOCKET_SCHEMA_VERSION);
+    }
+
+    #[tokio::test]
+    async fn create_session_idempotency_key_replays_without_duplicate_session_or_event() {
+        let app = router();
+        let login = login(app.clone()).await;
+
+        let first =
+            create_session_request_for(app.clone(), &login.session_token, Some("session-create-1"))
+                .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_payload: CreateSessionResponse = parse_json(first).await;
+
+        let second =
+            create_session_request_for(app.clone(), &login.session_token, Some("session-create-1"))
+                .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_payload: CreateSessionResponse = parse_json(second).await;
+        assert_eq!(
+            first_payload.session.session_id,
+            second_payload.session.session_id
+        );
+
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions")
+                    .header("authorization", format!("Bearer {}", login.session_token))
+                    .body(Body::empty())
+                    .expect("build list sessions request"),
+            )
+            .await
+            .expect("list sessions request should succeed");
+        let listed_payload: ListSessionsResponse = parse_json(listed).await;
+        assert_eq!(listed_payload.sessions.len(), 1);
+
+        let bootstrap = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/realtime/bootstrap")
+                    .header("authorization", format!("Bearer {}", login.session_token))
+                    .body(Body::empty())
+                    .expect("build realtime bootstrap request"),
+            )
+            .await
+            .expect("realtime bootstrap request should succeed");
+        let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
+        assert_eq!(bootstrap_payload.last_sequence, 1);
+    }
+
+    #[tokio::test]
+    async fn append_message_idempotency_key_replays_without_duplicate_message_or_event() {
+        let app = router();
+        let login = login(app.clone()).await;
+        let created_payload = create_session_for(app.clone(), &login.session_token).await;
+        let session_id = created_payload.session.session_id;
+
+        let first = append_message_request_for(
+            app.clone(),
+            &login.session_token,
+            &session_id,
+            "msg_client_1",
+            Some(1),
+            Some("append-message-1"),
+        )
+        .await;
+        assert_eq!(first.status(), StatusCode::CREATED);
+        let first_payload: AppendMessageResponse = parse_json(first).await;
+
+        let second = append_message_request_for(
+            app.clone(),
+            &login.session_token,
+            &session_id,
+            "msg_client_1",
+            Some(1),
+            Some("append-message-1"),
+        )
+        .await;
+        assert_eq!(second.status(), StatusCode::CREATED);
+        let second_payload: AppendMessageResponse = parse_json(second).await;
+        assert_eq!(
+            first_payload.message.message_id,
+            second_payload.message.message_id
+        );
+
+        let conflicting_retry = append_message_request_for(
+            app.clone(),
+            &login.session_token,
+            &session_id,
+            "msg_client_2",
+            Some(1),
+            Some("append-message-1"),
+        )
+        .await;
+        assert_eq!(conflicting_retry.status(), StatusCode::CONFLICT);
+
+        let listed_messages =
+            list_messages_for(app.clone(), &login.session_token, &session_id).await;
+        assert_eq!(listed_messages.messages.len(), 1);
+
+        let bootstrap = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/realtime/bootstrap")
+                    .header("authorization", format!("Bearer {}", login.session_token))
+                    .body(Body::empty())
+                    .expect("build realtime bootstrap request"),
+            )
+            .await
+            .expect("realtime bootstrap request should succeed");
+        let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
+        assert_eq!(bootstrap_payload.last_sequence, 2);
     }
 
     #[tokio::test]
