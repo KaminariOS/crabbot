@@ -154,3 +154,11 @@ What We Are Building
   - [x] Make attach footer responsive to terminal width by compacting fields on narrow terminals.
   - [x] Add approval prompt and recoverable resume/interrupt TUI states.
   - [x] Add screenshot/golden regression coverage for CLI TUI output.
+
+  Current Sprint (M7 Kickoff)
+
+  - [x] Regenerate `@crabbot/api-client` types from `schemas/openapi.yaml` to match current Rust API responses.
+  - [x] Add RN-consumable typed API runtime client helpers for auth, sessions, messages, and realtime bootstrap endpoints.
+  - [x] Add mobile rollout flag helpers to gate Rust API and Rust realtime behavior during staged migration.
+  - [ ] Wire Android/Web RN app screens to the new `@crabbot/api-client` runtime methods and rollout flags.
+  - [ ] Add Android + Web smoke tests that execute against a staging Rust backend.

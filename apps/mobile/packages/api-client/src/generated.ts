@@ -373,8 +373,17 @@ export interface operations {
         };
         requestBody?: never;
         responses: {
-            /** @description Refresh stub is not implemented yet */
-            501: {
+            /** @description Refresh success */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["LoginResponse"];
+                };
+            };
+            /** @description Invalid or expired refresh token */
+            401: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -399,6 +408,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ListSessionsResponse"];
                 };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
@@ -431,6 +447,13 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
         };
     };
     getSessionById: {
@@ -453,6 +476,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["GetSessionResponse"];
                 };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Session not found */
             404: {
@@ -483,6 +513,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["ListMessagesResponse"];
                 };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
             /** @description Session not found */
             404: {
@@ -525,8 +562,22 @@ export interface operations {
                 };
                 content?: never;
             };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
             /** @description Session not found */
             404: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Optimistic version conflict from stale `If-Match` value */
+            409: {
                 headers: {
                     [name: string]: unknown;
                 };
@@ -551,6 +602,13 @@ export interface operations {
                 content: {
                     "application/json": components["schemas"]["RealtimeBootstrapResponse"];
                 };
+            };
+            /** @description Missing or invalid bearer token */
+            401: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
             };
         };
     };
