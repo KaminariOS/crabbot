@@ -888,6 +888,65 @@ mod tests {
         parse_json(response).await
     }
 
+    async fn append_message_burst_for(
+        app: Router,
+        session_token: &str,
+        session_id: &str,
+        writers: usize,
+        messages_per_writer: usize,
+    ) -> Vec<StatusCode> {
+        let mut tasks = Vec::with_capacity(writers);
+        for writer in 0..writers {
+            let app = app.clone();
+            let session_token = session_token.to_string();
+            let session_id = session_id.to_string();
+            tasks.push(tokio::spawn(async move {
+                let mut statuses = Vec::with_capacity(messages_per_writer);
+                for message_index in 0..messages_per_writer {
+                    let client_message_id = format!("msg_writer_{writer}_{message_index}");
+                    let response = append_message_for(
+                        app.clone(),
+                        &session_token,
+                        &session_id,
+                        &client_message_id,
+                        None,
+                    )
+                    .await;
+                    statuses.push(response.status());
+                }
+                statuses
+            }));
+        }
+
+        let mut statuses = Vec::with_capacity(writers * messages_per_writer);
+        for task in tasks {
+            let task_statuses = task.await.expect("writer task should join");
+            statuses.extend(task_statuses);
+        }
+        statuses
+    }
+
+    async fn assert_stream_receives_message_appended_events(
+        stream: &mut ClientWsStream,
+        expected_events: usize,
+        start_sequence: u64,
+    ) {
+        let mut expected_sequence = start_sequence;
+        for _ in 0..expected_events {
+            let envelope = next_ws_envelope(stream).await;
+            expected_sequence += 1;
+            assert_eq!(envelope.sequence, expected_sequence);
+            assert!(matches!(envelope.event, ApiEvent::MessageAppended(_)));
+        }
+    }
+
+    fn env_usize(name: &str, default: usize) -> usize {
+        std::env::var(name)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(default)
+    }
+
     async fn spawn_server(app: Router) -> (std::net::SocketAddr, JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -1242,6 +1301,125 @@ mod tests {
             .expect("realtime bootstrap request should succeed");
         let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
         assert_eq!(bootstrap_payload.last_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn realtime_websocket_fanout_handles_concurrent_burst_writers() {
+        let state = test_state();
+        let app = router_with_state(state.clone());
+        let login = login(app.clone()).await;
+        let created_payload = create_session_for(app.clone(), &login.session_token).await;
+        let session_id = created_payload.session.session_id;
+
+        let (addr, server_task) = spawn_server(router_with_state(state)).await;
+        let client_count = 6usize;
+        let writers = 4usize;
+        let messages_per_writer = 12usize;
+        let expected_messages = writers * messages_per_writer;
+
+        let mut streams = Vec::with_capacity(client_count);
+        for _ in 0..client_count {
+            let url = format!(
+                "ws://{addr}/realtime?session_token={}&since_sequence=0",
+                login.session_token
+            );
+            let (stream, _response) = connect_async(url).await.expect("open websocket client");
+            streams.push(stream);
+        }
+
+        for stream in &mut streams {
+            let initial = next_ws_envelope(stream).await;
+            assert_eq!(initial.sequence, 1);
+            assert!(matches!(initial.event, ApiEvent::SessionCreated(_)));
+        }
+
+        let statuses = append_message_burst_for(
+            app.clone(),
+            &login.session_token,
+            &session_id,
+            writers,
+            messages_per_writer,
+        )
+        .await;
+        assert_eq!(statuses.len(), expected_messages);
+        assert!(statuses.iter().all(|status| *status == StatusCode::CREATED));
+
+        for stream in &mut streams {
+            assert_stream_receives_message_appended_events(stream, expected_messages, 1).await;
+            let no_extra = timeout(Duration::from_millis(200), stream.next()).await;
+            assert!(no_extra.is_err(), "unexpected extra websocket event");
+            stream.close(None).await.expect("close websocket");
+        }
+
+        server_task.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "manual soak harness for websocket fanout under higher load"]
+    async fn realtime_websocket_soak_harness_is_env_configurable() {
+        let state = test_state();
+        let app = router_with_state(state.clone());
+        let login = login(app.clone()).await;
+        let created_payload = create_session_for(app.clone(), &login.session_token).await;
+        let session_id = created_payload.session.session_id;
+
+        let (addr, server_task) = spawn_server(router_with_state(state)).await;
+        let client_count = env_usize("CRABBOT_SOAK_CLIENTS", 16);
+        let writers = env_usize("CRABBOT_SOAK_WRITERS", 4);
+        let messages_per_writer = env_usize("CRABBOT_SOAK_MESSAGES_PER_WRITER", 64);
+        let expected_messages = writers * messages_per_writer;
+
+        let mut streams = Vec::with_capacity(client_count);
+        for _ in 0..client_count {
+            let url = format!(
+                "ws://{addr}/realtime?session_token={}&since_sequence=0",
+                login.session_token
+            );
+            let (stream, _response) = connect_async(url).await.expect("open websocket client");
+            streams.push(stream);
+        }
+
+        for stream in &mut streams {
+            let initial = next_ws_envelope(stream).await;
+            assert_eq!(initial.sequence, 1);
+            assert!(matches!(initial.event, ApiEvent::SessionCreated(_)));
+        }
+
+        let statuses = append_message_burst_for(
+            app.clone(),
+            &login.session_token,
+            &session_id,
+            writers,
+            messages_per_writer,
+        )
+        .await;
+        assert_eq!(statuses.len(), expected_messages);
+        assert!(statuses.iter().all(|status| *status == StatusCode::CREATED));
+
+        for stream in &mut streams {
+            assert_stream_receives_message_appended_events(stream, expected_messages, 1).await;
+            stream.close(None).await.expect("close websocket");
+        }
+
+        let bootstrap = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/realtime/bootstrap")
+                    .header("authorization", format!("Bearer {}", login.session_token))
+                    .body(Body::empty())
+                    .expect("build realtime bootstrap request"),
+            )
+            .await
+            .expect("realtime bootstrap request should succeed");
+        assert_eq!(bootstrap.status(), StatusCode::OK);
+        let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
+        assert_eq!(
+            bootstrap_payload.last_sequence,
+            (expected_messages as u64) + 1
+        );
+
+        server_task.abort();
     }
 
     #[tokio::test]
