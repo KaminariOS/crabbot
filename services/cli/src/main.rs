@@ -38,7 +38,7 @@ enum CodexSubcommand {
     Resume(SessionArgs),
     Interrupt(SessionArgs),
     Status(StatusArgs),
-    Attach(SessionArgs),
+    Attach(AttachArgs),
     Config(ConfigCommand),
 }
 
@@ -52,6 +52,14 @@ struct StartArgs {
 struct SessionArgs {
     #[arg(long)]
     session_id: String,
+}
+
+#[derive(Debug, Args)]
+struct AttachArgs {
+    #[arg(long)]
+    session_id: String,
+    #[arg(long, default_value_t = false)]
+    tui: bool,
 }
 
 #[derive(Debug, Args)]
@@ -123,6 +131,22 @@ struct CliState {
     config: CliConfig,
 }
 
+enum CommandOutput {
+    Json(Value),
+    Text(String),
+}
+
+impl CommandOutput {
+    fn into_string(self) -> Result<String> {
+        match self {
+            Self::Json(value) => {
+                serde_json::to_string_pretty(&value).context("serialize cli output")
+            }
+            Self::Text(value) => Ok(value),
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = run(Cli::parse()) {
         eprintln!("error: {error:#}");
@@ -150,29 +174,29 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
     let output = match command.command {
         CodexSubcommand::Start(args) => {
             should_persist = true;
-            handle_start(args, &mut state)
+            handle_start(args, &mut state).map(CommandOutput::Json)
         }
         CodexSubcommand::Resume(args) => {
             should_persist = true;
-            handle_resume(args, &mut state)
+            handle_resume(args, &mut state).map(CommandOutput::Json)
         }
         CodexSubcommand::Interrupt(args) => {
             should_persist = true;
-            handle_interrupt(args, &mut state)
+            handle_interrupt(args, &mut state).map(CommandOutput::Json)
         }
         CodexSubcommand::Status(args) => {
             should_persist = args.session_id.is_some();
-            handle_status(args, &mut state)
+            handle_status(args, &mut state).map(CommandOutput::Json)
         }
         CodexSubcommand::Attach(args) => {
             should_persist = true;
             handle_attach(args, &mut state)
         }
         CodexSubcommand::Config(command) => match command.command {
-            ConfigSubcommand::Show => Ok(handle_config_show(&state)),
+            ConfigSubcommand::Show => Ok(CommandOutput::Json(handle_config_show(&state))),
             ConfigSubcommand::Set(args) => {
                 should_persist = true;
-                handle_config_set(args, &mut state)
+                handle_config_set(args, &mut state).map(CommandOutput::Json)
             }
         },
     }?;
@@ -181,7 +205,7 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
         save_state(state_path, &state)?;
     }
 
-    serde_json::to_string_pretty(&output).context("serialize cli output")
+    output.into_string()
 }
 
 fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
@@ -291,14 +315,15 @@ fn handle_status(args: StatusArgs, state: &mut CliState) -> Result<Value> {
     }))
 }
 
-fn handle_attach(args: SessionArgs, state: &mut CliState) -> Result<Value> {
+fn handle_attach(args: AttachArgs, state: &mut CliState) -> Result<CommandOutput> {
     if args.session_id.trim().is_empty() {
         bail!("session_id cannot be empty");
     }
+    let session_id = args.session_id;
 
     let stream_events = fetch_daemon_stream(
         &state.config.daemon_endpoint,
-        &args.session_id,
+        &session_id,
         state.config.auth_token.as_deref(),
     )?;
     if let Some(latest_state) = stream_events
@@ -312,7 +337,7 @@ fn handle_attach(args: SessionArgs, state: &mut CliState) -> Result<Value> {
         persist_daemon_session(
             state,
             &DaemonSessionStatusResponse {
-                session_id: args.session_id.clone(),
+                session_id: session_id.clone(),
                 state: latest_state,
                 last_event: "attached".to_string(),
                 updated_at_unix_ms: now_unix_ms(),
@@ -325,15 +350,25 @@ fn handle_attach(args: SessionArgs, state: &mut CliState) -> Result<Value> {
         .map(|event| event.sequence)
         .unwrap_or(0);
 
-    Ok(json!({
+    let json_output = json!({
         "ok": true,
         "action": "attach",
-        "session_id": args.session_id,
+        "session_id": session_id.clone(),
         "stream_events": stream_events,
         "received_events": received_events,
         "last_sequence": last_sequence,
         "daemon_endpoint": state.config.daemon_endpoint,
-    }))
+    });
+
+    if args.tui {
+        return Ok(CommandOutput::Text(render_attach_tui(
+            &session_id,
+            &stream_events,
+            &state.config.daemon_endpoint,
+        )));
+    }
+
+    Ok(CommandOutput::Json(json_output))
 }
 
 fn handle_config_show(state: &CliState) -> Value {
@@ -544,6 +579,82 @@ fn fetch_daemon_stream(
             serde_json::from_str::<DaemonStreamEnvelope>(line).context("parse daemon stream line")
         })
         .collect()
+}
+
+fn render_attach_tui(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+) -> String {
+    let mut output = String::new();
+    let mut latest_state = "unknown";
+
+    for envelope in stream_events {
+        match &envelope.event {
+            DaemonStreamEvent::SessionState(payload) => latest_state = payload.state.as_str(),
+            DaemonStreamEvent::TurnStreamDelta(payload) => output.push_str(&payload.delta),
+            DaemonStreamEvent::TurnCompleted(payload) => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "[turn {} complete] {}\n",
+                    payload.turn_id, payload.output_summary
+                ));
+            }
+            DaemonStreamEvent::Heartbeat(_) => {}
+        }
+    }
+
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    let last_sequence = stream_events
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(0);
+    let columns = terminal_columns();
+    let footer = build_attach_footer(
+        session_id,
+        latest_state,
+        stream_events.len(),
+        last_sequence,
+        daemon_endpoint,
+        columns,
+    );
+
+    let separator_width = columns.clamp(24, 80);
+    output.push_str(&"-".repeat(separator_width));
+    output.push('\n');
+    output.push_str(&footer);
+    output
+}
+
+fn terminal_columns() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|columns| *columns > 0)
+        .unwrap_or(100)
+}
+
+fn build_attach_footer(
+    session_id: &str,
+    state: &str,
+    received_events: usize,
+    last_sequence: u64,
+    daemon_endpoint: &str,
+    columns: usize,
+) -> String {
+    let full = format!(
+        "session={session_id} state={state} events={received_events} seq={last_sequence} daemon={daemon_endpoint}"
+    );
+    if full.len() <= columns {
+        return full;
+    }
+
+    format!("session={session_id} state={state} events={received_events} seq={last_sequence}")
 }
 
 fn resolve_state_path() -> Result<PathBuf> {
@@ -915,8 +1026,9 @@ mod tests {
         let attach = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Attach(SessionArgs {
+                    command: CodexSubcommand::Attach(AttachArgs {
                         session_id: "sess_cli_attach".to_string(),
+                        tui: false,
                     }),
                 }),
             },
@@ -948,5 +1060,107 @@ mod tests {
 
         daemon_handle.join().expect("join daemon mock thread");
         api_handle.join().expect("join api mock thread");
+    }
+
+    #[test]
+    fn attach_tui_renders_stream_and_footer() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_attach_tui";
+
+        let daemon_events = vec![
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_tui".to_string(),
+                sequence: 1,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_tui".to_string(),
+                sequence: 2,
+                event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                    turn_id: "turn_1".to_string(),
+                    delta: "hello ".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_tui".to_string(),
+                sequence: 3,
+                event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                    turn_id: "turn_1".to_string(),
+                    delta: "world".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_tui".to_string(),
+                sequence: 4,
+                event: DaemonStreamEvent::TurnCompleted(crabbot_protocol::DaemonTurnCompleted {
+                    turn_id: "turn_1".to_string(),
+                    output_summary: "done".to_string(),
+                }),
+            },
+        ];
+        let daemon_body = daemon_events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize daemon event"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (daemon_endpoint, daemon_handle) = spawn_mock_get_server(
+            "/v1/sessions/sess_cli_tui/stream",
+            Some(auth_token),
+            "application/x-ndjson",
+            daemon_body,
+        );
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint.clone()),
+                            auth_token: Some(auth_token.to_string()),
+                            clear_auth_token: false,
+                        }),
+                    }),
+                }),
+            },
+            &state_path,
+        );
+
+        let output = run_with_state_path(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: CodexSubcommand::Attach(AttachArgs {
+                        session_id: "sess_cli_tui".to_string(),
+                        tui: true,
+                    }),
+                }),
+            },
+            &state_path,
+        )
+        .expect("run attach tui");
+
+        assert!(output.contains("hello world"));
+        assert!(output.contains("[turn turn_1 complete] done"));
+        assert!(output.contains("session=sess_cli_tui state=active events=4 seq=4"));
+        assert!(output.contains(&format!("daemon={daemon_endpoint}")));
+
+        daemon_handle.join().expect("join daemon mock thread");
+    }
+
+    #[test]
+    fn attach_footer_compacts_for_narrow_terminal_width() {
+        let wide = build_attach_footer("sess_1", "active", 12, 42, "http://127.0.0.1:8788", 160);
+        assert!(wide.contains("daemon=http://127.0.0.1:8788"));
+
+        let narrow = build_attach_footer("sess_1", "active", 12, 42, "http://127.0.0.1:8788", 48);
+        assert!(!narrow.contains("daemon="));
+        assert!(narrow.contains("session=sess_1 state=active events=12 seq=42"));
     }
 }

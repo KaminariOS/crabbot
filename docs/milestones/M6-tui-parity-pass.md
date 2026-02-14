@@ -8,3 +8,8 @@ Reach native Codex-like terminal UX parity in the Rust CLI experience.
 - [ ] Approval prompts, interrupts, and resume UI states are clear and recoverable.
 - [ ] Terminal layout adapts to narrow and wide Linux terminal sizes.
 - [ ] UX regression tests and screenshot/golden checks are in place.
+
+## Progress
+- [x] `crabbot codex attach --session-id ... --tui` renders streamed turn deltas inline with turn completion lines.
+- [x] `attach --tui` now includes a compact status footer with session/state/event/sequence metadata.
+- [x] Footer output adapts to terminal width by removing endpoint details in narrow terminals.

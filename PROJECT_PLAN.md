@@ -146,3 +146,11 @@ What We Are Building
   - [x] Route CLI `status --session-id ...` through daemon status endpoint with cache refresh semantics.
   - [x] Refresh local status cache from daemon stream session-state events during `attach`.
   - [x] Forward configured CLI auth token as `Authorization: Bearer` on daemon and API control requests.
+
+  Current Sprint (M6 Kickoff)
+
+  - [x] Add `crabbot codex attach --tui` mode to render daemon stream deltas as terminal text output.
+  - [x] Add an attach status footer with session/state/event count/sequence metadata.
+  - [x] Make attach footer responsive to terminal width by compacting fields on narrow terminals.
+  - [ ] Add approval prompt and recoverable resume/interrupt TUI states.
+  - [ ] Add screenshot/golden regression coverage for CLI TUI output.
