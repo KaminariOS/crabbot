@@ -11,7 +11,6 @@ use crabbot_protocol::{
     DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope,
     DaemonStreamEvent, DaemonTurnCompleted, DaemonTurnStreamDelta, HealthResponse, Heartbeat,
 };
-use serde_json::json;
 use std::{
     collections::HashMap,
     env,
