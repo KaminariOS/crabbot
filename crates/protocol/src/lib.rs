@@ -177,6 +177,7 @@ pub enum DaemonStreamEvent {
     SessionState(DaemonSessionState),
     TurnStreamDelta(DaemonTurnStreamDelta),
     TurnCompleted(DaemonTurnCompleted),
+    ApprovalRequired(DaemonApprovalRequired),
     Heartbeat(Heartbeat),
 }
 
@@ -195,6 +196,14 @@ pub struct DaemonTurnStreamDelta {
 pub struct DaemonTurnCompleted {
     pub turn_id: String,
     pub output_summary: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonApprovalRequired {
+    pub turn_id: String,
+    pub approval_id: String,
+    pub action_kind: String,
+    pub prompt: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -250,6 +259,26 @@ mod tests {
         assert_eq!(value["sequence"], 3);
         assert_eq!(value["event"]["type"], "turn_completed");
         assert_eq!(value["event"]["payload"]["output_summary"], "done");
+    }
+
+    #[test]
+    fn daemon_approval_event_uses_tagged_schema() {
+        let envelope = DaemonStreamEnvelope {
+            schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+            session_id: "s_1".to_string(),
+            sequence: 8,
+            event: DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                turn_id: "t_1".to_string(),
+                approval_id: "approval_1".to_string(),
+                action_kind: "shell_command".to_string(),
+                prompt: "Allow ls -la?".to_string(),
+            }),
+        };
+
+        let value = serde_json::to_value(&envelope).expect("serialize daemon approval envelope");
+        assert_eq!(value["event"]["type"], "approval_required");
+        assert_eq!(value["event"]["payload"]["approval_id"], "approval_1");
+        assert_eq!(value["event"]["payload"]["prompt"], "Allow ls -la?");
     }
 
     #[test]

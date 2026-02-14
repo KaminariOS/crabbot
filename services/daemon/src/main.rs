@@ -7,9 +7,9 @@ use axum::{
     routing::{get, post},
 };
 use crabbot_protocol::{
-    DAEMON_STREAM_SCHEMA_VERSION, DaemonSessionState, DaemonSessionStatusResponse,
-    DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, DaemonTurnCompleted,
-    DaemonTurnStreamDelta, HealthResponse, Heartbeat,
+    DAEMON_STREAM_SCHEMA_VERSION, DaemonApprovalRequired, DaemonSessionState,
+    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope,
+    DaemonStreamEvent, DaemonTurnCompleted, DaemonTurnStreamDelta, HealthResponse, Heartbeat,
 };
 use serde_json::json;
 use std::{
@@ -193,12 +193,23 @@ async fn session_stream(
             schema_version: DAEMON_STREAM_SCHEMA_VERSION,
             session_id: session_id.clone(),
             sequence: 3,
+            event: DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                turn_id: turn_id.clone(),
+                approval_id: format!("approval_{session_id}_1"),
+                action_kind: "shell_command".to_string(),
+                prompt: "Allow running ls -la in workspace?".to_string(),
+            }),
+        },
+        DaemonStreamEnvelope {
+            schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+            session_id: session_id.clone(),
+            sequence: 4,
             event: DaemonStreamEvent::Heartbeat(Heartbeat { unix_ms: now }),
         },
         DaemonStreamEnvelope {
             schema_version: DAEMON_STREAM_SCHEMA_VERSION,
             session_id,
-            sequence: 4,
+            sequence: 5,
             event: DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
                 turn_id,
                 output_summary: format!("last event: {}", session.last_event),
@@ -351,11 +362,22 @@ mod tests {
             .to_bytes();
         let body = String::from_utf8(bytes.to_vec()).expect("utf8 body");
         let lines = body.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 4);
+        assert_eq!(lines.len(), 5);
         let first: DaemonStreamEnvelope =
             serde_json::from_str(lines[0]).expect("parse first stream line");
         assert_eq!(first.session_id, "sess_daemon_stream");
         assert_eq!(first.sequence, 1);
+        let approval: DaemonStreamEnvelope =
+            serde_json::from_str(lines[2]).expect("parse approval stream line");
+        assert_eq!(
+            approval.event,
+            DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                turn_id: "turn_sess_daemon_stream_1".to_string(),
+                approval_id: "approval_sess_daemon_stream_1".to_string(),
+                action_kind: "shell_command".to_string(),
+                prompt: "Allow running ls -la in workspace?".to_string(),
+            })
+        );
     }
 
     #[tokio::test]

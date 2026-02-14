@@ -152,5 +152,5 @@ What We Are Building
   - [x] Add `crabbot codex attach --tui` mode to render daemon stream deltas as terminal text output.
   - [x] Add an attach status footer with session/state/event count/sequence metadata.
   - [x] Make attach footer responsive to terminal width by compacting fields on narrow terminals.
-  - [ ] Add approval prompt and recoverable resume/interrupt TUI states.
-  - [ ] Add screenshot/golden regression coverage for CLI TUI output.
+  - [x] Add approval prompt and recoverable resume/interrupt TUI states.
+  - [x] Add screenshot/golden regression coverage for CLI TUI output.

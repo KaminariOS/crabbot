@@ -586,12 +586,46 @@ fn render_attach_tui(
     stream_events: &[DaemonStreamEnvelope],
     daemon_endpoint: &str,
 ) -> String {
+    render_attach_tui_with_columns(
+        session_id,
+        stream_events,
+        daemon_endpoint,
+        terminal_columns(),
+    )
+}
+
+fn render_attach_tui_with_columns(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+    columns: usize,
+) -> String {
     let mut output = String::new();
-    let mut latest_state = "unknown";
+    let mut latest_state = String::from("unknown");
+    let mut previous_state: Option<String> = None;
 
     for envelope in stream_events {
         match &envelope.event {
-            DaemonStreamEvent::SessionState(payload) => latest_state = payload.state.as_str(),
+            DaemonStreamEvent::SessionState(payload) => {
+                if previous_state.as_deref() != Some(payload.state.as_str()) {
+                    if payload.state == "interrupted" {
+                        if !output.is_empty() && !output.ends_with('\n') {
+                            output.push('\n');
+                        }
+                        output.push_str(&format!(
+                            "[session interrupted] resume with: crabbot codex resume --session-id {session_id}\n"
+                        ));
+                    }
+
+                    if previous_state.as_deref() == Some("interrupted")
+                        && payload.state.as_str() == "active"
+                    {
+                        output.push_str("[session resumed] stream is active again\n");
+                    }
+                }
+                latest_state = payload.state.clone();
+                previous_state = Some(payload.state.clone());
+            }
             DaemonStreamEvent::TurnStreamDelta(payload) => output.push_str(&payload.delta),
             DaemonStreamEvent::TurnCompleted(payload) => {
                 if !output.is_empty() && !output.ends_with('\n') {
@@ -600,6 +634,19 @@ fn render_attach_tui(
                 output.push_str(&format!(
                     "[turn {} complete] {}\n",
                     payload.turn_id, payload.output_summary
+                ));
+            }
+            DaemonStreamEvent::ApprovalRequired(payload) => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "[approval required] id={} action={}\n",
+                    payload.approval_id, payload.action_kind
+                ));
+                output.push_str(&format!("prompt: {}\n", payload.prompt));
+                output.push_str(&format!(
+                    "after approval, resume with: crabbot codex resume --session-id {session_id}\n"
                 ));
             }
             DaemonStreamEvent::Heartbeat(_) => {}
@@ -614,10 +661,9 @@ fn render_attach_tui(
         .last()
         .map(|event| event.sequence)
         .unwrap_or(0);
-    let columns = terminal_columns();
     let footer = build_attach_footer(
         session_id,
-        latest_state,
+        &latest_state,
         stream_events.len(),
         last_sequence,
         daemon_endpoint,
@@ -701,8 +747,8 @@ fn save_state(path: &Path, state: &CliState) -> Result<()> {
 mod tests {
     use super::*;
     use crabbot_protocol::{
-        DAEMON_STREAM_SCHEMA_VERSION, DaemonSessionState, DaemonStreamEvent, DaemonTurnStreamDelta,
-        Heartbeat,
+        DAEMON_STREAM_SCHEMA_VERSION, DaemonApprovalRequired, DaemonSessionState,
+        DaemonStreamEvent, DaemonTurnStreamDelta, Heartbeat,
     };
     use std::{
         io::{Read, Write},
@@ -1162,5 +1208,138 @@ mod tests {
         let narrow = build_attach_footer("sess_1", "active", 12, 42, "http://127.0.0.1:8788", 48);
         assert!(!narrow.contains("daemon="));
         assert!(narrow.contains("session=sess_1 state=active events=12 seq=42"));
+    }
+
+    #[test]
+    fn attach_tui_shows_approval_and_resume_recovery_hints() {
+        let output = render_attach_tui(
+            "sess_recover",
+            &[
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_recover".to_string(),
+                    sequence: 1,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "active".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_recover".to_string(),
+                    sequence: 2,
+                    event: DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                        turn_id: "turn_recover_1".to_string(),
+                        approval_id: "approval_recover_1".to_string(),
+                        action_kind: "shell_command".to_string(),
+                        prompt: "Allow cat Cargo.toml?".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_recover".to_string(),
+                    sequence: 3,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "interrupted".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_recover".to_string(),
+                    sequence: 4,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "active".to_string(),
+                    }),
+                },
+            ],
+            "http://127.0.0.1:8788",
+        );
+
+        assert!(output.contains("[approval required] id=approval_recover_1 action=shell_command"));
+        assert!(output.contains("prompt: Allow cat Cargo.toml?"));
+        assert!(output.contains(
+            "after approval, resume with: crabbot codex resume --session-id sess_recover"
+        ));
+        assert!(output.contains(
+            "[session interrupted] resume with: crabbot codex resume --session-id sess_recover"
+        ));
+        assert!(output.contains("[session resumed] stream is active again"));
+    }
+
+    #[test]
+    fn attach_tui_output_matches_golden_fixture() {
+        let output = render_attach_tui_with_columns(
+            "sess_golden",
+            &[
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 1,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "active".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 2,
+                    event: DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                        turn_id: "turn_golden_1".to_string(),
+                        approval_id: "approval_golden_1".to_string(),
+                        action_kind: "shell_command".to_string(),
+                        prompt: "Allow ls -la?".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 3,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "interrupted".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 4,
+                    event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                        state: "active".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 5,
+                    event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                        turn_id: "turn_golden_1".to_string(),
+                        delta: "Hello, ".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 6,
+                    event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                        turn_id: "turn_golden_1".to_string(),
+                        delta: "world!".to_string(),
+                    }),
+                },
+                DaemonStreamEnvelope {
+                    schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                    session_id: "sess_golden".to_string(),
+                    sequence: 7,
+                    event: DaemonStreamEvent::TurnCompleted(
+                        crabbot_protocol::DaemonTurnCompleted {
+                            turn_id: "turn_golden_1".to_string(),
+                            output_summary: "done".to_string(),
+                        },
+                    ),
+                },
+            ],
+            "http://127.0.0.1:8788",
+            24,
+        );
+
+        let expected = include_str!("../tests/golden/attach_tui_output.txt").trim_end_matches('\n');
+        assert_eq!(output, expected);
     }
 }
