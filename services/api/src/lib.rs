@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     sync::Arc,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -22,23 +23,28 @@ use crabbot_protocol::{
     WebSocketEnvelope,
 };
 use futures_util::StreamExt;
-use serde::Deserialize;
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use serde::{Deserialize, Serialize};
 use tokio::sync::{RwLock, broadcast};
 
 const SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const REALTIME_CHANNEL_CAPACITY: usize = 256;
 const EVENT_LOG_LIMIT: usize = 512;
+const JWT_SECRET_ENV: &str = "CRABBOT_JWT_SECRET";
+const JWT_DEFAULT_DEV_SECRET: &str = "crabbot-dev-secret-change-me";
 
 #[derive(Clone)]
 pub struct AppState {
     pub service_name: String,
     pub realtime_websocket_url: String,
+    jwt_secret: String,
     store: Arc<RwLock<InMemoryStore>>,
 }
 
 #[derive(Debug, Clone)]
 struct AuthSession {
     user_id: String,
+    token_id: String,
     session_token: String,
     refresh_token: String,
     expires_at_unix_ms: u64,
@@ -70,10 +76,19 @@ struct RealtimeQuery {
     since_sequence: Option<u64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct JwtClaims {
+    sub: String,
+    exp: u64,
+    iat: u64,
+    jti: String,
+}
+
 pub fn router() -> Router {
     let state = AppState {
         service_name: "crabbot_api".to_string(),
         realtime_websocket_url: "wss://api.crabbot.local/realtime".to_string(),
+        jwt_secret: env::var(JWT_SECRET_ENV).unwrap_or_else(|_| JWT_DEFAULT_DEV_SECRET.to_string()),
         store: Arc::new(RwLock::new(InMemoryStore::default())),
     };
 
@@ -101,6 +116,18 @@ fn now_unix_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+fn now_unix_s() -> u64 {
+    now_unix_ms() / 1_000
+}
+
+fn encoding_key(secret: &str) -> EncodingKey {
+    EncodingKey::from_secret(secret.as_bytes())
+}
+
+fn decoding_key(secret: &str) -> DecodingKey {
+    DecodingKey::from_secret(secret.as_bytes())
 }
 
 fn normalize_provider(provider: &str) -> String {
@@ -194,6 +221,14 @@ async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Authentic
 }
 
 async fn authenticate_token(token: String, state: &AppState) -> Result<Authenticated, StatusCode> {
+    let claims = decode::<JwtClaims>(
+        &token,
+        &decoding_key(&state.jwt_secret),
+        &Validation::new(Algorithm::HS256),
+    )
+    .map_err(|_| StatusCode::UNAUTHORIZED)?
+    .claims;
+
     let mut store = state.store.write().await;
     let auth = store
         .auth_by_session_token
@@ -201,7 +236,10 @@ async fn authenticate_token(token: String, state: &AppState) -> Result<Authentic
         .cloned()
         .ok_or(StatusCode::UNAUTHORIZED)?;
 
-    if auth.expires_at_unix_ms <= now_unix_ms() {
+    if auth.expires_at_unix_ms <= now_unix_ms()
+        || claims.sub != auth.user_id
+        || claims.jti != auth.token_id
+    {
         store.auth_by_session_token.remove(&auth.session_token);
         store
             .session_token_by_refresh_token
@@ -215,14 +253,32 @@ async fn authenticate_token(token: String, state: &AppState) -> Result<Authentic
     })
 }
 
-fn issue_auth_session(store: &mut InMemoryStore, user_id: String) -> LoginResponse {
+fn issue_auth_session(
+    store: &mut InMemoryStore,
+    jwt_secret: &str,
+    user_id: String,
+) -> Result<LoginResponse, StatusCode> {
     store.next_auth_id += 1;
     let issued_id = store.next_auth_id;
-    let session_token = format!("session_tok_{issued_id}");
-    let refresh_token = format!("refresh_tok_{issued_id}");
+    let token_id = format!("auth_{issued_id}");
+    let now_unix_s = now_unix_s();
     let expires_at_unix_ms = now_unix_ms() + SESSION_TOKEN_TTL.as_millis() as u64;
+    let claims = JwtClaims {
+        sub: user_id.clone(),
+        exp: expires_at_unix_ms / 1_000,
+        iat: now_unix_s,
+        jti: token_id.clone(),
+    };
+    let session_token = encode(
+        &Header::new(Algorithm::HS256),
+        &claims,
+        &encoding_key(jwt_secret),
+    )
+    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    let refresh_token = format!("refresh_tok_{issued_id}");
     let auth = AuthSession {
         user_id: user_id.clone(),
+        token_id,
         session_token: session_token.clone(),
         refresh_token: refresh_token.clone(),
         expires_at_unix_ms,
@@ -235,12 +291,12 @@ fn issue_auth_session(store: &mut InMemoryStore, user_id: String) -> LoginRespon
         .auth_by_session_token
         .insert(session_token.clone(), auth);
 
-    LoginResponse {
+    Ok(LoginResponse {
         user_id,
         session_token,
         refresh_token,
         expires_at_unix_ms,
-    }
+    })
 }
 
 async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
@@ -261,7 +317,7 @@ async fn login(
 
     let user_id = format!("user_{}", normalize_provider(&payload.provider));
     let mut store = state.store.write().await;
-    let response = issue_auth_session(&mut store, user_id);
+    let response = issue_auth_session(&mut store, &state.jwt_secret, user_id)?;
     Ok(Json(response))
 }
 
@@ -285,7 +341,7 @@ async fn refresh(
         return Err(StatusCode::UNAUTHORIZED);
     }
 
-    let response = issue_auth_session(&mut store, previous_auth.user_id);
+    let response = issue_auth_session(&mut store, &state.jwt_secret, previous_auth.user_id)?;
     Ok(Json(response))
 }
 
@@ -715,6 +771,7 @@ mod tests {
         AppState {
             service_name: "crabbot_api".to_string(),
             realtime_websocket_url: "ws://127.0.0.1/realtime".to_string(),
+            jwt_secret: JWT_DEFAULT_DEV_SECRET.to_string(),
             store: Arc::new(RwLock::new(InMemoryStore::default())),
         }
     }
@@ -755,6 +812,28 @@ mod tests {
             )
             .await
             .expect("login request should succeed");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn login_issues_jwt_access_token_and_tampering_is_rejected() {
+        let app = router();
+        let login = login(app.clone()).await;
+        assert_eq!(login.session_token.split('.').count(), 3);
+
+        let tampered = format!("{}x", login.session_token);
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/sessions")
+                    .header("authorization", format!("Bearer {tampered}"))
+                    .body(Body::empty())
+                    .expect("build tampered token request"),
+            )
+            .await
+            .expect("tampered token request should complete");
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
