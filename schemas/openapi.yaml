@@ -43,7 +43,107 @@ paths:
       responses:
         '501':
           description: Refresh stub is not implemented yet
+  /sessions:
+    get:
+      operationId: getSessions
+      summary: List user sessions
+      responses:
+        '200':
+          description: Sessions for the authenticated user
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListSessionsResponse'
+    post:
+      operationId: postSessions
+      summary: Create a new session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSessionRequest'
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateSessionResponse'
+        '400':
+          description: Invalid request payload
+  /sessions/{session_id}:
+    get:
+      operationId: getSessionById
+      summary: Fetch a session by id
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetSessionResponse'
+        '404':
+          description: Session not found
+  /sessions/{session_id}/messages:
+    get:
+      operationId: getSessionMessages
+      summary: List messages for a session
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      responses:
+        '200':
+          description: Session messages
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListMessagesResponse'
+        '404':
+          description: Session not found
+    post:
+      operationId: postSessionMessage
+      summary: Append a message to a session
+      parameters:
+        - $ref: '#/components/parameters/SessionId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AppendMessageRequest'
+      responses:
+        '201':
+          description: Message appended
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AppendMessageResponse'
+        '400':
+          description: Invalid request payload
+        '404':
+          description: Session not found
+  /realtime/bootstrap:
+    get:
+      operationId: getRealtimeBootstrap
+      summary: Fetch realtime websocket bootstrap details
+      responses:
+        '200':
+          description: Realtime connection metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RealtimeBootstrapResponse'
 components:
+  parameters:
+    SessionId:
+      name: session_id
+      in: path
+      required: true
+      description: Stable session identifier
+      schema:
+        type: string
   schemas:
     HealthResponse:
       type: object
@@ -77,16 +177,165 @@ components:
         expires_at_unix_ms:
           type: integer
           format: uint64
+    Session:
+      type: object
+      required:
+        [
+          session_id,
+          machine_id,
+          state,
+          optimistic_version,
+          created_at_unix_ms,
+          updated_at_unix_ms,
+        ]
+      properties:
+        session_id:
+          type: string
+        machine_id:
+          type: string
+        state:
+          type: string
+        optimistic_version:
+          type: integer
+          format: uint64
+        created_at_unix_ms:
+          type: integer
+          format: uint64
+        updated_at_unix_ms:
+          type: integer
+          format: uint64
+    ListSessionsResponse:
+      type: object
+      required: [sessions]
+      properties:
+        sessions:
+          type: array
+          items:
+            $ref: '#/components/schemas/Session'
+        next_cursor:
+          type:
+            - string
+            - 'null'
+    CreateSessionRequest:
+      type: object
+      required: [machine_id, title_ciphertext]
+      properties:
+        machine_id:
+          type: string
+        title_ciphertext:
+          type: string
+    CreateSessionResponse:
+      type: object
+      required: [session]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+    GetSessionResponse:
+      type: object
+      required: [session]
+      properties:
+        session:
+          $ref: '#/components/schemas/Session'
+    Message:
+      type: object
+      required:
+        [
+          message_id,
+          session_id,
+          role,
+          ciphertext,
+          optimistic_version,
+          created_at_unix_ms,
+        ]
+      properties:
+        message_id:
+          type: string
+        session_id:
+          type: string
+        role:
+          type: string
+        ciphertext:
+          type: string
+        optimistic_version:
+          type: integer
+          format: uint64
+        created_at_unix_ms:
+          type: integer
+          format: uint64
+    ListMessagesResponse:
+      type: object
+      required: [session_id, messages]
+      properties:
+        session_id:
+          type: string
+        messages:
+          type: array
+          items:
+            $ref: '#/components/schemas/Message'
+        next_cursor:
+          type:
+            - string
+            - 'null'
+    AppendMessageRequest:
+      type: object
+      required: [role, ciphertext]
+      properties:
+        role:
+          type: string
+        ciphertext:
+          type: string
+        client_message_id:
+          type:
+            - string
+            - 'null'
+    AppendMessageResponse:
+      type: object
+      required: [message]
+      properties:
+        message:
+          $ref: '#/components/schemas/Message'
+    RealtimeBootstrapResponse:
+      type: object
+      required:
+        [
+          websocket_url,
+          session_token,
+          heartbeat_interval_ms,
+          last_sequence,
+          schema_version,
+        ]
+      properties:
+        websocket_url:
+          type: string
+          format: uri
+        session_token:
+          type: string
+        heartbeat_interval_ms:
+          type: integer
+          format: uint64
+        last_sequence:
+          type: integer
+          format: uint64
+        schema_version:
+          type: integer
+          minimum: 1
     WebSocketEnvelope:
       type: object
-      required: [sequence, event]
+      description: Envelope for every websocket event published by the API.
+      required: [schema_version, sequence, event]
       properties:
+        schema_version:
+          type: integer
+          minimum: 1
+          description: Incremented only for breaking event shape changes.
         sequence:
           type: integer
           format: uint64
+          description: Monotonic per-user sequence for ordering and resume.
         event:
           $ref: '#/components/schemas/ApiEvent'
     ApiEvent:
+      description: Discriminated union of websocket event variants.
       oneOf:
         - $ref: '#/components/schemas/SessionCreatedEvent'
         - $ref: '#/components/schemas/SessionUpdatedEvent'
