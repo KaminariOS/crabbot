@@ -20,3 +20,10 @@
 - `heartbeat`
 
 Canonical source for field-level definitions is `schemas/openapi.yaml`.
+
+## Connection
+- Bootstrap via `GET /realtime/bootstrap` to get `session_token` and last known `sequence`.
+- Connect websocket at `/realtime` with either:
+  - query params: `session_token`, optional `since_sequence`
+  - or `Authorization: Bearer <session_token>` header
+- On reconnect, pass `since_sequence=<last_seen_sequence>` to replay missed events in order.
