@@ -22,6 +22,7 @@ use crabbot_protocol::{
     RealtimeBootstrapResponse, Session, SessionCreated, WEBSOCKET_SCHEMA_VERSION,
     WebSocketEnvelope,
 };
+use crabbot_storage::{InMemoryRedisPresenceAdapter, PresenceStore};
 use futures_util::StreamExt;
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
@@ -30,6 +31,7 @@ use tokio::sync::{RwLock, broadcast};
 const SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const REALTIME_CHANNEL_CAPACITY: usize = 256;
 const EVENT_LOG_LIMIT: usize = 512;
+const REALTIME_PRESENCE_TTL: Duration = Duration::from_secs(45);
 const JWT_SECRET_ENV: &str = "CRABBOT_JWT_SECRET";
 const JWT_DEFAULT_DEV_SECRET: &str = "crabbot-dev-secret-change-me";
 
@@ -39,6 +41,7 @@ pub struct AppState {
     pub realtime_websocket_url: String,
     jwt_secret: String,
     store: Arc<RwLock<InMemoryStore>>,
+    presence: Arc<RwLock<InMemoryRedisPresenceAdapter>>,
 }
 
 #[derive(Debug, Clone)]
@@ -104,6 +107,7 @@ pub fn router() -> Router {
         realtime_websocket_url: "wss://api.crabbot.local/realtime".to_string(),
         jwt_secret: env::var(JWT_SECRET_ENV).unwrap_or_else(|_| JWT_DEFAULT_DEV_SECRET.to_string()),
         store: Arc::new(RwLock::new(InMemoryStore::default())),
+        presence: Arc::new(RwLock::new(InMemoryRedisPresenceAdapter::default())),
     };
 
     router_with_state(state)
@@ -239,6 +243,17 @@ fn parse_idempotency_key(headers: &HeaderMap) -> Result<Option<String>, StatusCo
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok(Some(normalized.to_string()))
+}
+
+async fn refresh_presence(state: &AppState, user_id: &str, presence_key: &str) {
+    let expires_at_unix_ms = now_unix_ms() + REALTIME_PRESENCE_TTL.as_millis() as u64;
+    let mut presence = state.presence.write().await;
+    presence.set_presence(user_id, presence_key, expires_at_unix_ms);
+}
+
+async fn clear_presence(state: &AppState, user_id: &str, presence_key: &str) {
+    let mut presence = state.presence.write().await;
+    presence.clear_presence(user_id, presence_key);
 }
 
 async fn authenticate(headers: &HeaderMap, state: &AppState) -> Result<Authenticated, StatusCode> {
@@ -656,15 +671,26 @@ async fn realtime_websocket(
     let auth = authenticate_token(token, &state).await?;
     let since_sequence = query.since_sequence.unwrap_or(0);
 
-    Ok(ws.on_upgrade(move |socket| realtime_socket(socket, state, auth.user_id, since_sequence)))
+    Ok(ws.on_upgrade(move |socket| {
+        realtime_socket(
+            socket,
+            state,
+            auth.user_id,
+            auth.session_token,
+            since_sequence,
+        )
+    }))
 }
 
 async fn realtime_socket(
     mut socket: WebSocket,
     state: AppState,
     user_id: String,
+    presence_key: String,
     since_sequence: u64,
 ) {
+    refresh_presence(&state, &user_id, &presence_key).await;
+
     let (backlog, mut receiver) = {
         let mut store = state.store.write().await;
         let backlog = store
@@ -680,7 +706,7 @@ async fn realtime_socket(
             .unwrap_or_default();
         let receiver = store
             .realtime_by_user
-            .entry(user_id)
+            .entry(user_id.clone())
             .or_insert_with(create_broadcaster)
             .subscribe();
         (backlog, receiver)
@@ -688,8 +714,10 @@ async fn realtime_socket(
 
     for envelope in backlog {
         if send_envelope(&mut socket, &envelope).await.is_err() {
+            clear_presence(&state, &user_id, &presence_key).await;
             return;
         }
+        refresh_presence(&state, &user_id, &presence_key).await;
     }
 
     loop {
@@ -698,17 +726,21 @@ async fn realtime_socket(
                 match inbound {
                     Some(Ok(WsMessage::Close(_))) | None => break,
                     Some(Ok(WsMessage::Ping(payload))) => {
+                        refresh_presence(&state, &user_id, &presence_key).await;
                         if socket.send(WsMessage::Pong(payload)).await.is_err() {
                             break;
                         }
                     }
-                    Some(Ok(_)) => {}
+                    Some(Ok(_)) => {
+                        refresh_presence(&state, &user_id, &presence_key).await;
+                    }
                     Some(Err(_)) => break,
                 }
             }
             outbound = receiver.recv() => {
                 match outbound {
                     Ok(envelope) => {
+                        refresh_presence(&state, &user_id, &presence_key).await;
                         if send_envelope(&mut socket, &envelope).await.is_err() {
                             break;
                         }
@@ -722,6 +754,8 @@ async fn realtime_socket(
             }
         }
     }
+
+    clear_presence(&state, &user_id, &presence_key).await;
 }
 
 async fn send_envelope(socket: &mut WebSocket, envelope: &WebSocketEnvelope) -> Result<(), ()> {
@@ -742,7 +776,7 @@ mod tests {
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use tokio::task::JoinHandle;
-    use tokio::time::timeout;
+    use tokio::time::{sleep, timeout};
     use tokio_tungstenite::{
         MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as TungsteniteMessage,
     };
@@ -981,6 +1015,7 @@ mod tests {
             realtime_websocket_url: "ws://127.0.0.1/realtime".to_string(),
             jwt_secret: JWT_DEFAULT_DEV_SECRET.to_string(),
             store: Arc::new(RwLock::new(InMemoryStore::default())),
+            presence: Arc::new(RwLock::new(InMemoryRedisPresenceAdapter::default())),
         }
     }
 
@@ -1301,6 +1336,53 @@ mod tests {
             .expect("realtime bootstrap request should succeed");
         let bootstrap_payload: RealtimeBootstrapResponse = parse_json(bootstrap).await;
         assert_eq!(bootstrap_payload.last_sequence, 2);
+    }
+
+    #[tokio::test]
+    async fn realtime_websocket_connection_sets_and_clears_presence() {
+        let state = test_state();
+        let app = router_with_state(state.clone());
+        let login = login(app).await;
+        let (addr, server_task) = spawn_server(router_with_state(state.clone())).await;
+
+        let url = format!(
+            "ws://{addr}/realtime?session_token={}&since_sequence=0",
+            login.session_token
+        );
+        let (mut stream, _response) = connect_async(url).await.expect("open websocket");
+
+        let mut saw_online = false;
+        for _ in 0..20 {
+            {
+                let presence = state.presence.read().await;
+                if presence.is_online(&login.user_id, &login.session_token, now_unix_ms()) {
+                    saw_online = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(saw_online, "expected websocket presence to become online");
+
+        stream.close(None).await.expect("close websocket");
+
+        let mut saw_offline = false;
+        for _ in 0..20 {
+            {
+                let presence = state.presence.read().await;
+                if !presence.is_online(&login.user_id, &login.session_token, now_unix_ms()) {
+                    saw_offline = true;
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_offline,
+            "expected websocket presence to clear after connection close"
+        );
+
+        server_task.abort();
     }
 
     #[tokio::test]

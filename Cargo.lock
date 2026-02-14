@@ -134,6 +134,7 @@ dependencies = [
  "anyhow",
  "axum",
  "crabbot_protocol",
+ "crabbot_storage",
  "futures-util",
  "http-body-util",
  "jsonwebtoken",

@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 axum = { version = "0.8", features = ["ws"] }
 crabbot_protocol = { path = "../../crates/protocol" }
+crabbot_storage = { path = "../../crates/storage" }
 futures-util = "0.3"
 jsonwebtoken = "9"
 serde.workspace = true

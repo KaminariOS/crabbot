@@ -83,6 +83,12 @@ pub trait ArtifactStore {
     fn list_artifacts_for_session(&self, session_id: &str) -> Vec<ArtifactRecord>;
 }
 
+pub trait PresenceStore {
+    fn set_presence(&mut self, account_id: &str, machine_id: &str, expires_at_unix_ms: u64);
+    fn clear_presence(&mut self, account_id: &str, machine_id: &str);
+    fn is_online(&self, account_id: &str, machine_id: &str, now_unix_ms: u64) -> bool;
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct InMemoryPostgresAdapter {
     accounts: HashMap<String, AccountRecord>,
@@ -192,15 +198,20 @@ pub struct InMemoryRedisPresenceAdapter {
     entries: HashMap<(String, String), u64>,
 }
 
-impl InMemoryRedisPresenceAdapter {
-    pub fn set_presence(&mut self, account_id: &str, machine_id: &str, expires_at_unix_ms: u64) {
+impl PresenceStore for InMemoryRedisPresenceAdapter {
+    fn set_presence(&mut self, account_id: &str, machine_id: &str, expires_at_unix_ms: u64) {
         self.entries.insert(
             (account_id.to_string(), machine_id.to_string()),
             expires_at_unix_ms,
         );
     }
 
-    pub fn is_online(&self, account_id: &str, machine_id: &str, now_unix_ms: u64) -> bool {
+    fn clear_presence(&mut self, account_id: &str, machine_id: &str) {
+        self.entries
+            .remove(&(account_id.to_string(), machine_id.to_string()));
+    }
+
+    fn is_online(&self, account_id: &str, machine_id: &str, now_unix_ms: u64) -> bool {
         self.entries
             .get(&(account_id.to_string(), machine_id.to_string()))
             .is_some_and(|expires_at| *expires_at > now_unix_ms)
@@ -331,6 +342,8 @@ mod tests {
         assert!(adapter.is_online("acct_1", "machine_1", 100));
         assert!(!adapter.is_online("acct_1", "machine_1", 200));
         assert!(!adapter.is_online("acct_1", "machine_2", 100));
+        adapter.clear_presence("acct_1", "machine_1");
+        assert!(!adapter.is_online("acct_1", "machine_1", 100));
     }
 
     #[test]

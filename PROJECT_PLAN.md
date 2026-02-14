@@ -124,6 +124,7 @@ What We Are Building
 
   - [x] Implement storage domain records and in-memory adapters for accounts/sessions/messages/machines/artifacts.
   - [x] Add clear presence and object storage adapters for reliability-layer integration points.
+  - [x] Integrate realtime websocket presence tracking (online/offline lifecycle) through storage adapters.
   - [x] Enforce `Idempotency-Key` replay semantics on write APIs for sessions/messages with conflict detection.
   - [x] Add load/soak harness for websocket fanout and retry-heavy traffic patterns.
   - [x] Add env-configurable manual soak test entrypoint:
