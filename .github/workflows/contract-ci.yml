@@ -1,0 +1,41 @@
+name: contract-ci
+
+on:
+  pull_request:
+    paths:
+      - "schemas/openapi.yaml"
+      - "apps/mobile/packages/api-client/**"
+      - ".github/workflows/contract-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "schemas/openapi.yaml"
+      - "apps/mobile/packages/api-client/**"
+      - ".github/workflows/contract-ci.yml"
+
+jobs:
+  openapi-generate-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/mobile/packages/api-client/package-lock.json
+
+      - name: Install api-client dependencies
+        working-directory: apps/mobile/packages/api-client
+        run: npm ci
+
+      - name: Regenerate API types
+        working-directory: apps/mobile/packages/api-client
+        run: npm run generate
+
+      - name: Verify generated output is committed
+        run: git diff --exit-code -- apps/mobile/packages/api-client/src/generated.ts
