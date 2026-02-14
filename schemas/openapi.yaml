@@ -41,8 +41,14 @@ paths:
       operationId: postAuthRefresh
       summary: Refresh session token
       responses:
-        '501':
-          description: Refresh stub is not implemented yet
+        '200':
+          description: Refresh success
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LoginResponse'
+        '401':
+          description: Invalid or expired refresh token
   /sessions:
     get:
       operationId: getSessions
@@ -54,6 +60,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ListSessionsResponse'
+        '401':
+          description: Missing or invalid bearer token
     post:
       operationId: postSessions
       summary: Create a new session
@@ -72,6 +80,8 @@ paths:
                 $ref: '#/components/schemas/CreateSessionResponse'
         '400':
           description: Invalid request payload
+        '401':
+          description: Missing or invalid bearer token
   /sessions/{session_id}:
     get:
       operationId: getSessionById
@@ -85,6 +95,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/GetSessionResponse'
+        '401':
+          description: Missing or invalid bearer token
         '404':
           description: Session not found
   /sessions/{session_id}/messages:
@@ -100,6 +112,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ListMessagesResponse'
+        '401':
+          description: Missing or invalid bearer token
         '404':
           description: Session not found
     post:
@@ -122,6 +136,10 @@ paths:
                 $ref: '#/components/schemas/AppendMessageResponse'
         '400':
           description: Invalid request payload
+        '401':
+          description: Missing or invalid bearer token
+        '409':
+          description: Optimistic version conflict from stale `If-Match` value
         '404':
           description: Session not found
   /realtime/bootstrap:
@@ -135,6 +153,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/RealtimeBootstrapResponse'
+        '401':
+          description: Missing or invalid bearer token
 components:
   parameters:
     SessionId:
