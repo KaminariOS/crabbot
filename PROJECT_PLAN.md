@@ -1,5 +1,5 @@
 What We Are Building
-  It is a high customized rewrite of the `happy` project. 
+  It is a highly customized rewrite of the `happy` project. 
   We are building Crabbot: a Codex-only engineering assistant platform with:
 
   1. Frontend: React Native app (targets Android + Web).
