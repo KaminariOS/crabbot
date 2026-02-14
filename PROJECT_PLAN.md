@@ -143,3 +143,5 @@ What We Are Building
   - [x] Replace local attach mirroring with real daemon stream integration.
   - [x] Add end-to-end CLI-to-daemon and CLI-to-API happy path tests.
   - [x] Route CLI `start`/`resume`/`interrupt` through daemon control endpoints with persisted local status cache.
+  - [x] Route CLI `status --session-id ...` through daemon status endpoint with cache refresh semantics.
+  - [x] Refresh local status cache from daemon stream session-state events during `attach`.

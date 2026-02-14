@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use crabbot_protocol::{
-    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope, HealthResponse,
+    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope,
+    DaemonStreamEvent, HealthResponse,
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -159,8 +160,14 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
             should_persist = true;
             handle_interrupt(args, &mut state)
         }
-        CodexSubcommand::Status(args) => handle_status(args, &state),
-        CodexSubcommand::Attach(args) => handle_attach(args, &state),
+        CodexSubcommand::Status(args) => {
+            should_persist = args.session_id.is_some();
+            handle_status(args, &mut state)
+        }
+        CodexSubcommand::Attach(args) => {
+            should_persist = true;
+            handle_attach(args, &mut state)
+        }
         CodexSubcommand::Config(command) => match command.command {
             ConfigSubcommand::Show => Ok(handle_config_show(&state)),
             ConfigSubcommand::Set(args) => {
@@ -234,7 +241,7 @@ fn handle_interrupt(args: SessionArgs, state: &mut CliState) -> Result<Value> {
     }))
 }
 
-fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
+fn handle_status(args: StatusArgs, state: &mut CliState) -> Result<Value> {
     let api_health = if args.check_api {
         Some(fetch_api_health(&state.config.api_endpoint)?)
     } else {
@@ -242,16 +249,14 @@ fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
     };
 
     if let Some(session_id) = args.session_id {
-        let session = state
-            .sessions
-            .get(&session_id)
-            .ok_or_else(|| anyhow!("session not found: {session_id}"))?;
+        let daemon_session = daemon_get_session_status(&state.config.daemon_endpoint, &session_id)?;
+        persist_daemon_session(state, &daemon_session)?;
         return Ok(json!({
             "ok": true,
-            "session_id": session_id,
-            "state": session.state,
-            "updated_at_unix_ms": session.updated_at_unix_ms,
-            "last_event": session.last_event,
+            "session_id": daemon_session.session_id,
+            "state": daemon_session.state,
+            "updated_at_unix_ms": daemon_session.updated_at_unix_ms,
+            "last_event": daemon_session.last_event,
             "daemon_endpoint": state.config.daemon_endpoint,
             "api_endpoint": state.config.api_endpoint,
             "api_health": api_health,
@@ -267,12 +272,30 @@ fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
     }))
 }
 
-fn handle_attach(args: SessionArgs, state: &CliState) -> Result<Value> {
+fn handle_attach(args: SessionArgs, state: &mut CliState) -> Result<Value> {
     if args.session_id.trim().is_empty() {
         bail!("session_id cannot be empty");
     }
 
     let stream_events = fetch_daemon_stream(&state.config.daemon_endpoint, &args.session_id)?;
+    if let Some(latest_state) = stream_events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.event {
+            DaemonStreamEvent::SessionState(payload) => Some(payload.state.clone()),
+            _ => None,
+        })
+    {
+        persist_daemon_session(
+            state,
+            &DaemonSessionStatusResponse {
+                session_id: args.session_id.clone(),
+                state: latest_state,
+                last_event: "attached".to_string(),
+                updated_at_unix_ms: now_unix_ms(),
+            },
+        )?;
+    }
     let received_events = stream_events.len();
     let last_sequence = stream_events
         .last()
@@ -447,6 +470,24 @@ fn daemon_interrupt_session(
         .context("parse daemon interrupt response")
 }
 
+fn daemon_get_session_status(
+    daemon_endpoint: &str,
+    session_id: &str,
+) -> Result<DaemonSessionStatusResponse> {
+    let client = http_client()?;
+    let path = format!("/v1/sessions/{session_id}/status");
+    let url = endpoint_url(daemon_endpoint, &path);
+    let response = client
+        .get(url)
+        .send()
+        .context("request daemon session status")?
+        .error_for_status()
+        .context("daemon session status returned error status")?;
+    response
+        .json::<DaemonSessionStatusResponse>()
+        .context("parse daemon status response")
+}
+
 fn fetch_daemon_stream(
     daemon_endpoint: &str,
     session_id: &str,
@@ -481,6 +522,13 @@ fn resolve_state_path() -> Result<PathBuf> {
 
     let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
     Ok(PathBuf::from(home).join(".crabbot").join("cli-state.json"))
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
 }
 
 fn load_state(path: &Path) -> Result<CliState> {
@@ -612,6 +660,13 @@ mod tests {
                 r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":30}"#
                     .to_string(),
             ),
+            (
+                "GET /v1/sessions/sess_cli_1/status HTTP/1.1".to_string(),
+                "HTTP/1.1 200 OK".to_string(),
+                "application/json".to_string(),
+                r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":31}"#
+                    .to_string(),
+            ),
         ]);
 
         let _ = run_json(
@@ -680,6 +735,7 @@ mod tests {
         );
         assert_eq!(status["state"], "active");
         assert_eq!(status["last_event"], "resumed");
+        assert_eq!(status["updated_at_unix_ms"], 31);
         daemon_handle.join().expect("join daemon mock thread");
     }
 
@@ -812,6 +868,11 @@ mod tests {
         );
         assert_eq!(status["ok"], true);
         assert_eq!(status["api_health"]["service"], "mock_api");
+        assert_eq!(status["sessions"]["sess_cli_attach"]["state"], "active");
+        assert_eq!(
+            status["sessions"]["sess_cli_attach"]["last_event"],
+            "attached"
+        );
 
         daemon_handle.join().expect("join daemon mock thread");
         api_handle.join().expect("join api mock thread");
