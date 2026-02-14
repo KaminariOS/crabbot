@@ -161,6 +161,42 @@ pub struct Heartbeat {
     pub unix_ms: u64,
 }
 
+pub const DAEMON_STREAM_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStreamEnvelope {
+    pub schema_version: u16,
+    pub session_id: String,
+    pub sequence: u64,
+    pub event: DaemonStreamEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum DaemonStreamEvent {
+    SessionState(DaemonSessionState),
+    TurnStreamDelta(DaemonTurnStreamDelta),
+    TurnCompleted(DaemonTurnCompleted),
+    Heartbeat(Heartbeat),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonSessionState {
+    pub state: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonTurnStreamDelta {
+    pub turn_id: String,
+    pub delta: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonTurnCompleted {
+    pub turn_id: String,
+    pub output_summary: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -182,6 +218,25 @@ mod tests {
         assert_eq!(value["sequence"], 42);
         assert_eq!(value["event"]["type"], "turn_stream_delta");
         assert_eq!(value["event"]["payload"]["delta"], "hello");
+    }
+
+    #[test]
+    fn daemon_stream_event_uses_tagged_schema() {
+        let envelope = DaemonStreamEnvelope {
+            schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+            session_id: "s_1".to_string(),
+            sequence: 3,
+            event: DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
+                turn_id: "t_1".to_string(),
+                output_summary: "done".to_string(),
+            }),
+        };
+
+        let value = serde_json::to_value(&envelope).expect("serialize daemon envelope");
+        assert_eq!(value["schema_version"], DAEMON_STREAM_SCHEMA_VERSION);
+        assert_eq!(value["sequence"], 3);
+        assert_eq!(value["event"]["type"], "turn_completed");
+        assert_eq!(value["event"]["payload"]["output_summary"], "done");
     }
 
     #[test]

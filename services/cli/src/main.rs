@@ -1,12 +1,14 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
+use crabbot_protocol::{DaemonStreamEnvelope, HealthResponse};
+use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[derive(Debug, Parser)]
@@ -53,6 +55,8 @@ struct SessionArgs {
 struct StatusArgs {
     #[arg(long)]
     session_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    check_api: bool,
 }
 
 #[derive(Debug, Args)]
@@ -234,6 +238,12 @@ fn handle_interrupt(args: SessionArgs, state: &mut CliState) -> Result<Value> {
 }
 
 fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
+    let api_health = if args.check_api {
+        Some(fetch_api_health(&state.config.api_endpoint)?)
+    } else {
+        None
+    };
+
     if let Some(session_id) = args.session_id {
         let session = state
             .sessions
@@ -247,6 +257,7 @@ fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
             "last_event": session.last_event,
             "daemon_endpoint": state.config.daemon_endpoint,
             "api_endpoint": state.config.api_endpoint,
+            "api_health": api_health,
         }));
     }
 
@@ -255,20 +266,29 @@ fn handle_status(args: StatusArgs, state: &CliState) -> Result<Value> {
         "sessions": state.sessions,
         "daemon_endpoint": state.config.daemon_endpoint,
         "api_endpoint": state.config.api_endpoint,
+        "api_health": api_health,
     }))
 }
 
 fn handle_attach(args: SessionArgs, state: &CliState) -> Result<Value> {
-    let session = state
-        .sessions
-        .get(&args.session_id)
-        .ok_or_else(|| anyhow!("session not found: {}", args.session_id))?;
+    if args.session_id.trim().is_empty() {
+        bail!("session_id cannot be empty");
+    }
+
+    let stream_events = fetch_daemon_stream(&state.config.daemon_endpoint, &args.session_id)?;
+    let received_events = stream_events.len();
+    let last_sequence = stream_events
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(0);
+
     Ok(json!({
         "ok": true,
         "action": "attach",
         "session_id": args.session_id,
-        "mirrored_state": session.state,
-        "last_event": session.last_event,
+        "stream_events": stream_events,
+        "received_events": received_events,
+        "last_sequence": last_sequence,
         "daemon_endpoint": state.config.daemon_endpoint,
     }))
 }
@@ -323,6 +343,59 @@ fn handle_config_set(args: ConfigSetArgs, state: &mut CliState) -> Result<Value>
     }))
 }
 
+fn http_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .context("build http client")
+}
+
+fn endpoint_url(base: &str, path: &str) -> String {
+    format!(
+        "{}/{}",
+        base.trim_end_matches('/'),
+        path.trim_start_matches('/')
+    )
+}
+
+fn fetch_api_health(api_endpoint: &str) -> Result<HealthResponse> {
+    let client = http_client()?;
+    let url = endpoint_url(api_endpoint, "/health");
+    let response = client
+        .get(url)
+        .send()
+        .context("request api health")?
+        .error_for_status()
+        .context("api health returned error status")?;
+    response
+        .json::<HealthResponse>()
+        .context("parse api health response")
+}
+
+fn fetch_daemon_stream(
+    daemon_endpoint: &str,
+    session_id: &str,
+) -> Result<Vec<DaemonStreamEnvelope>> {
+    let client = http_client()?;
+    let path = format!("/v1/sessions/{session_id}/stream");
+    let url = endpoint_url(daemon_endpoint, &path);
+    let body = client
+        .get(url)
+        .send()
+        .context("request daemon stream")?
+        .error_for_status()
+        .context("daemon stream returned error status")?
+        .text()
+        .context("read daemon stream body")?;
+
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<DaemonStreamEnvelope>(line).context("parse daemon stream line")
+        })
+        .collect()
+}
+
 fn resolve_state_path() -> Result<PathBuf> {
     if let Some(path) = env::var_os("CRABBOT_CLI_STATE_PATH") {
         let candidate = PathBuf::from(path);
@@ -366,6 +439,15 @@ fn now_unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crabbot_protocol::{
+        DAEMON_STREAM_SCHEMA_VERSION, DaemonSessionState, DaemonStreamEvent, DaemonTurnStreamDelta,
+        Heartbeat,
+    };
+    use std::{
+        io::{Read, Write},
+        net::TcpListener,
+        thread::JoinHandle,
+    };
     use tempfile::TempDir;
 
     fn temp_state_path() -> (TempDir, PathBuf) {
@@ -377,6 +459,36 @@ mod tests {
     fn run_json(cli: Cli, state_path: &Path) -> Value {
         let output = run_with_state_path(cli, state_path).expect("run command");
         serde_json::from_str(&output).expect("parse command output")
+    }
+
+    fn spawn_mock_get_server(
+        expected_path: &str,
+        content_type: &str,
+        body: String,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        let expected_request_line = format!("GET {expected_path} HTTP/1.1");
+        let content_type = content_type.to_string();
+        let handle = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept mock request");
+            let mut buffer = [0_u8; 8 * 1024];
+            let read = stream.read(&mut buffer).expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..read]);
+            let first_line = request.lines().next().unwrap_or_default();
+            assert_eq!(first_line, expected_request_line);
+
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream
+                .write_all(response.as_bytes())
+                .expect("write response");
+            stream.flush().expect("flush response");
+        });
+
+        (format!("http://{addr}"), handle)
     }
 
     #[test]
@@ -425,6 +537,7 @@ mod tests {
                 command: TopLevelCommand::Codex(CodexCommand {
                     command: CodexSubcommand::Status(StatusArgs {
                         session_id: Some("sess_cli_1".to_string()),
+                        check_api: false,
                     }),
                 }),
             },
@@ -474,8 +587,66 @@ mod tests {
     }
 
     #[test]
-    fn attach_reflects_session_state() {
+    fn attach_uses_daemon_stream_and_status_can_check_api_health() {
         let (_dir, state_path) = temp_state_path();
+
+        let daemon_events = vec![
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_attach".to_string(),
+                sequence: 1,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_attach".to_string(),
+                sequence: 2,
+                event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                    turn_id: "turn_1".to_string(),
+                    delta: "hello from daemon".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_cli_attach".to_string(),
+                sequence: 3,
+                event: DaemonStreamEvent::Heartbeat(Heartbeat { unix_ms: 123 }),
+            },
+        ];
+        let daemon_body = daemon_events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize daemon event"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        let (daemon_endpoint, daemon_handle) = spawn_mock_get_server(
+            "/v1/sessions/sess_cli_attach/stream",
+            "application/x-ndjson",
+            daemon_body,
+        );
+        let (api_endpoint, api_handle) = spawn_mock_get_server(
+            "/health",
+            "application/json",
+            r#"{"status":"ok","service":"mock_api","version":"1.2.3"}"#.to_string(),
+        );
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: Some(api_endpoint),
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: None,
+                            clear_auth_token: false,
+                        }),
+                    }),
+                }),
+            },
+            &state_path,
+        );
 
         let _ = run_json(
             Cli {
@@ -499,6 +670,25 @@ mod tests {
             &state_path,
         );
         assert_eq!(attach["ok"], true);
-        assert_eq!(attach["mirrored_state"], "active");
+        assert_eq!(attach["received_events"], 3);
+        assert_eq!(attach["last_sequence"], 3);
+        assert_eq!(attach["stream_events"][0]["event"]["type"], "session_state");
+
+        let status = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: CodexSubcommand::Status(StatusArgs {
+                        session_id: Some("sess_cli_attach".to_string()),
+                        check_api: true,
+                    }),
+                }),
+            },
+            &state_path,
+        );
+        assert_eq!(status["ok"], true);
+        assert_eq!(status["api_health"]["service"], "mock_api");
+
+        daemon_handle.join().expect("join daemon mock thread");
+        api_handle.join().expect("join api mock thread");
     }
 }

@@ -140,5 +140,5 @@ What We Are Building
 
   - [x] Implement `crabbot codex` CLI workflows: `start`, `resume`, `interrupt`, and `status`.
   - [x] Add local CLI config/auth management for API/daemon endpoints and auth token persistence.
-  - [ ] Replace local attach mirroring with real daemon stream integration.
-  - [ ] Add end-to-end CLI-to-daemon and CLI-to-API happy path tests.
+  - [x] Replace local attach mirroring with real daemon stream integration.
+  - [x] Add end-to-end CLI-to-daemon and CLI-to-API happy path tests.
