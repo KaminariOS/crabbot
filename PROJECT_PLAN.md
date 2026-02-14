@@ -129,3 +129,9 @@ What We Are Building
   - [x] Add load/soak harness for websocket fanout and retry-heavy traffic patterns.
   - [x] Add env-configurable manual soak test entrypoint:
         `CRABBOT_SOAK_CLIENTS=16 CRABBOT_SOAK_WRITERS=4 CRABBOT_SOAK_MESSAGES_PER_WRITER=64 cargo test -p crabbot_api realtime_websocket_soak_harness_is_env_configurable -- --ignored`
+
+  Current Sprint (M4 Kickoff)
+
+  - [x] Expand `crates/codex_app_server` with initialize/session/thread lifecycle primitives.
+  - [x] Add deterministic mapping for turn start/delta/complete and approval-required runtime events.
+  - [x] Implement abort + replay-tested resume behavior for interrupted turns.
