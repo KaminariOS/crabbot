@@ -1,6 +1,8 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
-use crabbot_protocol::{DaemonStreamEnvelope, HealthResponse};
+use crabbot_protocol::{
+    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope, HealthResponse,
+};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -8,7 +10,7 @@ use std::{
     collections::BTreeMap,
     env, fs,
     path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 #[derive(Debug, Parser)]
@@ -176,64 +178,59 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
 }
 
 fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
-    let now = now_unix_ms();
-    let session_id = args
+    if args
         .session_id
-        .unwrap_or_else(|| format!("sess_local_{now}"));
-    if session_id.trim().is_empty() {
+        .as_deref()
+        .is_some_and(|session_id| session_id.trim().is_empty())
+    {
         bail!("session_id cannot be empty");
     }
-
-    state.sessions.insert(
-        session_id.clone(),
-        SessionRuntimeState {
-            state: SessionStatus::Active,
-            updated_at_unix_ms: now,
-            last_event: "started".to_string(),
-        },
-    );
+    let daemon_session = daemon_start_session(&state.config.daemon_endpoint, args.session_id)?;
+    persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
         "ok": true,
         "action": "start",
-        "session_id": session_id,
-        "state": "active",
+        "session_id": daemon_session.session_id,
+        "state": daemon_session.state,
+        "last_event": daemon_session.last_event,
+        "updated_at_unix_ms": daemon_session.updated_at_unix_ms,
         "daemon_endpoint": state.config.daemon_endpoint,
         "api_endpoint": state.config.api_endpoint,
     }))
 }
 
 fn handle_resume(args: SessionArgs, state: &mut CliState) -> Result<Value> {
-    let session = state
-        .sessions
-        .get_mut(&args.session_id)
-        .ok_or_else(|| anyhow!("session not found: {}", args.session_id))?;
-    session.state = SessionStatus::Active;
-    session.updated_at_unix_ms = now_unix_ms();
-    session.last_event = "resumed".to_string();
+    if args.session_id.trim().is_empty() {
+        bail!("session_id cannot be empty");
+    }
+    let daemon_session = daemon_resume_session(&state.config.daemon_endpoint, &args.session_id)?;
+    persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
         "ok": true,
         "action": "resume",
-        "session_id": args.session_id,
-        "state": "active",
+        "session_id": daemon_session.session_id,
+        "state": daemon_session.state,
+        "last_event": daemon_session.last_event,
+        "updated_at_unix_ms": daemon_session.updated_at_unix_ms,
     }))
 }
 
 fn handle_interrupt(args: SessionArgs, state: &mut CliState) -> Result<Value> {
-    let session = state
-        .sessions
-        .get_mut(&args.session_id)
-        .ok_or_else(|| anyhow!("session not found: {}", args.session_id))?;
-    session.state = SessionStatus::Interrupted;
-    session.updated_at_unix_ms = now_unix_ms();
-    session.last_event = "interrupted".to_string();
+    if args.session_id.trim().is_empty() {
+        bail!("session_id cannot be empty");
+    }
+    let daemon_session = daemon_interrupt_session(&state.config.daemon_endpoint, &args.session_id)?;
+    persist_daemon_session(state, &daemon_session)?;
 
     Ok(json!({
         "ok": true,
         "action": "interrupt",
-        "session_id": args.session_id,
-        "state": "interrupted",
+        "session_id": daemon_session.session_id,
+        "state": daemon_session.state,
+        "last_event": daemon_session.last_event,
+        "updated_at_unix_ms": daemon_session.updated_at_unix_ms,
     }))
 }
 
@@ -343,6 +340,30 @@ fn handle_config_set(args: ConfigSetArgs, state: &mut CliState) -> Result<Value>
     }))
 }
 
+fn parse_session_status(state: &str) -> Result<SessionStatus> {
+    match state {
+        "active" => Ok(SessionStatus::Active),
+        "interrupted" => Ok(SessionStatus::Interrupted),
+        other => bail!("unsupported daemon session state: {other}"),
+    }
+}
+
+fn persist_daemon_session(
+    state: &mut CliState,
+    daemon_session: &DaemonSessionStatusResponse,
+) -> Result<()> {
+    let state_value = parse_session_status(&daemon_session.state)?;
+    state.sessions.insert(
+        daemon_session.session_id.clone(),
+        SessionRuntimeState {
+            state: state_value,
+            updated_at_unix_ms: daemon_session.updated_at_unix_ms,
+            last_event: daemon_session.last_event.clone(),
+        },
+    );
+    Ok(())
+}
+
 fn http_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_secs(5))
@@ -370,6 +391,60 @@ fn fetch_api_health(api_endpoint: &str) -> Result<HealthResponse> {
     response
         .json::<HealthResponse>()
         .context("parse api health response")
+}
+
+fn daemon_start_session(
+    daemon_endpoint: &str,
+    session_id: Option<String>,
+) -> Result<DaemonSessionStatusResponse> {
+    let client = http_client()?;
+    let url = endpoint_url(daemon_endpoint, "/v1/sessions/start");
+    let response = client
+        .post(url)
+        .json(&DaemonStartSessionRequest { session_id })
+        .send()
+        .context("request daemon session start")?
+        .error_for_status()
+        .context("daemon session start returned error status")?;
+    response
+        .json::<DaemonSessionStatusResponse>()
+        .context("parse daemon start response")
+}
+
+fn daemon_resume_session(
+    daemon_endpoint: &str,
+    session_id: &str,
+) -> Result<DaemonSessionStatusResponse> {
+    let client = http_client()?;
+    let path = format!("/v1/sessions/{session_id}/resume");
+    let url = endpoint_url(daemon_endpoint, &path);
+    let response = client
+        .post(url)
+        .send()
+        .context("request daemon session resume")?
+        .error_for_status()
+        .context("daemon session resume returned error status")?;
+    response
+        .json::<DaemonSessionStatusResponse>()
+        .context("parse daemon resume response")
+}
+
+fn daemon_interrupt_session(
+    daemon_endpoint: &str,
+    session_id: &str,
+) -> Result<DaemonSessionStatusResponse> {
+    let client = http_client()?;
+    let path = format!("/v1/sessions/{session_id}/interrupt");
+    let url = endpoint_url(daemon_endpoint, &path);
+    let response = client
+        .post(url)
+        .send()
+        .context("request daemon session interrupt")?
+        .error_for_status()
+        .context("daemon session interrupt returned error status")?;
+    response
+        .json::<DaemonSessionStatusResponse>()
+        .context("parse daemon interrupt response")
 }
 
 fn fetch_daemon_stream(
@@ -429,13 +504,6 @@ fn save_state(path: &Path, state: &CliState) -> Result<()> {
     Ok(())
 }
 
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,9 +559,76 @@ mod tests {
         (format!("http://{addr}"), handle)
     }
 
+    fn spawn_mock_sequence_server(
+        expectations: Vec<(String, String, String, String)>,
+    ) -> (String, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind mock sequence server");
+        let addr = listener.local_addr().expect("mock server local addr");
+        let handle = std::thread::spawn(move || {
+            for (expected_request_line, status_line, content_type, body) in expectations {
+                let (mut stream, _) = listener.accept().expect("accept mock request");
+                let mut buffer = [0_u8; 8 * 1024];
+                let read = stream.read(&mut buffer).expect("read request");
+                let request = String::from_utf8_lossy(&buffer[..read]);
+                let first_line = request.lines().next().unwrap_or_default();
+                assert_eq!(first_line, expected_request_line);
+
+                let response = format!(
+                    "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                stream
+                    .write_all(response.as_bytes())
+                    .expect("write response");
+                stream.flush().expect("flush response");
+            }
+        });
+
+        (format!("http://{addr}"), handle)
+    }
+
     #[test]
     fn start_interrupt_resume_and_status_roundtrip() {
         let (_dir, state_path) = temp_state_path();
+        let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
+            (
+                "POST /v1/sessions/start HTTP/1.1".to_string(),
+                "HTTP/1.1 201 Created".to_string(),
+                "application/json".to_string(),
+                r#"{"session_id":"sess_cli_1","state":"active","last_event":"started","updated_at_unix_ms":10}"#
+                    .to_string(),
+            ),
+            (
+                "POST /v1/sessions/sess_cli_1/interrupt HTTP/1.1".to_string(),
+                "HTTP/1.1 200 OK".to_string(),
+                "application/json".to_string(),
+                r#"{"session_id":"sess_cli_1","state":"interrupted","last_event":"interrupted","updated_at_unix_ms":20}"#
+                    .to_string(),
+            ),
+            (
+                "POST /v1/sessions/sess_cli_1/resume HTTP/1.1".to_string(),
+                "HTTP/1.1 200 OK".to_string(),
+                "application/json".to_string(),
+                r#"{"session_id":"sess_cli_1","state":"active","last_event":"resumed","updated_at_unix_ms":30}"#
+                    .to_string(),
+            ),
+        ]);
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: None,
+                            clear_auth_token: false,
+                        }),
+                    }),
+                }),
+            },
+            &state_path,
+        );
 
         let start = run_json(
             Cli {
@@ -545,6 +680,7 @@ mod tests {
         );
         assert_eq!(status["state"], "active");
         assert_eq!(status["last_event"], "resumed");
+        daemon_handle.join().expect("join daemon mock thread");
     }
 
     #[test]
@@ -648,17 +784,6 @@ mod tests {
             &state_path,
         );
 
-        let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Start(StartArgs {
-                        session_id: Some("sess_cli_attach".to_string()),
-                    }),
-                }),
-            },
-            &state_path,
-        );
-
         let attach = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
@@ -678,7 +803,7 @@ mod tests {
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
                     command: CodexSubcommand::Status(StatusArgs {
-                        session_id: Some("sess_cli_attach".to_string()),
+                        session_id: None,
                         check_api: true,
                     }),
                 }),

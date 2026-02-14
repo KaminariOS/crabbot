@@ -197,6 +197,19 @@ pub struct DaemonTurnCompleted {
     pub output_summary: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonStartSessionRequest {
+    pub session_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonSessionStatusResponse {
+    pub session_id: String,
+    pub state: String,
+    pub last_event: String,
+    pub updated_at_unix_ms: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +250,21 @@ mod tests {
         assert_eq!(value["sequence"], 3);
         assert_eq!(value["event"]["type"], "turn_completed");
         assert_eq!(value["event"]["payload"]["output_summary"], "done");
+    }
+
+    #[test]
+    fn daemon_session_status_round_trips() {
+        let response = DaemonSessionStatusResponse {
+            session_id: "sess_1".to_string(),
+            state: "active".to_string(),
+            last_event: "started".to_string(),
+            updated_at_unix_ms: 123,
+        };
+        let value = serde_json::to_value(&response).expect("serialize daemon session status");
+        assert_eq!(value["session_id"], "sess_1");
+        let decoded: DaemonSessionStatusResponse =
+            serde_json::from_value(value).expect("deserialize daemon session status");
+        assert_eq!(decoded, response);
     }
 
     #[test]

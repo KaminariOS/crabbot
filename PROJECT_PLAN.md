@@ -142,3 +142,4 @@ What We Are Building
   - [x] Add local CLI config/auth management for API/daemon endpoints and auth token persistence.
   - [x] Replace local attach mirroring with real daemon stream integration.
   - [x] Add end-to-end CLI-to-daemon and CLI-to-API happy path tests.
+  - [x] Route CLI `start`/`resume`/`interrupt` through daemon control endpoints with persisted local status cache.
