@@ -7,11 +7,12 @@ on:
       - "apps/mobile/packages/api-client/**"
       - ".github/workflows/contract-ci.yml"
   push:
-    branches: [main]
+    branches: [master, main]
     paths:
       - "schemas/openapi.yaml"
       - "apps/mobile/packages/api-client/**"
       - ".github/workflows/contract-ci.yml"
+  workflow_dispatch: {}
 
 jobs:
   openapi-generate-check:

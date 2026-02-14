@@ -3,7 +3,8 @@ name: codespell
 on:
   pull_request: {}
   push:
-    branches: [main]
+    branches: [master, main]
+  workflow_dispatch: {}
 
 permissions:
   contents: read

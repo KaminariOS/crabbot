@@ -9,7 +9,8 @@ on:
       - "services/**"
       - ".github/workflows/rust-ci.yml"
   push:
-    branches: [main]
+    branches: [master, main]
+  workflow_dispatch: {}
 
 concurrency:
   group: rust-ci-${{ github.ref }}
