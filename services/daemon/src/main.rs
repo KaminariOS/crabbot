@@ -10,34 +10,44 @@ use crabbot_codex_app_server::{
     CodexAppServerClient, CodexServerEvent, InitializeRequest, RuntimeEvent, SessionLifecycleState,
 };
 use crabbot_protocol::{
-    DAEMON_STREAM_SCHEMA_VERSION, DaemonApprovalRequired, DaemonPromptRequest,
-    DaemonPromptResponse, DaemonSessionState, DaemonSessionStatusResponse,
-    DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, DaemonTurnCompleted,
-    DaemonTurnStreamDelta, HealthResponse,
+    DAEMON_RPC_STREAM_SCHEMA_VERSION, DAEMON_STREAM_SCHEMA_VERSION, DaemonApprovalRequired,
+    DaemonPromptRequest, DaemonPromptResponse, DaemonRpcDecodeError, DaemonRpcNotification,
+    DaemonRpcRequest, DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcRespondResponse,
+    DaemonRpcServerRequest, DaemonRpcStreamEnvelope, DaemonRpcStreamEvent, DaemonSessionState,
+    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope,
+    DaemonStreamEvent, DaemonTurnCompleted, DaemonTurnStreamDelta, HealthResponse,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     env,
     io::{BufRead, BufReader, Write},
     net::SocketAddr,
-    process::{ChildStdin, ChildStdout, Command, Stdio},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicI64, Ordering},
+    },
+    thread,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::RwLock;
+use tokio::task::JoinError;
 
 const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:8788";
 const DEFAULT_CODEX_APP_SERVER_ENDPOINT: &str = "http://127.0.0.1:8789";
 const CODEX_PROTOCOL_VERSION: &str = "2026-02-14";
 const DAEMON_RUNTIME_USER_ID: &str = "daemon_local_user";
 const DEFAULT_CODEX_BIN: &str = "codex";
+const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
+const RPC_EVENT_BUFFER_CAPACITY: usize = 16384;
 
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<RwLock<HashMap<String, SessionRuntime>>>,
     codex_client: CodexAppServerClient,
+    rpc_runtime: Option<CodexRpcRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +63,262 @@ struct SessionRuntime {
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     since_sequence: Option<u64>,
+}
+
+#[derive(Clone)]
+struct CodexRpcRuntime {
+    inner: Arc<CodexRpcRuntimeInner>,
+}
+
+struct CodexRpcRuntimeInner {
+    stdin: Mutex<ChildStdin>,
+    shared: Arc<(Mutex<CodexRpcShared>, Condvar)>,
+    next_request_id: AtomicI64,
+    _child: Mutex<Child>,
+    _reader_thread: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+#[derive(Default)]
+struct CodexRpcShared {
+    next_sequence: u64,
+    events: VecDeque<DaemonRpcStreamEnvelope>,
+    responses: HashMap<String, Result<Value, String>>,
+}
+
+impl CodexRpcRuntime {
+    fn from_env() -> anyhow::Result<Self> {
+        let codex_bin =
+            env::var("CRABBOT_CODEX_BIN").unwrap_or_else(|_| DEFAULT_CODEX_BIN.to_string());
+        Self::new(&codex_bin)
+    }
+
+    fn new(codex_bin: &str) -> anyhow::Result<Self> {
+        let mut child = Command::new(codex_bin)
+            .arg("app-server")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .with_context(|| format!("spawn `{codex_bin} app-server`"))?;
+
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server stdin unavailable"))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| anyhow::anyhow!("codex app-server stdout unavailable"))?;
+        let shared = Arc::new((Mutex::new(CodexRpcShared::default()), Condvar::new()));
+        let reader_shared = Arc::clone(&shared);
+        let reader_thread = thread::spawn(move || {
+            codex_rpc_reader_loop(BufReader::new(stdout), reader_shared);
+        });
+
+        let runtime = Self {
+            inner: Arc::new(CodexRpcRuntimeInner {
+                stdin: Mutex::new(stdin),
+                shared,
+                next_request_id: AtomicI64::new(1),
+                _child: Mutex::new(child),
+                _reader_thread: Mutex::new(Some(reader_thread)),
+            }),
+        };
+
+        let _ = runtime.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "crabbot-daemon",
+                    "title": "Crabbot Daemon",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+                "capabilities": {
+                    "experimentalApi": true
+                }
+            }),
+        )?;
+        runtime.notify("initialized", json!({}))?;
+        Ok(runtime)
+    }
+
+    fn request(&self, method: &str, params: Value) -> anyhow::Result<(Value, Value)> {
+        let request_id = Value::from(self.inner.next_request_id.fetch_add(1, Ordering::SeqCst));
+        self.write_message(&json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))?;
+
+        let key = request_id_key(&request_id)
+            .ok_or_else(|| anyhow::anyhow!("failed to encode request id"))?;
+        let deadline = Instant::now() + RPC_RESPONSE_TIMEOUT;
+        loop {
+            let (lock, condvar) = &*self.inner.shared;
+            let mut shared = lock.lock().expect("rpc shared mutex poisoned");
+            if let Some(result) = shared.responses.remove(&key) {
+                return result
+                    .map(|value| (request_id.clone(), value))
+                    .map_err(anyhow::Error::msg);
+            }
+
+            let now = Instant::now();
+            if now >= deadline {
+                anyhow::bail!("timed out waiting for app-server response to {method}");
+            }
+            let wait_for = deadline - now;
+            let (next_shared, _) = condvar
+                .wait_timeout(shared, wait_for)
+                .expect("rpc condvar poisoned");
+            drop(next_shared);
+        }
+    }
+
+    fn respond(&self, request_id: Value, result: Value) -> anyhow::Result<()> {
+        self.write_message(&json!({
+            "id": request_id,
+            "result": result,
+        }))
+    }
+
+    fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
+        self.write_message(&json!({
+            "method": method,
+            "params": params,
+        }))
+    }
+
+    fn events_since(&self, since_sequence: u64) -> Vec<DaemonRpcStreamEnvelope> {
+        let (lock, _) = &*self.inner.shared;
+        let shared = lock.lock().expect("rpc shared mutex poisoned");
+        shared
+            .events
+            .iter()
+            .filter(|event| event.sequence > since_sequence)
+            .cloned()
+            .collect()
+    }
+
+    fn write_message(&self, value: &Value) -> anyhow::Result<()> {
+        let mut stdin = self.inner.stdin.lock().expect("rpc stdin mutex poisoned");
+        write_json_line(&mut stdin, value)
+    }
+}
+
+fn codex_rpc_reader_loop(
+    mut reader: BufReader<ChildStdout>,
+    shared: Arc<(Mutex<CodexRpcShared>, Condvar)>,
+) {
+    loop {
+        let mut raw = String::new();
+        let read = match reader.read_line(&mut raw) {
+            Ok(value) => value,
+            Err(error) => {
+                push_rpc_event(
+                    &shared,
+                    DaemonRpcStreamEvent::DecodeError(DaemonRpcDecodeError {
+                        raw: String::new(),
+                        message: format!("read error: {error}"),
+                    }),
+                );
+                break;
+            }
+        };
+        if read == 0 {
+            break;
+        }
+
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+
+        let message = match serde_json::from_str::<Value>(trimmed) {
+            Ok(message) => message,
+            Err(error) => {
+                push_rpc_event(
+                    &shared,
+                    DaemonRpcStreamEvent::DecodeError(DaemonRpcDecodeError {
+                        raw: trimmed.to_string(),
+                        message: error.to_string(),
+                    }),
+                );
+                continue;
+            }
+        };
+
+        let method = message.get("method").and_then(Value::as_str);
+        let request_id = message.get("id").cloned();
+        if method.is_none() && request_id.is_some() {
+            let request_id = request_id.expect("request id checked");
+            let Some(key) = request_id_key(&request_id) else {
+                continue;
+            };
+            let response = if let Some(error_value) = message.get("error") {
+                Err(extract_jsonrpc_error(error_value))
+            } else if let Some(result) = message.get("result") {
+                Ok(result.clone())
+            } else {
+                Err("missing result field in JSON-RPC response".to_string())
+            };
+
+            let (lock, condvar) = &*shared;
+            let mut state = lock.lock().expect("rpc shared mutex poisoned");
+            state.responses.insert(key, response);
+            condvar.notify_all();
+            continue;
+        }
+
+        let Some(method_name) = method else {
+            continue;
+        };
+        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+        if let Some(request_id) = request_id {
+            push_rpc_event(
+                &shared,
+                DaemonRpcStreamEvent::ServerRequest(DaemonRpcServerRequest {
+                    request_id,
+                    method: method_name.to_string(),
+                    params,
+                }),
+            );
+        } else {
+            push_rpc_event(
+                &shared,
+                DaemonRpcStreamEvent::Notification(DaemonRpcNotification {
+                    method: method_name.to_string(),
+                    params,
+                }),
+            );
+        }
+    }
+}
+
+fn push_rpc_event(shared: &Arc<(Mutex<CodexRpcShared>, Condvar)>, event: DaemonRpcStreamEvent) {
+    let (lock, _) = &**shared;
+    let mut state = lock.lock().expect("rpc shared mutex poisoned");
+    state.next_sequence += 1;
+    let sequence = state.next_sequence;
+    state.events.push_back(DaemonRpcStreamEnvelope {
+        schema_version: DAEMON_RPC_STREAM_SCHEMA_VERSION,
+        sequence,
+        event,
+    });
+    while state.events.len() > RPC_EVENT_BUFFER_CAPACITY {
+        state.events.pop_front();
+    }
+}
+
+fn request_id_key(request_id: &Value) -> Option<String> {
+    serde_json::to_string(request_id).ok()
+}
+
+fn extract_jsonrpc_error(error_value: &Value) -> String {
+    error_value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| error_value.to_string())
 }
 
 #[tokio::main]
@@ -97,6 +363,9 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/sessions/{session_id}/prompt", post(prompt_session))
         .route("/v1/sessions/{session_id}/status", get(session_status))
         .route("/v1/sessions/{session_id}/stream", get(session_stream))
+        .route("/v2/app-server/request", post(app_server_rpc_request))
+        .route("/v2/app-server/respond", post(app_server_rpc_respond))
+        .route("/v2/app-server/stream", get(app_server_rpc_stream))
         .with_state(state)
 }
 
@@ -104,15 +373,30 @@ impl AppState {
     fn from_env() -> anyhow::Result<Self> {
         let endpoint = env::var("CRABBOT_CODEX_APP_SERVER_ENDPOINT")
             .unwrap_or_else(|_| DEFAULT_CODEX_APP_SERVER_ENDPOINT.to_string());
-        Self::for_endpoint(&endpoint)
+        let codex_client = CodexAppServerClient::new(&endpoint)
+            .with_context(|| format!("initialize codex app server client for {endpoint}"))?;
+        let rpc_runtime = match CodexRpcRuntime::from_env() {
+            Ok(runtime) => Some(runtime),
+            Err(error) => {
+                eprintln!("warning: daemon app-server rpc bridge disabled: {error:#}");
+                None
+            }
+        };
+        Ok(Self {
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+            codex_client,
+            rpc_runtime,
+        })
     }
 
+    #[cfg(test)]
     fn for_endpoint(endpoint: &str) -> anyhow::Result<Self> {
         let codex_client = CodexAppServerClient::new(endpoint)
             .with_context(|| format!("initialize codex app server client for {endpoint}"))?;
         Ok(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
+            rpc_runtime: None,
         })
     }
 }
@@ -786,6 +1070,75 @@ async fn session_stream(
             ("content-type", "application/x-ndjson"),
             ("cache-control", "no-store"),
             ("x-crabbot-daemon-stream", "1"),
+        ],
+        payload,
+    ))
+}
+
+fn rpc_runtime_or_503(state: &AppState) -> Result<CodexRpcRuntime, StatusCode> {
+    state
+        .rpc_runtime
+        .clone()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
+}
+
+fn map_spawn_blocking_error(error: JoinError) -> StatusCode {
+    let _ = error;
+    StatusCode::INTERNAL_SERVER_ERROR
+}
+
+async fn app_server_rpc_request(
+    State(state): State<AppState>,
+    Json(payload): Json<DaemonRpcRequest>,
+) -> Result<Json<DaemonRpcRequestResponse>, StatusCode> {
+    if payload.method.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    let runtime = rpc_runtime_or_503(&state)?;
+    let method = payload.method.clone();
+    let params = payload.params.clone();
+    let result = tokio::task::spawn_blocking(move || runtime.request(&method, params))
+        .await
+        .map_err(map_spawn_blocking_error)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(DaemonRpcRequestResponse {
+        request_id: result.0,
+        result: result.1,
+    }))
+}
+
+async fn app_server_rpc_respond(
+    State(state): State<AppState>,
+    Json(payload): Json<DaemonRpcRespondRequest>,
+) -> Result<Json<DaemonRpcRespondResponse>, StatusCode> {
+    let runtime = rpc_runtime_or_503(&state)?;
+    let request_id = payload.request_id.clone();
+    let result = payload.result.clone();
+    tokio::task::spawn_blocking(move || runtime.respond(request_id, result))
+        .await
+        .map_err(map_spawn_blocking_error)?
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(Json(DaemonRpcRespondResponse { ok: true }))
+}
+
+async fn app_server_rpc_stream(
+    State(state): State<AppState>,
+    Query(query): Query<StreamQuery>,
+) -> Result<impl IntoResponse, StatusCode> {
+    let runtime = rpc_runtime_or_503(&state)?;
+    let since = query.since_sequence.unwrap_or(0);
+    let lines = runtime
+        .events_since(since)
+        .into_iter()
+        .map(|event| serde_json::to_string(&event).expect("serialize daemon rpc event"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let payload = format!("{lines}\n");
+    Ok((
+        [
+            ("content-type", "application/x-ndjson"),
+            ("cache-control", "no-store"),
+            ("x-crabbot-daemon-app-server-stream", "1"),
         ],
         payload,
     ))

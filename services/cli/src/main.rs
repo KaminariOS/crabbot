@@ -1,7 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use crabbot_protocol::{
-    DaemonPromptRequest, DaemonPromptResponse, DaemonSessionStatusResponse,
+    DaemonPromptRequest, DaemonPromptResponse, DaemonRpcNotification, DaemonRpcRequest,
+    DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcServerRequest,
+    DaemonRpcStreamEnvelope, DaemonRpcStreamEvent, DaemonSessionStatusResponse,
     DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
 };
 use crossterm::{
@@ -66,6 +68,18 @@ const TUI_SLASH_COMMANDS: &[TuiSlashCommand] = &[
         description: "resume interrupted session",
     },
     TuiSlashCommand {
+        command: "/new",
+        description: "start a new app-server thread",
+    },
+    TuiSlashCommand {
+        command: "/approve",
+        description: "approve pending request (id)",
+    },
+    TuiSlashCommand {
+        command: "/deny",
+        description: "deny pending request (id)",
+    },
+    TuiSlashCommand {
         command: "/exit",
         description: "detach from attach tui",
     },
@@ -100,6 +114,7 @@ enum CodexSubcommand {
     Resume(SessionArgs),
     Interrupt(SessionArgs),
     Status(StatusArgs),
+    Tui(TuiArgs),
     Attach(AttachArgs),
     Config(ConfigCommand),
 }
@@ -130,6 +145,12 @@ struct AttachArgs {
     session_id: Option<String>,
     #[arg(long, default_value_t = false)]
     tui: bool,
+}
+
+#[derive(Debug, Args)]
+struct TuiArgs {
+    #[arg(long)]
+    thread_id: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -201,6 +222,8 @@ impl Default for CliConfig {
 struct CliState {
     sessions: BTreeMap<String, SessionRuntimeState>,
     config: CliConfig,
+    #[serde(default)]
+    last_thread_id: Option<String>,
 }
 
 enum CommandOutput {
@@ -264,6 +287,10 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
             should_persist = args.session_id.is_some();
             handle_status(args, &mut state).map(CommandOutput::Json)
         }
+        Some(CodexSubcommand::Tui(args)) => {
+            should_persist = true;
+            handle_tui(args, &mut state)
+        }
         Some(CodexSubcommand::Attach(args)) => {
             should_persist = true;
             handle_attach(args, &mut state)
@@ -289,20 +316,349 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
 }
 
 fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
-    ensure_daemon_ready(state)?;
-    let daemon_session = daemon_start_session(
-        &state.config.daemon_endpoint,
-        None,
-        state.config.auth_token.as_deref(),
-    )?;
-    persist_daemon_session(state, &daemon_session)?;
-    handle_attach(
-        AttachArgs {
-            session_id: Some(daemon_session.session_id),
-            tui: true,
+    if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
+        ensure_daemon_ready(state)?;
+        let daemon_session = daemon_start_session(
+            &state.config.daemon_endpoint,
+            None,
+            state.config.auth_token.as_deref(),
+        )?;
+        persist_daemon_session(state, &daemon_session)?;
+        return handle_attach(
+            AttachArgs {
+                session_id: Some(daemon_session.session_id),
+                tui: true,
+            },
+            state,
+        );
+    }
+    handle_tui(
+        TuiArgs {
+            thread_id: state.last_thread_id.clone(),
         },
         state,
     )
+}
+
+fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+    ensure_daemon_ready(state)?;
+    let mut thread_id = args.thread_id.or_else(|| state.last_thread_id.clone());
+    if thread_id.is_none() {
+        let response = daemon_app_server_rpc_request(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+            "thread/start",
+            json!({
+                "approvalPolicy": "on-request"
+            }),
+        )?;
+        thread_id = extract_thread_id_from_rpc_result(&response.result);
+    }
+    let Some(thread_id) = thread_id else {
+        bail!("failed to initialize app-server thread");
+    };
+    state.last_thread_id = Some(thread_id.clone());
+
+    if io::stdin().is_terminal() && io::stdout().is_terminal() {
+        return handle_tui_interactive(thread_id, state);
+    }
+
+    Ok(CommandOutput::Json(json!({
+        "ok": true,
+        "action": "tui",
+        "thread_id": thread_id,
+        "daemon_endpoint": state.config.daemon_endpoint,
+    })))
+}
+
+fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<CommandOutput> {
+    let mut ui = LiveAttachTui::new(thread_id.clone(), "active".to_string());
+    ui.status_message = Some("connected to daemon app-server bridge".to_string());
+    let _ = poll_app_server_tui_stream_updates(state, &mut ui);
+
+    enable_raw_mode().context("enable raw mode for app-server tui")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("enter alternate screen for app-server tui")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
+    terminal.clear().context("clear app-server tui terminal")?;
+
+    let loop_result = run_app_server_tui_loop(&mut terminal, &mut ui, state);
+
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = terminal.show_cursor();
+
+    loop_result?;
+    state.last_thread_id = Some(ui.session_id.clone());
+    Ok(CommandOutput::Text(format!(
+        "thread={} detached",
+        ui.session_id
+    )))
+}
+
+fn run_app_server_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ui: &mut LiveAttachTui,
+    state: &mut CliState,
+) -> Result<()> {
+    loop {
+        ui.draw(terminal)?;
+        let mut should_redraw = false;
+
+        if event::poll(TUI_EVENT_WAIT_STEP).context("poll app-server tui input event")? {
+            let event = event::read().context("read app-server tui input event")?;
+            if let Event::Key(key_event) = event {
+                if key_event.kind != KeyEventKind::Press {
+                    continue;
+                }
+                match handle_app_server_tui_key_event(key_event, state, ui)? {
+                    LiveTuiAction::Continue => {}
+                    LiveTuiAction::Detach => return Ok(()),
+                }
+                should_redraw = true;
+            }
+        }
+
+        if poll_app_server_tui_stream_updates(state, ui)? {
+            should_redraw = true;
+        }
+
+        if !should_redraw {
+            thread::sleep(TUI_STREAM_POLL_INTERVAL);
+        }
+    }
+}
+
+fn handle_app_server_tui_key_event(
+    key: crossterm::event::KeyEvent,
+    state: &mut CliState,
+    ui: &mut LiveAttachTui,
+) -> Result<LiveTuiAction> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Ok(LiveTuiAction::Detach);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ui.clear_input();
+        }
+        KeyCode::Up => {
+            if ui.slash_picker_is_active() {
+                ui.slash_picker_move_up();
+            } else {
+                ui.history_prev();
+            }
+        }
+        KeyCode::Down => {
+            if ui.slash_picker_is_active() {
+                ui.slash_picker_move_down();
+            } else {
+                ui.history_next();
+            }
+        }
+        KeyCode::Left => ui.move_input_cursor_left(),
+        KeyCode::Right => ui.move_input_cursor_right(),
+        KeyCode::Home => ui.move_input_cursor_home(),
+        KeyCode::End => ui.move_input_cursor_end(),
+        KeyCode::Enter => {
+            if ui.should_apply_slash_picker_on_enter() {
+                let _ = ui.apply_selected_slash_entry();
+                return Ok(LiveTuiAction::Continue);
+            }
+            if handle_app_server_tui_submit(state, ui)? {
+                return Ok(LiveTuiAction::Detach);
+            }
+        }
+        KeyCode::Backspace => {
+            ui.input_backspace();
+        }
+        KeyCode::Delete => {
+            ui.input_delete();
+        }
+        KeyCode::Tab => {
+            if ui.slash_picker_is_active() {
+                let _ = ui.apply_selected_slash_entry();
+            } else {
+                ui.input_insert_char('\t');
+            }
+        }
+        KeyCode::Char(ch) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                ui.input_insert_char(ch);
+            }
+        }
+        _ => {}
+    }
+    Ok(LiveTuiAction::Continue)
+}
+
+fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+    let input = ui.take_input();
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+    ui.remember_history_entry(trimmed);
+
+    match trimmed {
+        "/exit" | "/quit" => return Ok(true),
+        "/status" => {
+            ui.status_message = Some(format!(
+                "thread={} approvals={} seq={}",
+                ui.session_id,
+                ui.pending_approvals.len(),
+                ui.last_sequence
+            ));
+            return Ok(false);
+        }
+        "/refresh" => {
+            ui.status_message = Some("refreshing stream...".to_string());
+            return Ok(false);
+        }
+        "/new" => {
+            let response = daemon_app_server_rpc_request(
+                &state.config.daemon_endpoint,
+                state.config.auth_token.as_deref(),
+                "thread/start",
+                json!({
+                    "approvalPolicy": "on-request"
+                }),
+            )?;
+            let Some(thread_id) = extract_thread_id_from_rpc_result(&response.result) else {
+                bail!("thread/start did not return thread id");
+            };
+            ui.session_id = thread_id.clone();
+            ui.active_turn_id = None;
+            ui.pending_approvals.clear();
+            ui.push_line(&format!("[thread switched] {thread_id}"));
+            ui.status_message = Some("started new thread".to_string());
+            state.last_thread_id = Some(thread_id);
+            return Ok(false);
+        }
+        _ => {}
+    }
+
+    if trimmed == "/interrupt" {
+        if let Some(turn_id) = ui.active_turn_id.clone() {
+            let _ = daemon_app_server_rpc_request(
+                &state.config.daemon_endpoint,
+                state.config.auth_token.as_deref(),
+                "turn/interrupt",
+                json!({
+                    "threadId": ui.session_id,
+                    "turnId": turn_id,
+                }),
+            )?;
+            ui.status_message = Some("interrupt requested".to_string());
+        } else {
+            ui.status_message = Some("no running turn".to_string());
+        }
+        return Ok(false);
+    }
+
+    if trimmed == "/resume" {
+        let response = daemon_app_server_rpc_request(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+            "thread/resume",
+            json!({
+                "threadId": ui.session_id,
+            }),
+        )?;
+        if let Some(thread_id) = extract_thread_id_from_rpc_result(&response.result) {
+            ui.session_id = thread_id.clone();
+            state.last_thread_id = Some(thread_id);
+            ui.status_message = Some("thread resumed".to_string());
+        } else {
+            ui.status_message = Some("resume returned no thread id".to_string());
+        }
+        return Ok(false);
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("/approve") {
+        return handle_app_server_approval_decision(state, ui, rest.trim(), true).map(|_| false);
+    }
+    if let Some(rest) = trimmed.strip_prefix("/deny") {
+        return handle_app_server_approval_decision(state, ui, rest.trim(), false).map(|_| false);
+    }
+
+    ui.push_user_prompt(trimmed);
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "turn/start",
+        json!({
+            "threadId": ui.session_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": trimmed,
+                    "textElements": []
+                }
+            ]
+        }),
+    )?;
+    if let Some(turn_id) = response
+        .result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+    {
+        ui.active_turn_id = Some(turn_id.to_string());
+    }
+    ui.status_message = Some("waiting for response...".to_string());
+    Ok(false)
+}
+
+fn handle_app_server_approval_decision(
+    state: &mut CliState,
+    ui: &mut LiveAttachTui,
+    arg: &str,
+    approve: bool,
+) -> Result<()> {
+    let approval_key = if arg.is_empty() {
+        ui.pending_approvals.keys().next_back().cloned()
+    } else {
+        Some(arg.to_string())
+    }
+    .ok_or_else(|| anyhow!("no pending approval request"))?;
+    let Some(request) = ui.pending_approvals.remove(&approval_key) else {
+        bail!("pending approval id not found: {approval_key}");
+    };
+    daemon_app_server_rpc_respond(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        request.request_id,
+        json!({
+            "decision": if approve { "accept" } else { "decline" }
+        }),
+    )?;
+    ui.status_message = Some(format!(
+        "{} request {}",
+        if approve { "approved" } else { "denied" },
+        approval_key
+    ));
+    Ok(())
+}
+
+fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+    let events = fetch_daemon_app_server_stream(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        Some(ui.last_sequence),
+    )?;
+    if events.is_empty() {
+        return Ok(false);
+    }
+    ui.apply_rpc_stream_events(&events);
+    Ok(true)
 }
 
 fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
@@ -604,6 +960,7 @@ struct LiveAttachTui {
     status_message: Option<String>,
     active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
+    pending_approvals: BTreeMap<String, DaemonRpcServerRequest>,
     slash_picker_index: usize,
 }
 
@@ -623,6 +980,7 @@ impl LiveAttachTui {
             status_message: None,
             active_turn_id: None,
             pending_prompt: None,
+            pending_approvals: BTreeMap::new(),
             slash_picker_index: 0,
         }
     }
@@ -685,6 +1043,88 @@ impl LiveAttachTui {
                 }
                 DaemonStreamEvent::Heartbeat(_) => {}
             }
+        }
+    }
+
+    fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
+        for envelope in stream_events {
+            self.received_events += 1;
+            self.last_sequence = envelope.sequence;
+            match &envelope.event {
+                DaemonRpcStreamEvent::Notification(notification) => {
+                    self.apply_rpc_notification(notification);
+                }
+                DaemonRpcStreamEvent::ServerRequest(request) => {
+                    let key = request_id_key_for_cli(&request.request_id);
+                    self.pending_approvals.insert(key.clone(), request.clone());
+                    self.push_line(&format!(
+                        "[approval required] request_id={key} method={}",
+                        request.method
+                    ));
+                    if let Some(reason) = request.params.get("reason").and_then(Value::as_str) {
+                        self.push_line(&format!("reason: {reason}"));
+                    }
+                }
+                DaemonRpcStreamEvent::DecodeError(error) => {
+                    self.push_line(&format!("[daemon rpc decode error] {}", error.message));
+                }
+            }
+        }
+    }
+
+    fn apply_rpc_notification(&mut self, notification: &DaemonRpcNotification) {
+        match notification.method.as_str() {
+            "thread/started" => {
+                if let Some(thread_id) = notification
+                    .params
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.session_id = thread_id.to_string();
+                    self.push_line(&format!("[thread started] {thread_id}"));
+                }
+            }
+            "turn/started" => {
+                if let Some(turn_id) = notification
+                    .params
+                    .get("turn")
+                    .and_then(|turn| turn.get("id"))
+                    .and_then(Value::as_str)
+                {
+                    self.active_turn_id = Some(turn_id.to_string());
+                    self.status_message = Some("running turn...".to_string());
+                }
+            }
+            "item/agentMessage/delta" => {
+                if let Some(delta) = notification.params.get("delta").and_then(Value::as_str) {
+                    self.append_assistant_delta(delta);
+                }
+            }
+            "item/completed" => {
+                if let Some(item_type) = notification
+                    .params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    && item_type == "agent_message"
+                    && let Some(text) = notification
+                        .params
+                        .get("item")
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                {
+                    self.append_assistant_delta(text);
+                }
+            }
+            "turn/completed" => {
+                self.active_turn_id = None;
+                self.status_message = None;
+                if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
+                    self.transcript.push('\n');
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1963,6 +2403,85 @@ fn daemon_get_session_status(
         .context("parse daemon status response")
 }
 
+fn daemon_app_server_rpc_request(
+    daemon_endpoint: &str,
+    auth_token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<DaemonRpcRequestResponse> {
+    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
+    let url = endpoint_url(daemon_endpoint, "/v2/app-server/request");
+    let response = apply_auth(client.post(url), auth_token)
+        .json(&DaemonRpcRequest {
+            method: method.to_string(),
+            params,
+        })
+        .send()
+        .context("request daemon app-server rpc")?
+        .error_for_status()
+        .context("daemon app-server rpc returned error status")?;
+    response
+        .json::<DaemonRpcRequestResponse>()
+        .context("parse daemon app-server rpc response")
+}
+
+fn daemon_app_server_rpc_respond(
+    daemon_endpoint: &str,
+    auth_token: Option<&str>,
+    request_id: Value,
+    result: Value,
+) -> Result<()> {
+    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
+    let url = endpoint_url(daemon_endpoint, "/v2/app-server/respond");
+    apply_auth(client.post(url), auth_token)
+        .json(&DaemonRpcRespondRequest { request_id, result })
+        .send()
+        .context("respond daemon app-server request")?
+        .error_for_status()
+        .context("daemon app-server respond returned error status")?;
+    Ok(())
+}
+
+fn fetch_daemon_app_server_stream(
+    daemon_endpoint: &str,
+    auth_token: Option<&str>,
+    since_sequence: Option<u64>,
+) -> Result<Vec<DaemonRpcStreamEnvelope>> {
+    let client = http_client_with_timeout(TUI_STREAM_REQUEST_TIMEOUT)?;
+    let mut path = "/v2/app-server/stream".to_string();
+    if let Some(since_sequence) = since_sequence {
+        path.push_str(&format!("?since_sequence={since_sequence}"));
+    }
+    let url = endpoint_url(daemon_endpoint, &path);
+    let response = apply_auth(client.get(url), auth_token)
+        .send()
+        .context("request daemon app-server stream")?;
+    let body = response
+        .error_for_status()
+        .context("daemon app-server stream returned error status")?
+        .text()
+        .context("read daemon app-server stream body")?;
+    body.lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| {
+            serde_json::from_str::<DaemonRpcStreamEnvelope>(line)
+                .context("parse daemon app-server stream line")
+        })
+        .collect::<Result<Vec<_>>>()
+}
+
+fn request_id_key_for_cli(request_id: &Value) -> String {
+    serde_json::to_string(request_id).unwrap_or_else(|_| request_id.to_string())
+}
+
+fn extract_thread_id_from_rpc_result(result: &Value) -> Option<String> {
+    result
+        .get("thread")
+        .and_then(|thread| thread.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
 #[derive(Debug)]
 enum DaemonStreamFetchResult {
     Stream(Vec<DaemonStreamEnvelope>),
@@ -2690,6 +3209,7 @@ mod tests {
                     daemon_endpoint,
                     auth_token: Some(auth_token.to_string()),
                 },
+                last_thread_id: None,
             },
         )
         .expect("seed cli state");

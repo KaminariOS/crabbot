@@ -234,6 +234,69 @@ pub struct DaemonSessionStatusResponse {
     pub updated_at_unix_ms: u64,
 }
 
+pub const DAEMON_RPC_STREAM_SCHEMA_VERSION: u16 = 1;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcRequest {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcRequestResponse {
+    pub request_id: serde_json::Value,
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcRespondRequest {
+    pub request_id: serde_json::Value,
+    #[serde(default)]
+    pub result: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonRpcRespondResponse {
+    pub ok: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcStreamEnvelope {
+    pub schema_version: u16,
+    pub sequence: u64,
+    pub event: DaemonRpcStreamEvent,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload", rename_all = "snake_case")]
+pub enum DaemonRpcStreamEvent {
+    Notification(DaemonRpcNotification),
+    ServerRequest(DaemonRpcServerRequest),
+    DecodeError(DaemonRpcDecodeError),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcNotification {
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DaemonRpcServerRequest {
+    pub request_id: serde_json::Value,
+    pub method: String,
+    #[serde(default)]
+    pub params: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonRpcDecodeError {
+    pub raw: String,
+    pub message: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
