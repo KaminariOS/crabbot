@@ -14,15 +14,26 @@ anyhow.workspace = true
 codex-utils-fuzzy-match = { path = "/home/kosumi/repos/codex/codex-rs/utils/fuzzy-match" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
-ratatui = "0.29"
+ratatui = { version = "0.29", features = [
+    "unstable-backend-writer",
+    "unstable-rendered-line-info",
+    "unstable-widget-ref",
+] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"
 strum = "0.27.2"
 strum_macros = "0.27.2"
+tokio.workspace = true
+tokio-stream = { version = "0.1", features = ["sync"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
+derive_more = { version = "2", features = ["is_variant"] }
+tracing.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 pretty_assertions = "1"

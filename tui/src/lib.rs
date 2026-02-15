@@ -102,14 +102,19 @@ struct ConfigSetArgs {
     clear_auth_token: bool,
 }
 
+mod app;
 mod core_compat;
+mod custom_terminal;
+mod insert_history;
+mod key_hint;
+mod notifications;
 mod slash_command;
+mod terminal_palette;
 pub mod tui;
 
-pub(crate) use tui::color;
-pub use tui::handle_attach_tui_interactive;
-pub use tui::handle_tui;
-pub(crate) use tui::terminal_palette;
+pub(crate) use app::color;
+pub use app::handle_attach_tui_interactive;
+pub use app::handle_tui;
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();

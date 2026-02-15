@@ -1,7 +1,7 @@
-use super::app::UiApprovalRequest;
-use super::app::UiEvent;
-use super::app::map_daemon_stream_events;
-use super::app::map_rpc_stream_events;
+use super::UiApprovalRequest;
+use super::UiEvent;
+use super::map_daemon_stream_events;
+use super::map_rpc_stream_events;
 use super::slash_commands::builtins_for_input;
 use super::{key_hint, mention_codec, style, text_formatting, *};
 use crate::slash_command::SlashCommand;

@@ -1,538 +1,538 @@
-use super::*;
+use std::fmt;
+use std::future::Future;
+use std::io::IsTerminal;
+use std::io::Result;
+use std::io::Stdout;
+use std::io::stdin;
+use std::io::stdout;
+use std::panic;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-#[path = "app.rs"]
-mod app;
-#[path = "chatwidget.rs"]
-mod chatwidget;
-#[path = "color.rs"]
-pub(crate) mod color;
-#[path = "key_hint.rs"]
-mod key_hint;
-#[path = "mention_codec.rs"]
-mod mention_codec;
-#[path = "bottom_pane/slash_commands.rs"]
-mod slash_commands;
-#[path = "style.rs"]
-mod style;
-#[path = "terminal_palette.rs"]
-pub(crate) mod terminal_palette;
-#[path = "text_formatting.rs"]
-mod text_formatting;
-#[path = "version.rs"]
-mod version;
+use crossterm::Command;
+use crossterm::SynchronizedUpdate;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::DisableFocusChange;
+use crossterm::event::EnableBracketedPaste;
+use crossterm::event::EnableFocusChange;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyboardEnhancementFlags;
+use crossterm::event::PopKeyboardEnhancementFlags;
+use crossterm::event::PushKeyboardEnhancementFlags;
+use crossterm::terminal::EnterAlternateScreen;
+use crossterm::terminal::LeaveAlternateScreen;
+use crossterm::terminal::supports_keyboard_enhancement;
+use ratatui::backend::CrosstermBackend;
+use ratatui::crossterm::execute;
+use ratatui::crossterm::terminal::disable_raw_mode;
+use ratatui::crossterm::terminal::enable_raw_mode;
+use ratatui::layout::Offset;
+use ratatui::layout::Rect;
+use ratatui::text::Line;
+use tokio::sync::broadcast;
+use tokio_stream::Stream;
 
-use app::{
-    interrupt_turn, respond_to_approval, resume_thread, start_thread, start_turn, stream_events,
-};
-use chatwidget::ChatWidget;
-use chatwidget::LiveAttachTui;
-use slash_commands::find_builtin_command;
-use text_formatting::proper_join;
-use version::CODEX_CLI_VERSION;
+pub use self::frame_requester::FrameRequester;
+use crate::custom_terminal;
+use crate::custom_terminal::Terminal as CustomTerminal;
+use crate::notifications::DesktopNotificationBackend;
+use crate::notifications::NotificationMethod;
+use crate::notifications::detect_backend;
+use crate::tui::event_stream::EventBroker;
+use crate::tui::event_stream::TuiEventStream;
+#[cfg(unix)]
+use crate::tui::job_control::SuspendContext;
 
-#[derive(Debug)]
-enum AppEvent {
-    Key(crossterm::event::KeyEvent),
-    Paste(String),
-    Resize,
-    Tick,
-}
+mod event_stream;
+mod frame_rate_limiter;
+mod frame_requester;
+#[cfg(unix)]
+mod job_control;
 
-pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
-    ensure_daemon_ready(state)?;
-    let mut thread_id = args.thread_id.or_else(|| state.last_thread_id.clone());
-    if thread_id.is_none() {
-        thread_id = Some(start_thread(state)?);
-    }
-    let Some(thread_id) = thread_id else {
-        bail!("failed to initialize app-server thread");
-    };
-    state.last_thread_id = Some(thread_id.clone());
+/// Target frame interval for UI redraw scheduling.
+pub(crate) const TARGET_FRAME_INTERVAL: Duration = frame_rate_limiter::MIN_FRAME_INTERVAL;
 
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return handle_tui_interactive(thread_id, state);
-    }
+/// A type alias for the terminal type used in this application
+pub type Terminal = CustomTerminal<CrosstermBackend<Stdout>>;
 
-    Ok(CommandOutput::Json(json!({
-        "ok": true,
-        "action": "tui",
-        "thread_id": thread_id,
-        "daemon_endpoint": state.config.daemon_endpoint,
-    })))
-}
+pub fn set_modes() -> Result<()> {
+    execute!(stdout(), EnableBracketedPaste)?;
 
-fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<CommandOutput> {
-    let mut widget = ChatWidget::new(thread_id.clone());
-    widget.ui_mut().status_message = Some("connected to daemon app-server bridge".to_string());
-    let _ = widget.poll_stream_updates(state);
-
-    enable_raw_mode().context("enable raw mode for app-server tui")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter alternate screen for app-server tui")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
-    terminal.clear().context("clear app-server tui terminal")?;
-
-    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
-
-    let _ = disable_raw_mode();
+    enable_raw_mode()?;
+    // Enable keyboard enhancement flags so modifiers for keys like Enter are disambiguated.
+    // chat_composer.rs is using a keyboard event listener to enter for any modified keys
+    // to create a new line that require this.
+    // Some terminals (notably legacy Windows consoles) do not support
+    // keyboard enhancement flags. Attempt to enable them, but continue
+    // gracefully if unsupported.
     let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
+        stdout(),
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
+        )
     );
-    let _ = terminal.show_cursor();
 
-    loop_result?;
-    state.last_thread_id = Some(widget.session_id().to_string());
-    Ok(CommandOutput::Text(format!(
-        "thread={} detached",
-        widget.session_id()
-    )))
-}
-
-fn run_app_server_tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    widget: &mut ChatWidget,
-    state: &mut CliState,
-) -> Result<()> {
-    loop {
-        widget.draw(terminal)?;
-        let mut should_redraw = false;
-
-        if event::poll(TUI_EVENT_WAIT_STEP).context("poll app-server tui input event")? {
-            match event::read().context("read app-server tui input event")? {
-                Event::Key(key_event) => {
-                    if key_event.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match widget.on_event(AppEvent::Key(key_event), state)? {
-                        LiveTuiAction::Continue => {}
-                        LiveTuiAction::Detach => return Ok(()),
-                    }
-                    should_redraw = true;
-                }
-                Event::Paste(pasted) => {
-                    let _ = widget.on_event(AppEvent::Paste(pasted), state)?;
-                    should_redraw = true;
-                }
-                Event::Resize(_, _) => {
-                    let _ = widget.on_event(AppEvent::Resize, state)?;
-                    should_redraw = true;
-                }
-                _ => {}
-            }
-        }
-
-        let _ = widget.on_event(AppEvent::Tick, state)?;
-        if widget.poll_stream_updates(state)? {
-            should_redraw = true;
-        }
-
-        if !should_redraw {
-            thread::sleep(TUI_STREAM_POLL_INTERVAL);
-        }
-    }
-}
-
-fn handle_app_server_tui_key_event(
-    key: crossterm::event::KeyEvent,
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-) -> Result<LiveTuiAction> {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Ok(LiveTuiAction::Detach);
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.clear_input();
-        }
-        KeyCode::Up => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_up();
-            } else {
-                ui.history_prev();
-            }
-        }
-        KeyCode::Down => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_down();
-            } else {
-                ui.history_next();
-            }
-        }
-        KeyCode::Left => ui.move_input_cursor_left(),
-        KeyCode::Right => ui.move_input_cursor_right(),
-        KeyCode::Home => ui.move_input_cursor_home(),
-        KeyCode::End => ui.move_input_cursor_end(),
-        KeyCode::Esc => {
-            ui.hide_shortcuts_overlay();
-        }
-        KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                ui.input_insert_char('\n');
-                return Ok(LiveTuiAction::Continue);
-            }
-            if ui.should_apply_slash_picker_on_enter() {
-                let _ = ui.apply_selected_slash_entry();
-                return Ok(LiveTuiAction::Continue);
-            }
-            if handle_app_server_tui_submit(state, ui)? {
-                return Ok(LiveTuiAction::Detach);
-            }
-        }
-        KeyCode::Backspace => {
-            ui.input_backspace();
-        }
-        KeyCode::Delete => {
-            ui.input_delete();
-        }
-        KeyCode::Tab => {
-            if ui.slash_picker_is_active() {
-                let _ = ui.apply_selected_slash_entry();
-            } else {
-                ui.input_insert_char('\t');
-            }
-        }
-        KeyCode::Char('?') => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-                && ui.input.trim().is_empty()
-            {
-                ui.toggle_shortcuts_overlay();
-            } else if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                ui.input_insert_char('?');
-            }
-        }
-        KeyCode::Char(ch) => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                ui.input_insert_char(ch);
-            }
-        }
-        _ => {}
-    }
-    Ok(LiveTuiAction::Continue)
-}
-
-fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let input = ui.take_input();
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-    ui.hide_shortcuts_overlay();
-    ui.remember_history_entry(trimmed);
-
-    match trimmed {
-        "/exit" | "/quit" => return Ok(true),
-        "/status" => {
-            let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
-            let approvals = if approval_ids.is_empty() {
-                "none".to_string()
-            } else {
-                proper_join(&approval_ids)
-            };
-            ui.status_message = Some(format!(
-                "thread={} approvals={} seq={} v={}",
-                ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
-            ));
-            return Ok(false);
-        }
-        "/refresh" => {
-            ui.status_message = Some("refreshing stream...".to_string());
-            return Ok(false);
-        }
-        "/new" => {
-            let thread_id = start_thread(state)?;
-            ui.session_id = thread_id.clone();
-            ui.active_turn_id = None;
-            ui.pending_approvals.clear();
-            ui.push_line(&format!("[thread switched] {thread_id}"));
-            ui.status_message = Some("started new thread".to_string());
-            state.last_thread_id = Some(thread_id);
-            return Ok(false);
-        }
-        _ => {}
-    }
-
-    if trimmed == "/interrupt" {
-        if let Some(turn_id) = ui.active_turn_id.clone() {
-            interrupt_turn(state, &ui.session_id, &turn_id)?;
-            ui.status_message = Some("interrupt requested".to_string());
-        } else {
-            ui.status_message = Some("no running turn".to_string());
-        }
-        return Ok(false);
-    }
-
-    if trimmed == "/resume" {
-        if let Some(thread_id) = resume_thread(state, &ui.session_id)? {
-            ui.session_id = thread_id.clone();
-            state.last_thread_id = Some(thread_id);
-            ui.status_message = Some("thread resumed".to_string());
-        } else {
-            ui.status_message = Some("resume returned no thread id".to_string());
-        }
-        return Ok(false);
-    }
-
-    if let Some(rest) = trimmed.strip_prefix("/approve") {
-        return handle_app_server_approval_decision(state, ui, rest.trim(), true).map(|_| false);
-    }
-    if let Some(rest) = trimmed.strip_prefix("/deny") {
-        return handle_app_server_approval_decision(state, ui, rest.trim(), false).map(|_| false);
-    }
-
-    if let Some(command) = trimmed
-        .strip_prefix('/')
-        .and_then(|value| value.split_whitespace().next())
-        && find_builtin_command(command, true, true, true, true).is_some()
-    {
-        ui.status_message = Some(format!(
-            "slash command /{command} is not implemented in crabbot app-server tui yet"
-        ));
-        return Ok(false);
-    }
-
-    ui.push_user_prompt(trimmed);
-    if let Some(turn_id) = start_turn(state, &ui.session_id, trimmed)? {
-        ui.active_turn_id = Some(turn_id);
-    }
-    ui.status_message = Some("waiting for response...".to_string());
-    Ok(false)
-}
-
-fn handle_app_server_approval_decision(
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-    arg: &str,
-    approve: bool,
-) -> Result<()> {
-    let approval_key = if arg.is_empty() {
-        ui.pending_approvals.keys().next_back().cloned()
-    } else {
-        Some(arg.to_string())
-    }
-    .ok_or_else(|| anyhow!("no pending approval request"))?;
-    let Some(request) = ui.pending_approvals.remove(&approval_key) else {
-        bail!("pending approval id not found: {approval_key}");
-    };
-    respond_to_approval(state, request.request_id, approve)?;
-    ui.status_message = Some(format!(
-        "{} request {}",
-        if approve { "approved" } else { "denied" },
-        approval_key
-    ));
+    let _ = execute!(stdout(), EnableFocusChange);
     Ok(())
 }
 
-fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let events = stream_events(state, ui.last_sequence)?;
-    if events.is_empty() {
-        return Ok(false);
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct EnableAlternateScroll;
+
+impl Command for EnableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[?1007h")
     }
-    ui.apply_rpc_stream_events(&events);
-    Ok(true)
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> Result<()> {
+        Err(std::io::Error::other(
+            "tried to execute EnableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
 }
 
-pub fn handle_attach_tui_interactive(
-    session_id: String,
-    initial_events: Vec<DaemonStreamEnvelope>,
-    state: &mut CliState,
-) -> Result<CommandOutput> {
-    let mut widget = ChatWidget::new(session_id.clone());
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DisableAlternateScroll;
+
+impl Command for DisableAlternateScroll {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        write!(f, "\x1b[?1007l")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> Result<()> {
+        Err(std::io::Error::other(
+            "tried to execute DisableAlternateScroll using WinAPI; use ANSI instead",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        true
+    }
+}
+
+fn restore_common(should_disable_raw_mode: bool) -> Result<()> {
+    // Pop may fail on platforms that didn't support the push; ignore errors.
+    let _ = execute!(stdout(), PopKeyboardEnhancementFlags);
+    execute!(stdout(), DisableBracketedPaste)?;
+    let _ = execute!(stdout(), DisableFocusChange);
+    if should_disable_raw_mode {
+        disable_raw_mode()?;
+    }
+    let _ = execute!(stdout(), crossterm::cursor::Show);
+    Ok(())
+}
+
+/// Restore the terminal to its original state.
+/// Inverse of `set_modes`.
+pub fn restore() -> Result<()> {
+    let should_disable_raw_mode = true;
+    restore_common(should_disable_raw_mode)
+}
+
+/// Restore the terminal to its original state, but keep raw mode enabled.
+pub fn restore_keep_raw() -> Result<()> {
+    let should_disable_raw_mode = false;
+    restore_common(should_disable_raw_mode)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    #[allow(dead_code)]
+    Full, // Fully restore the terminal (disables raw mode).
+    KeepRaw, // Restore the terminal but keep raw mode enabled.
+}
+
+impl RestoreMode {
+    fn restore(self) -> Result<()> {
+        match self {
+            RestoreMode::Full => restore(),
+            RestoreMode::KeepRaw => restore_keep_raw(),
+        }
+    }
+}
+
+/// Flush the underlying stdin buffer to clear any input that may be buffered at the terminal level.
+/// For example, clears any user input that occurred while the crossterm EventStream was dropped.
+#[cfg(unix)]
+fn flush_terminal_input_buffer() {
+    // Safety: flushing the stdin queue is safe and does not move ownership.
+    let result = unsafe { libc::tcflush(libc::STDIN_FILENO, libc::TCIFLUSH) };
+    if result != 0 {
+        let err = std::io::Error::last_os_error();
+        tracing::warn!("failed to tcflush stdin: {err}");
+    }
+}
+
+/// Flush the underlying stdin buffer to clear any input that may be buffered at the terminal level.
+/// For example, clears any user input that occurred while the crossterm EventStream was dropped.
+#[cfg(windows)]
+fn flush_terminal_input_buffer() {
+    use windows_sys::Win32::Foundation::GetLastError;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::FlushConsoleInputBuffer;
+    use windows_sys::Win32::System::Console::GetStdHandle;
+    use windows_sys::Win32::System::Console::STD_INPUT_HANDLE;
+
+    let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if handle == INVALID_HANDLE_VALUE || handle == 0 {
+        let err = unsafe { GetLastError() };
+        tracing::warn!("failed to get stdin handle for flush: error {err}");
+        return;
+    }
+
+    let result = unsafe { FlushConsoleInputBuffer(handle) };
+    if result == 0 {
+        let err = unsafe { GetLastError() };
+        tracing::warn!("failed to flush stdin buffer: error {err}");
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn flush_terminal_input_buffer() {}
+
+/// Initialize the terminal (inline viewport; history stays in normal scrollback)
+pub fn init() -> Result<Terminal> {
+    if !stdin().is_terminal() {
+        return Err(std::io::Error::other("stdin is not a terminal"));
+    }
+    if !stdout().is_terminal() {
+        return Err(std::io::Error::other("stdout is not a terminal"));
+    }
+    set_modes()?;
+
+    flush_terminal_input_buffer();
+
+    set_panic_hook();
+
+    let backend = CrosstermBackend::new(stdout());
+    let tui = CustomTerminal::with_options(backend)?;
+    Ok(tui)
+}
+
+fn set_panic_hook() {
+    let hook = panic::take_hook();
+    panic::set_hook(Box::new(move |panic_info| {
+        let _ = restore(); // ignore any errors as we are already failing
+        hook(panic_info);
+    }));
+}
+
+#[derive(Clone, Debug)]
+pub enum TuiEvent {
+    Key(KeyEvent),
+    Paste(String),
+    Draw,
+}
+
+pub struct Tui {
+    frame_requester: FrameRequester,
+    draw_tx: broadcast::Sender<()>,
+    event_broker: Arc<EventBroker>,
+    pub(crate) terminal: Terminal,
+    pending_history_lines: Vec<Line<'static>>,
+    alt_saved_viewport: Option<ratatui::layout::Rect>,
+    #[cfg(unix)]
+    suspend_context: SuspendContext,
+    // True when overlay alt-screen UI is active
+    alt_screen_active: Arc<AtomicBool>,
+    // True when terminal/tab is focused; updated internally from crossterm events
+    terminal_focused: Arc<AtomicBool>,
+    enhanced_keys_supported: bool,
+    notification_backend: Option<DesktopNotificationBackend>,
+    // When false, enter_alt_screen() becomes a no-op (for Zellij scrollback support)
+    alt_screen_enabled: bool,
+}
+
+impl Tui {
+    pub fn new(terminal: Terminal) -> Self {
+        let (draw_tx, _) = broadcast::channel(1);
+        let frame_requester = FrameRequester::new(draw_tx.clone());
+
+        // Detect keyboard enhancement support before any EventStream is created so the
+        // crossterm poller can acquire its lock without contention.
+        let enhanced_keys_supported = supports_keyboard_enhancement().unwrap_or(false);
+        // Cache this to avoid contention with the event reader.
+        supports_color::on_cached(supports_color::Stream::Stdout);
+        let _ = crate::terminal_palette::default_colors();
+
+        Self {
+            frame_requester,
+            draw_tx,
+            event_broker: Arc::new(EventBroker::new()),
+            terminal,
+            pending_history_lines: vec![],
+            alt_saved_viewport: None,
+            #[cfg(unix)]
+            suspend_context: SuspendContext::new(),
+            alt_screen_active: Arc::new(AtomicBool::new(false)),
+            terminal_focused: Arc::new(AtomicBool::new(true)),
+            enhanced_keys_supported,
+            notification_backend: Some(detect_backend(NotificationMethod::default())),
+            alt_screen_enabled: true,
+        }
+    }
+
+    /// Set whether alternate screen is enabled. When false, enter_alt_screen() becomes a no-op.
+    pub fn set_alt_screen_enabled(&mut self, enabled: bool) {
+        self.alt_screen_enabled = enabled;
+    }
+
+    pub fn set_notification_method(&mut self, method: NotificationMethod) {
+        self.notification_backend = Some(detect_backend(method));
+    }
+
+    pub fn frame_requester(&self) -> FrameRequester {
+        self.frame_requester.clone()
+    }
+
+    pub fn enhanced_keys_supported(&self) -> bool {
+        self.enhanced_keys_supported
+    }
+
+    pub fn is_alt_screen_active(&self) -> bool {
+        self.alt_screen_active.load(Ordering::Relaxed)
+    }
+
+    // Drop crossterm EventStream to avoid stdin conflicts with other processes.
+    pub fn pause_events(&mut self) {
+        self.event_broker.pause_events();
+    }
+
+    // Resume crossterm EventStream to resume stdin polling.
+    // Inverse of `pause_events`.
+    pub fn resume_events(&mut self) {
+        self.event_broker.resume_events();
+    }
+
+    /// Temporarily restore terminal state to run an external interactive program `f`.
+    ///
+    /// This pauses crossterm's stdin polling by dropping the underlying event stream, restores
+    /// terminal modes (optionally keeping raw mode enabled), then re-applies Codex TUI modes and
+    /// flushes pending stdin input before resuming events.
+    pub async fn with_restored<R, F, Fut>(&mut self, mode: RestoreMode, f: F) -> R
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = R>,
     {
-        let ui = widget.ui_mut();
-        ui.latest_state = cached_session_state_label(state, &session_id)
-            .unwrap_or("unknown")
-            .to_string();
-        ui.apply_stream_events(&initial_events);
-        ui.status_message = Some("attached to daemon app-server bridge".to_string());
+        // Pause crossterm events to avoid stdin conflicts with external program `f`.
+        self.pause_events();
+
+        // Leave alt screen if active to avoid conflicts with external program `f`.
+        let was_alt_screen = self.is_alt_screen_active();
+        if was_alt_screen {
+            let _ = self.leave_alt_screen();
+        }
+
+        if let Err(err) = mode.restore() {
+            tracing::warn!("failed to restore terminal modes before external program: {err}");
+        }
+
+        let output = f().await;
+
+        if let Err(err) = set_modes() {
+            tracing::warn!("failed to re-enable terminal modes after external program: {err}");
+        }
+        // After the external program `f` finishes, reset terminal state and flush any buffered keypresses.
+        flush_terminal_input_buffer();
+
+        if was_alt_screen {
+            let _ = self.enter_alt_screen();
+        }
+
+        self.resume_events();
+        output
     }
 
-    enable_raw_mode().context("enable raw mode for attach tui")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter alternate screen for attach tui")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create attach tui terminal")?;
-    terminal.clear().context("clear attach tui terminal")?;
+    /// Emit a desktop notification now if the terminal is unfocused.
+    /// Returns true if a notification was posted.
+    pub fn notify(&mut self, message: impl AsRef<str>) -> bool {
+        if self.terminal_focused.load(Ordering::Relaxed) {
+            return false;
+        }
 
-    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
+        let Some(backend) = self.notification_backend.as_mut() else {
+            return false;
+        };
 
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
-
-    loop_result?;
-    state.last_thread_id = Some(widget.session_id().to_string());
-    Ok(CommandOutput::Text(format!(
-        "session={} detached",
-        widget.session_id()
-    )))
-}
-
-enum LiveTuiAction {
-    Continue,
-    Detach,
-}
-
-fn truncate_for_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-    let mut truncated = text.chars().take(width - 3).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
-fn error_chain_summary(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(": ")
-}
-
-fn align_left_right(left: &str, right: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
+        let message = message.as_ref().to_string();
+        match backend.notify(&message) {
+            Ok(()) => true,
+            Err(err) => {
+                let method = backend.method();
+                tracing::warn!(
+                    error = %err,
+                    method = %method,
+                    "Failed to emit terminal notification; disabling future notifications"
+                );
+                self.notification_backend = None;
+                false
+            }
+        }
     }
 
-    let left = truncate_for_width(left, width);
-    let right = truncate_for_width(right, width);
-    let left_width = left.chars().count();
-    let right_width = right.chars().count();
-
-    if left_width + right_width + 1 <= width {
-        let spacing = width.saturating_sub(left_width + right_width);
-        return format!("{left}{}{right}", " ".repeat(spacing));
-    }
-
-    if right_width + 1 >= width {
-        return truncate_for_width(&right, width);
-    }
-
-    let left_budget = width.saturating_sub(right_width + 1);
-    let left_truncated = truncate_for_width(&left, left_budget);
-    format!("{left_truncated} {right}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::LiveAttachTui;
-
-    #[test]
-    fn live_tui_input_editing_respects_cursor_boundaries() {
-        let mut ui = LiveAttachTui::new("sess_input".to_string(), "active".to_string());
-
-        ui.input_insert_str("hello");
-        ui.move_input_cursor_left();
-        ui.move_input_cursor_left();
-        ui.input_insert_char('X');
-        assert_eq!(ui.input, "helXlo");
-
-        ui.input_delete();
-        assert_eq!(ui.input, "helXo");
-
-        ui.input_backspace();
-        assert_eq!(ui.input, "helo");
-
-        ui.move_input_cursor_home();
-        ui.input_insert_char('[');
-        ui.move_input_cursor_end();
-        ui.input_insert_char(']');
-        assert_eq!(ui.input, "[helo]");
-    }
-
-    #[test]
-    fn live_tui_history_navigation_replays_previous_entries() {
-        let mut ui = LiveAttachTui::new("sess_history".to_string(), "active".to_string());
-        ui.remember_history_entry("first");
-        ui.remember_history_entry("second");
-
-        ui.history_prev();
-        assert_eq!(ui.input, "second");
-
-        ui.history_prev();
-        assert_eq!(ui.input, "first");
-
-        ui.history_next();
-        assert_eq!(ui.input, "second");
-
-        ui.history_next();
-        assert_eq!(ui.input, "");
-    }
-
-    #[test]
-    fn live_tui_slash_picker_opens_and_filters_commands() {
-        let mut ui = LiveAttachTui::new("sess_picker".to_string(), "active".to_string());
-        ui.input_insert_char('/');
-        assert!(ui.slash_picker_is_active());
-        assert_eq!(
-            ui.selected_slash_entry().map(|entry| entry.command),
-            Some("model")
+    pub fn event_stream(&self) -> Pin<Box<dyn Stream<Item = TuiEvent> + Send + 'static>> {
+        #[cfg(unix)]
+        let stream = TuiEventStream::new(
+            self.event_broker.clone(),
+            self.draw_tx.subscribe(),
+            self.terminal_focused.clone(),
+            self.suspend_context.clone(),
+            self.alt_screen_active.clone(),
         );
-
-        ui.input_insert_str("re");
-        let filtered = ui
-            .slash_picker_entries()
-            .iter()
-            .map(|entry| entry.command)
-            .collect::<Vec<_>>();
-        assert_eq!(filtered, vec!["review", "rename", "resume"]);
+        #[cfg(not(unix))]
+        let stream = TuiEventStream::new(
+            self.event_broker.clone(),
+            self.draw_tx.subscribe(),
+            self.terminal_focused.clone(),
+        );
+        Box::pin(stream)
     }
 
-    #[test]
-    fn live_tui_slash_picker_selection_applies_command() {
-        let mut ui = LiveAttachTui::new("sess_picker_select".to_string(), "active".to_string());
-        ui.input_insert_char('/');
-        ui.slash_picker_move_down();
-        assert_eq!(
-            ui.selected_slash_entry().map(|entry| entry.command),
-            Some("permissions")
-        );
-        assert!(ui.should_apply_slash_picker_on_enter());
-        assert!(ui.apply_selected_slash_entry());
-        assert_eq!(ui.input, "/permissions");
-        assert!(!ui.should_apply_slash_picker_on_enter());
+    /// Enter alternate screen and expand the viewport to full terminal size, saving the current
+    /// inline viewport for restoration when leaving.
+    pub fn enter_alt_screen(&mut self) -> Result<()> {
+        if !self.alt_screen_enabled {
+            return Ok(());
+        }
+        let _ = execute!(self.terminal.backend_mut(), EnterAlternateScreen);
+        // Enable "alternate scroll" so terminals may translate wheel to arrows
+        let _ = execute!(self.terminal.backend_mut(), EnableAlternateScroll);
+        if let Ok(size) = self.terminal.size() {
+            self.alt_saved_viewport = Some(self.terminal.viewport_area);
+            self.terminal.set_viewport_area(ratatui::layout::Rect::new(
+                0,
+                0,
+                size.width,
+                size.height,
+            ));
+            let _ = self.terminal.clear();
+        }
+        self.alt_screen_active.store(true, Ordering::Relaxed);
+        Ok(())
     }
 
-    #[test]
-    fn live_tui_special_token_hints_match_native_modes() {
-        let mut ui = LiveAttachTui::new("sess_tokens".to_string(), "active".to_string());
+    /// Leave alternate screen and restore the previously saved inline viewport, if any.
+    pub fn leave_alt_screen(&mut self) -> Result<()> {
+        if !self.alt_screen_enabled {
+            return Ok(());
+        }
+        // Disable alternate scroll when leaving alt-screen
+        let _ = execute!(self.terminal.backend_mut(), DisableAlternateScroll);
+        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        if let Some(saved) = self.alt_saved_viewport.take() {
+            self.terminal.set_viewport_area(saved);
+        }
+        self.alt_screen_active.store(false, Ordering::Relaxed);
+        Ok(())
+    }
 
-        ui.replace_input("!ls -la".to_string());
-        assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  ! shell command mode")
-        );
+    pub fn insert_history_lines(&mut self, lines: Vec<Line<'static>>) {
+        self.pending_history_lines.extend(lines);
+        self.frame_requester().schedule_frame();
+    }
 
-        ui.replace_input("@src/main.rs".to_string());
-        assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  @ file mention mode")
-        );
+    pub fn draw(
+        &mut self,
+        height: u16,
+        draw_fn: impl FnOnce(&mut custom_terminal::Frame),
+    ) -> Result<()> {
+        // If we are resuming from ^Z, we need to prepare the resume action now so we can apply it
+        // in the synchronized update.
+        #[cfg(unix)]
+        let mut prepared_resume = self
+            .suspend_context
+            .prepare_resume_action(&mut self.terminal, &mut self.alt_saved_viewport);
 
-        ui.replace_input("$VAR".to_string());
-        assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  $ variable/prompt mode")
-        );
+        // Precompute any viewport updates that need a cursor-position query before entering
+        // the synchronized update, to avoid racing with the event reader.
+        let mut pending_viewport_area = self.pending_viewport_area()?;
+
+        stdout().sync_update(|_| {
+            #[cfg(unix)]
+            if let Some(prepared) = prepared_resume.take() {
+                prepared.apply(&mut self.terminal)?;
+            }
+
+            let terminal = &mut self.terminal;
+            if let Some(new_area) = pending_viewport_area.take() {
+                terminal.set_viewport_area(new_area);
+                terminal.clear()?;
+            }
+
+            let size = terminal.size()?;
+
+            let mut area = terminal.viewport_area;
+            area.height = height.min(size.height);
+            area.width = size.width;
+            // If the viewport has expanded, scroll everything else up to make room.
+            if area.bottom() > size.height {
+                area.y = size.height - area.height;
+            }
+            if area != terminal.viewport_area {
+                // TODO(nornagon): probably this could be collapsed with the clear + set_viewport_area above.
+                terminal.clear()?;
+                terminal.set_viewport_area(area);
+            }
+
+            if !self.pending_history_lines.is_empty() {
+                crate::insert_history::insert_history_lines(
+                    terminal,
+                    self.pending_history_lines.clone(),
+                )?;
+                self.pending_history_lines.clear();
+            }
+
+            // Update the y position for suspending so Ctrl-Z can place the cursor correctly.
+            #[cfg(unix)]
+            {
+                let inline_area_bottom = if self.alt_screen_active.load(Ordering::Relaxed) {
+                    self.alt_saved_viewport
+                        .map(|r| r.bottom().saturating_sub(1))
+                        .unwrap_or_else(|| area.bottom().saturating_sub(1))
+                } else {
+                    area.bottom().saturating_sub(1)
+                };
+                self.suspend_context.set_cursor_y(inline_area_bottom);
+            }
+
+            terminal.draw(|frame| {
+                draw_fn(frame);
+            })
+        })?
+    }
+
+    fn pending_viewport_area(&mut self) -> Result<Option<Rect>> {
+        let terminal = &mut self.terminal;
+        let screen_size = terminal.size()?;
+        let last_known_screen_size = terminal.last_known_screen_size;
+        if screen_size != last_known_screen_size
+            && let Ok(cursor_pos) = terminal.get_cursor_position()
+        {
+            let last_known_cursor_pos = terminal.last_known_cursor_pos;
+            // If we resized AND the cursor moved, we adjust the viewport area to keep the
+            // cursor in the same position. This is a heuristic that seems to work well
+            // at least in iTerm2.
+            if cursor_pos.y != last_known_cursor_pos.y {
+                let offset = Offset {
+                    x: 0,
+                    y: cursor_pos.y as i32 - last_known_cursor_pos.y as i32,
+                };
+                return Ok(Some(terminal.viewport_area.offset(offset)));
+            }
+        }
+        Ok(None)
     }
 }
