@@ -1,26 +1,26 @@
 use super::*;
 
+mod app_event;
+mod app_server_bridge;
 mod bottom_pane;
+mod chatwidget;
 mod fuzzy_match;
 mod key_hint;
 mod live_ui;
 
+use app_event::AppEvent;
+use app_server_bridge::{
+    interrupt_turn, respond_to_approval, resume_thread, start_thread, start_turn, stream_events,
+};
 use bottom_pane::slash_commands::find_visible_slash_command;
+use chatwidget::ChatWidget;
 use live_ui::LiveAttachTui;
 
 pub(crate) fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
     let mut thread_id = args.thread_id.or_else(|| state.last_thread_id.clone());
     if thread_id.is_none() {
-        let response = daemon_app_server_rpc_request(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-            "thread/start",
-            json!({
-                "approvalPolicy": "on-request"
-            }),
-        )?;
-        thread_id = extract_thread_id_from_rpc_result(&response.result);
+        thread_id = Some(start_thread(state)?);
     }
     let Some(thread_id) = thread_id else {
         bail!("failed to initialize app-server thread");
@@ -40,9 +40,9 @@ pub(crate) fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandO
 }
 
 fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<CommandOutput> {
-    let mut ui = LiveAttachTui::new(thread_id.clone(), "active".to_string());
-    ui.status_message = Some("connected to daemon app-server bridge".to_string());
-    let _ = poll_app_server_tui_stream_updates(state, &mut ui);
+    let mut widget = ChatWidget::new(thread_id.clone());
+    widget.ui_mut().status_message = Some("connected to daemon app-server bridge".to_string());
+    let _ = widget.poll_stream_updates(state);
 
     enable_raw_mode().context("enable raw mode for app-server tui")?;
     let mut stdout = io::stdout();
@@ -52,7 +52,7 @@ fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<Com
     let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
     terminal.clear().context("clear app-server tui terminal")?;
 
-    let loop_result = run_app_server_tui_loop(&mut terminal, &mut ui, state);
+    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -63,20 +63,20 @@ fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<Com
     let _ = terminal.show_cursor();
 
     loop_result?;
-    state.last_thread_id = Some(ui.session_id.clone());
+    state.last_thread_id = Some(widget.session_id().to_string());
     Ok(CommandOutput::Text(format!(
         "thread={} detached",
-        ui.session_id
+        widget.session_id()
     )))
 }
 
 fn run_app_server_tui_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ui: &mut LiveAttachTui,
+    widget: &mut ChatWidget,
     state: &mut CliState,
 ) -> Result<()> {
     loop {
-        ui.draw(terminal)?;
+        widget.draw(terminal)?;
         let mut should_redraw = false;
 
         if event::poll(TUI_EVENT_WAIT_STEP).context("poll app-server tui input event")? {
@@ -85,24 +85,26 @@ fn run_app_server_tui_loop(
                     if key_event.kind != KeyEventKind::Press {
                         continue;
                     }
-                    match handle_app_server_tui_key_event(key_event, state, ui)? {
+                    match widget.on_event(AppEvent::Key(key_event), state)? {
                         LiveTuiAction::Continue => {}
                         LiveTuiAction::Detach => return Ok(()),
                     }
                     should_redraw = true;
                 }
                 Event::Paste(pasted) => {
-                    ui.input_insert_str(&pasted);
+                    let _ = widget.on_event(AppEvent::Paste(pasted), state)?;
                     should_redraw = true;
                 }
                 Event::Resize(_, _) => {
+                    let _ = widget.on_event(AppEvent::Resize, state)?;
                     should_redraw = true;
                 }
                 _ => {}
             }
         }
 
-        if poll_app_server_tui_stream_updates(state, ui)? {
+        let _ = widget.on_event(AppEvent::Tick, state)?;
+        if widget.poll_stream_updates(state)? {
             should_redraw = true;
         }
 
@@ -112,7 +114,7 @@ fn run_app_server_tui_loop(
     }
 }
 
-fn handle_app_server_tui_key_event(
+pub(in crate::tui) fn handle_app_server_tui_key_event(
     key: crossterm::event::KeyEvent,
     state: &mut CliState,
     ui: &mut LiveAttachTui,
@@ -220,17 +222,7 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
             return Ok(false);
         }
         "/new" => {
-            let response = daemon_app_server_rpc_request(
-                &state.config.daemon_endpoint,
-                state.config.auth_token.as_deref(),
-                "thread/start",
-                json!({
-                    "approvalPolicy": "on-request"
-                }),
-            )?;
-            let Some(thread_id) = extract_thread_id_from_rpc_result(&response.result) else {
-                bail!("thread/start did not return thread id");
-            };
+            let thread_id = start_thread(state)?;
             ui.session_id = thread_id.clone();
             ui.active_turn_id = None;
             ui.pending_approvals.clear();
@@ -244,15 +236,7 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
 
     if trimmed == "/interrupt" {
         if let Some(turn_id) = ui.active_turn_id.clone() {
-            let _ = daemon_app_server_rpc_request(
-                &state.config.daemon_endpoint,
-                state.config.auth_token.as_deref(),
-                "turn/interrupt",
-                json!({
-                    "threadId": ui.session_id,
-                    "turnId": turn_id,
-                }),
-            )?;
+            interrupt_turn(state, &ui.session_id, &turn_id)?;
             ui.status_message = Some("interrupt requested".to_string());
         } else {
             ui.status_message = Some("no running turn".to_string());
@@ -261,15 +245,7 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     }
 
     if trimmed == "/resume" {
-        let response = daemon_app_server_rpc_request(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-            "thread/resume",
-            json!({
-                "threadId": ui.session_id,
-            }),
-        )?;
-        if let Some(thread_id) = extract_thread_id_from_rpc_result(&response.result) {
+        if let Some(thread_id) = resume_thread(state, &ui.session_id)? {
             ui.session_id = thread_id.clone();
             state.last_thread_id = Some(thread_id);
             ui.status_message = Some("thread resumed".to_string());
@@ -298,28 +274,8 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     }
 
     ui.push_user_prompt(trimmed);
-    let response = daemon_app_server_rpc_request(
-        &state.config.daemon_endpoint,
-        state.config.auth_token.as_deref(),
-        "turn/start",
-        json!({
-            "threadId": ui.session_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": trimmed,
-                    "textElements": []
-                }
-            ]
-        }),
-    )?;
-    if let Some(turn_id) = response
-        .result
-        .get("turn")
-        .and_then(|turn| turn.get("id"))
-        .and_then(Value::as_str)
-    {
-        ui.active_turn_id = Some(turn_id.to_string());
+    if let Some(turn_id) = start_turn(state, &ui.session_id, trimmed)? {
+        ui.active_turn_id = Some(turn_id);
     }
     ui.status_message = Some("waiting for response...".to_string());
     Ok(false)
@@ -340,14 +296,7 @@ fn handle_app_server_approval_decision(
     let Some(request) = ui.pending_approvals.remove(&approval_key) else {
         bail!("pending approval id not found: {approval_key}");
     };
-    daemon_app_server_rpc_respond(
-        &state.config.daemon_endpoint,
-        state.config.auth_token.as_deref(),
-        request.request_id,
-        json!({
-            "decision": if approve { "accept" } else { "decline" }
-        }),
-    )?;
+    respond_to_approval(state, request.request_id, approve)?;
     ui.status_message = Some(format!(
         "{} request {}",
         if approve { "approved" } else { "denied" },
@@ -356,12 +305,11 @@ fn handle_app_server_approval_decision(
     Ok(())
 }
 
-fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let events = fetch_daemon_app_server_stream(
-        &state.config.daemon_endpoint,
-        state.config.auth_token.as_deref(),
-        Some(ui.last_sequence),
-    )?;
+pub(in crate::tui) fn poll_app_server_tui_stream_updates(
+    state: &CliState,
+    ui: &mut LiveAttachTui,
+) -> Result<bool> {
+    let events = stream_events(state, ui.last_sequence)?;
     if events.is_empty() {
         return Ok(false);
     }
@@ -483,7 +431,7 @@ fn run_attach_tui_loop(
     Ok(())
 }
 
-enum LiveTuiAction {
+pub(in crate::tui) enum LiveTuiAction {
     Continue,
     Detach,
 }

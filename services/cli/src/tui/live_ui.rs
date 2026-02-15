@@ -159,9 +159,39 @@ impl LiveAttachTui {
                     self.status_message = Some("running turn...".to_string());
                 }
             }
+            "thread/name/updated" => {
+                if let Some(name) = notification
+                    .params
+                    .get("thread")
+                    .and_then(|thread| thread.get("name"))
+                    .and_then(Value::as_str)
+                {
+                    self.push_line(&format!("[thread renamed] {name}"));
+                }
+            }
             "item/agentMessage/delta" => {
-                if let Some(delta) = notification.params.get("delta").and_then(Value::as_str) {
+                if let Some(delta) = delta_from_params(&notification.params) {
                     self.append_assistant_delta(delta);
+                }
+            }
+            "item/plan/delta" => {
+                if let Some(delta) = delta_from_params(&notification.params) {
+                    self.append_assistant_delta(delta);
+                }
+            }
+            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+                if delta_from_params(&notification.params).is_some() {
+                    self.status_message = Some("reasoning...".to_string());
+                }
+            }
+            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
+                if let Some(delta) = delta_from_params(&notification.params) {
+                    self.push_line(delta);
+                }
+            }
+            "item/commandExecution/terminalInteraction" => {
+                if let Some(prompt) = notification.params.get("prompt").and_then(Value::as_str) {
+                    self.push_line(&format!("[terminal interaction] {prompt}"));
                 }
             }
             "item/completed" => {
@@ -182,10 +212,26 @@ impl LiveAttachTui {
             }
             "turn/completed" => {
                 self.active_turn_id = None;
-                self.status_message = None;
+                if let Some(status) = notification
+                    .params
+                    .get("turn")
+                    .and_then(|turn| turn.get("status"))
+                    .and_then(Value::as_str)
+                    && status != "completed"
+                {
+                    self.status_message = Some(format!("turn {status}"));
+                } else {
+                    self.status_message = None;
+                }
                 if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
                     self.transcript.push('\n');
                 }
+            }
+            "turn/diff/updated" => {
+                self.status_message = Some("diff updated".to_string());
+            }
+            "thread/tokenUsage/updated" => {
+                self.status_message = Some("token usage updated".to_string());
             }
             _ => {}
         }
@@ -780,4 +826,11 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .next()
             .map(|ch| ch.len_utf8())
             .unwrap_or(0)
+}
+
+fn delta_from_params(params: &Value) -> Option<&str> {
+    params
+        .get("delta")
+        .or_else(|| params.get("outputDelta"))
+        .and_then(Value::as_str)
 }
