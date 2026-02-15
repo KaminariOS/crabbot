@@ -5,25 +5,8 @@ use std::env;
 use std::io;
 
 use bel::BelBackend;
+use codex_core::config::types::NotificationMethod;
 use osc9::Osc9Backend;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum NotificationMethod {
-    #[default]
-    Auto,
-    Osc9,
-    Bel,
-}
-
-impl std::fmt::Display for NotificationMethod {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            NotificationMethod::Auto => f.write_str("auto"),
-            NotificationMethod::Osc9 => f.write_str("osc9"),
-            NotificationMethod::Bel => f.write_str("bel"),
-        }
-    }
-}
 
 #[derive(Debug)]
 pub enum DesktopNotificationBackend {
@@ -90,8 +73,8 @@ fn supports_osc9() -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::NotificationMethod;
     use super::detect_backend;
+    use codex_core::config::types::NotificationMethod;
     use serial_test::serial;
     use std::ffi::OsString;
 

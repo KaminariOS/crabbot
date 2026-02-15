@@ -2,6 +2,7 @@ use std::fmt;
 use std::io;
 use std::io::Write;
 
+use crate::wrapping::word_wrap_lines_borrowed;
 use crossterm::Command;
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
@@ -39,9 +40,7 @@ where
 
     // Pre-wrap lines using word-aware wrapping so terminal scrollback sees the same
     // formatting as the TUI. This avoids character-level hard wrapping by the terminal.
-    // Keep scrollback insertion working without depending on the full wrapping
-    // module graph during runtime porting.
-    let wrapped = lines;
+    let wrapped = word_wrap_lines_borrowed(&lines, area.width.max(1) as usize);
     let wrapped_lines = wrapped.len() as u16;
     let cursor_top = if area.bottom() < screen_size.height {
         // If the viewport is not at the bottom of the screen, scroll it down to make room.

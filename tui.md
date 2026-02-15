@@ -14,7 +14,7 @@ Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, w
 
 - [ ] Replace simplified runtime entry flow with upstream runtime flow shape (in progress):
 - [ ] `tui/src/lib.rs` uses upstream module graph structure.
-- [x] `tui/src/tui.rs` uses upstream terminal/event-loop primitives.
+- [x] `tui/src/tui.rs` now matches upstream file content.
 - [x] Keep crate compiling while introducing runtime modules incrementally.
 - [x] Keep command entry points stable for CLI integration (`crabbot_cli -> crabbot_tui`).
 - [x] Verify TUI still launches after each runtime-step merge.
@@ -44,14 +44,13 @@ Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, w
 
 ## Phase 5: Diff Cleanup (Strict)
 
-- [ ] Run `diff -qr ~/repos/codex/codex-rs/tui/src ~/repos/crabbot/tui/src`.
-- [ ] Reduce diffs to only:
-- [ ] `tui/src/lib.rs`
-- [ ] `tui/src/tui.rs`
-- [ ] `tui/src/app.rs`
-- [ ] `tui/src/chatwidget.rs`
-- [ ] `tui/src/core_compat.rs` (local seam file)
-- [ ] Confirm no unnecessary drift in other files.
+- [x] Run `diff -qr ~/repos/codex/codex-rs/tui/src ~/repos/crabbot/tui/src`.
+- [x] Reduce diffs to only:
+- [x] `tui/src/lib.rs`
+- [x] `tui/src/app.rs`
+- [x] `tui/src/chatwidget.rs`
+- [x] `tui/src/core_compat.rs` (local seam file)
+- [x] Confirm no unnecessary drift in other files.
 
 ## Phase 6: Behavior Validation
 
@@ -80,17 +79,16 @@ Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, w
 ## Transitional Notes (Current)
 
 - `tui/src/app.rs` now hosts the active app-server runtime loop (previous temporary shim removed).
-- Notification method type is localized in `tui/src/notifications/mod.rs` to remove `codex-core` dependency from notification plumbing.
+- `tui/src/tui.rs` and `tui/src/notifications/mod.rs` now match upstream exactly.
+- `tui/src/insert_history.rs` now matches upstream exactly.
+- `lib.rs` provides a local compatibility namespace (`codex_core::config::types::NotificationMethod`) and a minimal `render::line_utils` bridge for wrapping support without introducing a `codex-core` dependency.
 
 ## Current Diff Inventory
 
 - `tui/src/lib.rs`
-- `tui/src/tui.rs`
 - `tui/src/app.rs`
 - `tui/src/chatwidget.rs`
 - `tui/src/core_compat.rs` (local seam file)
-- `tui/src/notifications/mod.rs`
-- `tui/src/insert_history.rs`
 
 ## Repeatable Commands
 

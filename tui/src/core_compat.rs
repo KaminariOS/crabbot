@@ -5,6 +5,28 @@
 use super::*;
 use crabbot_protocol::DaemonRpcServerRequest;
 
+pub mod config {
+    pub mod types {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+        pub enum NotificationMethod {
+            #[default]
+            Auto,
+            Osc9,
+            Bel,
+        }
+
+        impl std::fmt::Display for NotificationMethod {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    NotificationMethod::Auto => f.write_str("auto"),
+                    NotificationMethod::Osc9 => f.write_str("osc9"),
+                    NotificationMethod::Bel => f.write_str("bel"),
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(crate) struct UiApprovalRequest {
     pub(crate) key: String,

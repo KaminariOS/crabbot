@@ -25,6 +25,7 @@ use crossterm::event::PushKeyboardEnhancementFlags;
 use crossterm::terminal::EnterAlternateScreen;
 use crossterm::terminal::LeaveAlternateScreen;
 use crossterm::terminal::supports_keyboard_enhancement;
+use ratatui::backend::Backend;
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::disable_raw_mode;
@@ -39,12 +40,12 @@ pub use self::frame_requester::FrameRequester;
 use crate::custom_terminal;
 use crate::custom_terminal::Terminal as CustomTerminal;
 use crate::notifications::DesktopNotificationBackend;
-use crate::notifications::NotificationMethod;
 use crate::notifications::detect_backend;
 use crate::tui::event_stream::EventBroker;
 use crate::tui::event_stream::TuiEventStream;
 #[cfg(unix)]
 use crate::tui::job_control::SuspendContext;
+use codex_core::config::types::NotificationMethod;
 
 mod event_stream;
 mod frame_rate_limiter;
@@ -479,6 +480,9 @@ impl Tui {
             area.width = size.width;
             // If the viewport has expanded, scroll everything else up to make room.
             if area.bottom() > size.height {
+                terminal
+                    .backend_mut()
+                    .scroll_region_up(0..area.top(), area.bottom() - size.height)?;
                 area.y = size.height - area.height;
             }
             if area != terminal.viewport_area {

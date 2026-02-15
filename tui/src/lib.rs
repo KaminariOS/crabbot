@@ -35,6 +35,14 @@ use std::{
     time::{Duration, Instant},
 };
 
+extern crate self as codex_core;
+
+pub mod config {
+    pub mod types {
+        pub use crate::core_compat::config::types::NotificationMethod;
+    }
+}
+
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
 const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
@@ -111,6 +119,35 @@ mod notifications;
 mod slash_command;
 mod terminal_palette;
 pub mod tui;
+mod wrapping;
+
+mod render {
+    pub mod line_utils {
+        use ratatui::text::Line;
+        use ratatui::text::Span;
+
+        fn line_to_static(line: &Line<'_>) -> Line<'static> {
+            Line {
+                style: line.style,
+                alignment: line.alignment,
+                spans: line
+                    .spans
+                    .iter()
+                    .map(|s| Span {
+                        style: s.style,
+                        content: std::borrow::Cow::Owned(s.content.to_string()),
+                    })
+                    .collect(),
+            }
+        }
+
+        pub fn push_owned_lines<'a>(src: &[Line<'a>], out: &mut Vec<Line<'static>>) {
+            for line in src {
+                out.push(line_to_static(line));
+            }
+        }
+    }
+}
 
 pub(crate) use app::color;
 pub use app::handle_attach_tui_interactive;
