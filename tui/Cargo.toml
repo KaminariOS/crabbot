@@ -33,6 +33,7 @@ unicode-segmentation = "1"
 unicode-width = "0.2"
 derive_more = { version = "2", features = ["is_variant"] }
 tracing.workspace = true
+rand = "0.9"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

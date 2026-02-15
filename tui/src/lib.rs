@@ -136,14 +136,18 @@ struct ConfigSetArgs {
 mod app;
 #[path = "bottom_pane/slash_commands.rs"]
 mod slash_commands;
+mod ascii_animation;
 mod chatwidget;
 mod color;
 mod core_compat;
 mod custom_terminal;
+mod frames;
 mod insert_history;
 mod key_hint;
+pub mod live_wrap;
 mod mention_codec;
 mod notifications;
+mod shimmer;
 mod slash_command;
 mod style;
 mod terminal_palette;
@@ -157,7 +161,7 @@ mod render {
         use ratatui::text::Line;
         use ratatui::text::Span;
 
-        fn line_to_static(line: &Line<'_>) -> Line<'static> {
+        pub fn line_to_static(line: &Line<'_>) -> Line<'static> {
             Line {
                 style: line.style,
                 alignment: line.alignment,
