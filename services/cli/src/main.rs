@@ -16,6 +16,8 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
+    style::Stylize,
+    text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
 use reqwest::StatusCode;
@@ -519,16 +521,11 @@ fn handle_attach_tui_interactive(
 ) -> Result<CommandOutput> {
     let mut ui = LiveAttachTui::new(
         session_id.clone(),
-        state.config.daemon_endpoint.clone(),
         cached_session_state_label(state, &session_id)
             .unwrap_or("unknown")
             .to_string(),
     );
     ui.apply_stream_events(&initial_events);
-    ui.status_message = Some(
-        "attached: Enter send | /status /interrupt /resume /refresh | Ctrl-C or /exit detach"
-            .to_string(),
-    );
 
     enable_raw_mode().context("enable raw mode for attach tui")?;
     let mut stdout = io::stdout();
@@ -562,7 +559,6 @@ struct InFlightPrompt {
 
 struct LiveAttachTui {
     session_id: String,
-    daemon_endpoint: String,
     transcript: String,
     input: String,
     input_cursor: usize,
@@ -578,10 +574,9 @@ struct LiveAttachTui {
 }
 
 impl LiveAttachTui {
-    fn new(session_id: String, daemon_endpoint: String, latest_state: String) -> Self {
+    fn new(session_id: String, latest_state: String) -> Self {
         Self {
             session_id,
-            daemon_endpoint,
             transcript: String::new(),
             input: String::new(),
             input_cursor: 0,
@@ -848,104 +843,72 @@ impl LiveAttachTui {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(1),
                     Constraint::Min(1),
-                    Constraint::Length(1),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
                 .split(frame.area());
 
-            frame.render_widget(
-                Paragraph::new(self.status_line_text(chunks[0].width as usize)),
-                chunks[0],
-            );
-
             let history = self.transcript.clone();
             let history_lines = history.lines().count().max(1) as u16;
-            let scroll = history_lines.saturating_sub(chunks[1].height);
+            let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
                 Paragraph::new(history)
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
-                chunks[1],
+                chunks[0],
             );
 
-            let input_width = chunks[2].width as usize;
+            let input_width = chunks[1].width as usize;
             let (visible_input, cursor_col) = self.input_view(input_width);
-            let input_line = if visible_input.is_empty() {
+            let input_line: Line<'static> = if visible_input.is_empty() {
                 let placeholder_width =
                     input_width.saturating_sub(TUI_COMPOSER_PROMPT.chars().count());
                 let placeholder = truncate_for_width(TUI_COMPOSER_PLACEHOLDER, placeholder_width);
-                format!("{TUI_COMPOSER_PROMPT}{placeholder}")
+                Line::from(vec![
+                    Span::raw(TUI_COMPOSER_PROMPT.to_string()),
+                    Span::raw(placeholder).dim(),
+                ])
             } else {
-                format!("{TUI_COMPOSER_PROMPT}{visible_input}")
+                Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
             };
-            frame.render_widget(Paragraph::new(input_line), chunks[2]);
+            frame.render_widget(Paragraph::new(input_line), chunks[1]);
 
             frame.render_widget(
-                Paragraph::new(self.footer_hint_line(chunks[3].width as usize)),
-                chunks[3],
+                Paragraph::new(Line::from(self.footer_line_text(chunks[2].width as usize)).dim()),
+                chunks[2],
             );
 
-            frame.render_widget(
-                Paragraph::new(self.session_footer_line(chunks[4].width as usize)),
-                chunks[4],
-            );
-
-            let cursor_x = chunks[2]
+            let cursor_x = chunks[1]
                 .x
                 .saturating_add(cursor_col.try_into().unwrap_or(u16::MAX));
-            frame.set_cursor_position((cursor_x, chunks[2].y));
+            frame.set_cursor_position((cursor_x, chunks[1].y));
         })?;
         Ok(())
     }
 
-    fn status_line_text(&self, width: usize) -> String {
-        let mut left = if let Some(pending) = &self.pending_prompt {
+    fn footer_line_text(&self, width: usize) -> String {
+        let left = if let Some(pending) = &self.pending_prompt {
             let elapsed = pending.submitted_at.elapsed().as_secs_f32();
-            format!("\u{2022} Working ({elapsed:.1}s \u{2022} esc to interrupt)")
+            format!("  esc to interrupt ({elapsed:.1}s)")
         } else if let Some(status) = &self.status_message {
-            format!("\u{2022} {}", status.trim())
+            format!("  {}", status.trim())
         } else if self.latest_state == "interrupted" {
-            "\u{2022} Interrupted (run /resume to continue)".to_string()
+            "  interrupted \u{2022} /resume to continue".to_string()
         } else {
-            "\u{2022} Ready".to_string()
+            "  ? for shortcuts".to_string()
         };
-        left = truncate_for_width(&left, width);
 
-        let right = if self.last_sequence > 0 {
-            format!("{} \u{2022} #{}", self.session_id, self.last_sequence)
-        } else {
-            self.session_id.clone()
-        };
-        align_left_right(&left, &right, width)
-    }
-
-    fn footer_hint_line(&self, width: usize) -> String {
-        let left = if width >= 108 {
-            "Enter send \u{2022} \u{2191}/\u{2193} history \u{2022} /status /interrupt /resume /refresh \u{2022} Ctrl-C detach"
-        } else if width >= 82 {
-            "Enter send \u{2022} \u{2191}/\u{2193} history \u{2022} /status /resume \u{2022} Ctrl-C detach"
-        } else if width >= 58 {
-            "Enter send \u{2022} /status /resume \u{2022} Ctrl-C detach"
-        } else {
-            "Enter send \u{2022} Ctrl-C detach"
-        };
-        let right = if self.latest_state == "active" {
-            "active".to_string()
+        let right = if width >= 84 {
+            format!(
+                "{} \u{2022} events:{} \u{2022} #{}",
+                self.latest_state, self.received_events, self.last_sequence
+            )
+        } else if width >= 56 {
+            format!("{} \u{2022} #{}", self.latest_state, self.last_sequence)
         } else {
             self.latest_state.clone()
         };
-        align_left_right(left, &right, width)
-    }
-
-    fn session_footer_line(&self, width: usize) -> String {
-        let left = format!(
-            "session={} \u{2022} events={} \u{2022} seq={}",
-            self.session_id, self.received_events, self.last_sequence
-        );
-        let right = self.daemon_endpoint.clone();
         align_left_right(&left, &right, width)
     }
 }
@@ -2919,11 +2882,7 @@ mod tests {
 
     #[test]
     fn live_tui_input_editing_respects_cursor_boundaries() {
-        let mut ui = LiveAttachTui::new(
-            "sess_input".to_string(),
-            "http://127.0.0.1:8788".to_string(),
-            "active".to_string(),
-        );
+        let mut ui = LiveAttachTui::new("sess_input".to_string(), "active".to_string());
 
         ui.input_insert_str("hello");
         ui.move_input_cursor_left();
@@ -2946,11 +2905,7 @@ mod tests {
 
     #[test]
     fn live_tui_history_navigation_replays_previous_entries() {
-        let mut ui = LiveAttachTui::new(
-            "sess_history".to_string(),
-            "http://127.0.0.1:8788".to_string(),
-            "active".to_string(),
-        );
+        let mut ui = LiveAttachTui::new("sess_history".to_string(), "active".to_string());
         ui.remember_history_entry("first");
         ui.remember_history_entry("second");
 
