@@ -18,7 +18,9 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     widgets::{Paragraph, Wrap},
 };
+use reqwest::StatusCode;
 use reqwest::blocking::Client;
+use reqwest::blocking::Response;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -34,6 +36,9 @@ use std::{
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
 const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
+const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const TUI_COMPOSER_PROMPT: &str = "\u{203a} ";
+const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
 
 #[derive(Debug, Parser)]
 #[command(name = "crabbot", about = "Crabbot Linux CLI")]
@@ -818,7 +823,7 @@ impl LiveAttachTui {
     }
 
     fn input_view(&self, width: usize) -> (String, usize) {
-        let prompt_width = "you> ".chars().count();
+        let prompt_width = TUI_COMPOSER_PROMPT.chars().count();
         if width == 0 {
             return (String::new(), 0);
         }
@@ -843,71 +848,105 @@ impl LiveAttachTui {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
+                    Constraint::Length(1),
                     Constraint::Min(1),
                     Constraint::Length(1),
-                    Constraint::Length(2),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
                 ])
                 .split(frame.area());
 
+            frame.render_widget(
+                Paragraph::new(self.status_line_text(chunks[0].width as usize)),
+                chunks[0],
+            );
+
             let history = self.transcript.clone();
             let history_lines = history.lines().count().max(1) as u16;
-            let scroll = history_lines.saturating_sub(chunks[0].height);
+            let scroll = history_lines.saturating_sub(chunks[1].height);
             frame.render_widget(
                 Paragraph::new(history)
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
-                chunks[0],
-            );
-
-            frame.render_widget(
-                Paragraph::new(self.footer_text(chunks[1].width as usize)),
                 chunks[1],
             );
 
-            let input_chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Length(1), Constraint::Length(1)])
-                .split(chunks[2]);
+            let input_width = chunks[2].width as usize;
+            let (visible_input, cursor_col) = self.input_view(input_width);
+            let input_line = if visible_input.is_empty() {
+                let placeholder_width =
+                    input_width.saturating_sub(TUI_COMPOSER_PROMPT.chars().count());
+                let placeholder = truncate_for_width(TUI_COMPOSER_PLACEHOLDER, placeholder_width);
+                format!("{TUI_COMPOSER_PROMPT}{placeholder}")
+            } else {
+                format!("{TUI_COMPOSER_PROMPT}{visible_input}")
+            };
+            frame.render_widget(Paragraph::new(input_line), chunks[2]);
 
-            let (visible_input, cursor_col) = self.input_view(input_chunks[0].width as usize);
             frame.render_widget(
-                Paragraph::new(format!("you> {visible_input}")),
-                input_chunks[0],
-            );
-            frame.render_widget(
-                Paragraph::new(
-                    "Enter send | \u{2191}/\u{2193} history | \u{2190}/\u{2192} edit | /status /interrupt /resume /refresh | Ctrl-C detach",
-                ),
-                input_chunks[1],
+                Paragraph::new(self.footer_hint_line(chunks[3].width as usize)),
+                chunks[3],
             );
 
-            let cursor_x = input_chunks[0]
+            frame.render_widget(
+                Paragraph::new(self.session_footer_line(chunks[4].width as usize)),
+                chunks[4],
+            );
+
+            let cursor_x = chunks[2]
                 .x
                 .saturating_add(cursor_col.try_into().unwrap_or(u16::MAX));
-            frame.set_cursor_position((cursor_x, input_chunks[0].y));
+            frame.set_cursor_position((cursor_x, chunks[2].y));
         })?;
         Ok(())
     }
 
-    fn footer_text(&self, width: usize) -> String {
-        let mut footer = build_attach_footer(
-            &self.session_id,
-            &self.latest_state,
-            self.received_events,
-            self.last_sequence,
-            &self.daemon_endpoint,
-            width,
-        );
-
-        if let Some(pending) = &self.pending_prompt {
+    fn status_line_text(&self, width: usize) -> String {
+        let mut left = if let Some(pending) = &self.pending_prompt {
             let elapsed = pending.submitted_at.elapsed().as_secs_f32();
-            let pending_status = format!("pending {:.1}s", elapsed);
-            footer = truncate_for_width(&format!("{footer} | {pending_status}"), width);
-        }
-        if let Some(status) = &self.status_message {
-            footer = truncate_for_width(&format!("{footer} | {status}"), width);
-        }
-        footer
+            format!("\u{2022} Working ({elapsed:.1}s \u{2022} esc to interrupt)")
+        } else if let Some(status) = &self.status_message {
+            format!("\u{2022} {}", status.trim())
+        } else if self.latest_state == "interrupted" {
+            "\u{2022} Interrupted (run /resume to continue)".to_string()
+        } else {
+            "\u{2022} Ready".to_string()
+        };
+        left = truncate_for_width(&left, width);
+
+        let right = if self.last_sequence > 0 {
+            format!("{} \u{2022} #{}", self.session_id, self.last_sequence)
+        } else {
+            self.session_id.clone()
+        };
+        align_left_right(&left, &right, width)
+    }
+
+    fn footer_hint_line(&self, width: usize) -> String {
+        let left = if width >= 108 {
+            "Enter send \u{2022} \u{2191}/\u{2193} history \u{2022} /status /interrupt /resume /refresh \u{2022} Ctrl-C detach"
+        } else if width >= 82 {
+            "Enter send \u{2022} \u{2191}/\u{2193} history \u{2022} /status /resume \u{2022} Ctrl-C detach"
+        } else if width >= 58 {
+            "Enter send \u{2022} /status /resume \u{2022} Ctrl-C detach"
+        } else {
+            "Enter send \u{2022} Ctrl-C detach"
+        };
+        let right = if self.latest_state == "active" {
+            "active".to_string()
+        } else {
+            self.latest_state.clone()
+        };
+        align_left_right(left, &right, width)
+    }
+
+    fn session_footer_line(&self, width: usize) -> String {
+        let left = format!(
+            "session={} \u{2022} events={} \u{2022} seq={}",
+            self.session_id, self.received_events, self.last_sequence
+        );
+        let right = self.daemon_endpoint.clone();
+        align_left_right(&left, &right, width)
     }
 }
 
@@ -949,7 +988,7 @@ fn run_attach_tui_loop(
                 }
             }
             Err(error) => {
-                ui.status_message = Some(format!("prompt failed: {error}"));
+                ui.status_message = Some(format!("prompt failed: {}", error_chain_summary(&error)));
                 needs_redraw = true;
             }
         }
@@ -968,7 +1007,10 @@ fn run_attach_tui_loop(
                     }
                 }
                 Err(error) => {
-                    ui.status_message = Some(format!("stream poll failed: {error}"));
+                    ui.status_message = Some(format!(
+                        "stream poll failed: {}",
+                        error_chain_summary(&error)
+                    ));
                     needs_redraw = true;
                 }
             }
@@ -989,7 +1031,8 @@ fn run_attach_tui_loop(
                         next_poll = Instant::now();
                     }
                     Err(error) => {
-                        ui.status_message = Some(format!("command failed: {error}"));
+                        ui.status_message =
+                            Some(format!("command failed: {}", error_chain_summary(&error)));
                         needs_redraw = true;
                     }
                 }
@@ -1122,6 +1165,8 @@ fn handle_live_tui_submit(
         return Ok(LiveTuiAction::Continue);
     }
 
+    ensure_daemon_ready(state).context("daemon unavailable before prompt submit")?;
+
     ui.push_line(&format!("you: {command}"));
     ui.remember_history_entry(command);
 
@@ -1164,7 +1209,10 @@ fn poll_live_tui_prompt_completion(state: &mut CliState, ui: &mut LiveAttachTui)
     match poll_live_tui_stream_updates(state, ui) {
         Ok(_) => {}
         Err(error) => {
-            ui.status_message = Some(format!("stream poll failed after prompt: {error}"));
+            ui.status_message = Some(format!(
+                "stream poll failed after prompt: {}",
+                error_chain_summary(&error)
+            ));
         }
     }
     Ok(true)
@@ -1209,6 +1257,38 @@ fn truncate_for_width(text: &str, width: usize) -> String {
     let mut truncated = text.chars().take(width - 3).collect::<String>();
     truncated.push_str("...");
     truncated
+}
+
+fn error_chain_summary(error: &anyhow::Error) -> String {
+    error
+        .chain()
+        .map(|cause| cause.to_string())
+        .collect::<Vec<_>>()
+        .join(": ")
+}
+
+fn align_left_right(left: &str, right: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let left = truncate_for_width(left, width);
+    let right = truncate_for_width(right, width);
+    let left_width = left.chars().count();
+    let right_width = right.chars().count();
+
+    if left_width + right_width + 1 <= width {
+        let spacing = width.saturating_sub(left_width + right_width);
+        return format!("{left}{}{right}", " ".repeat(spacing));
+    }
+
+    if right_width + 1 >= width {
+        return truncate_for_width(&right, width);
+    }
+
+    let left_budget = width.saturating_sub(right_width + 1);
+    let left_truncated = truncate_for_width(&left, left_budget);
+    format!("{left_truncated} {right}")
 }
 
 fn persist_latest_session_state_from_stream(
@@ -1552,17 +1632,56 @@ fn daemon_prompt_session(
     text: &str,
     auth_token: Option<&str>,
 ) -> Result<DaemonPromptResponse> {
-    let client = http_client()?;
     let path = format!("/v1/sessions/{session_id}/prompt");
     let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.post(url), auth_token)
-        .json(&DaemonPromptRequest {
-            prompt: text.to_string(),
-        })
+    let request = DaemonPromptRequest {
+        prompt: text.to_string(),
+    };
+
+    let response = send_daemon_prompt_request(&url, &request, auth_token).with_context(|| {
+        format!("request daemon prompt (session={session_id}, endpoint={daemon_endpoint})")
+    })?;
+    if response.status() == StatusCode::NOT_FOUND {
+        daemon_start_session(daemon_endpoint, Some(session_id.to_string()), auth_token)
+            .with_context(|| format!("recover missing daemon session {session_id}"))?;
+        let retry = send_daemon_prompt_request(&url, &request, auth_token).with_context(|| {
+            format!("retry daemon prompt after session recovery (session={session_id})")
+        })?;
+        return parse_daemon_prompt_response(retry);
+    }
+
+    parse_daemon_prompt_response(response)
+}
+
+fn send_daemon_prompt_request(
+    url: &str,
+    request: &DaemonPromptRequest,
+    auth_token: Option<&str>,
+) -> Result<Response> {
+    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
+    apply_auth(client.post(url.to_string()), auth_token)
+        .json(request)
         .send()
-        .context("request daemon prompt")?
-        .error_for_status()
-        .context("daemon prompt returned error status")?;
+        .context("send daemon prompt request")
+}
+
+fn parse_daemon_prompt_response(response: Response) -> Result<DaemonPromptResponse> {
+    let status = response.status();
+    if !status.is_success() {
+        let body = response
+            .text()
+            .ok()
+            .map(|text| text.trim().to_string())
+            .unwrap_or_default();
+        if body.is_empty() {
+            bail!("daemon prompt returned HTTP {status}");
+        }
+        bail!(
+            "daemon prompt returned HTTP {status}: {}",
+            truncate_for_width(&body, 200)
+        );
+    }
+
     response
         .json::<DaemonPromptResponse>()
         .context("parse daemon prompt response")
