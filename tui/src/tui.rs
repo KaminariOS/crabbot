@@ -345,13 +345,15 @@ pub fn handle_attach_tui_interactive(
     initial_events: Vec<DaemonStreamEnvelope>,
     state: &mut CliState,
 ) -> Result<CommandOutput> {
-    let mut ui = LiveAttachTui::new(
-        session_id.clone(),
-        cached_session_state_label(state, &session_id)
+    let mut widget = ChatWidget::new(session_id.clone());
+    {
+        let ui = widget.ui_mut();
+        ui.latest_state = cached_session_state_label(state, &session_id)
             .unwrap_or("unknown")
-            .to_string(),
-    );
-    ui.apply_stream_events(&initial_events);
+            .to_string();
+        ui.apply_stream_events(&initial_events);
+        ui.status_message = Some("attached to daemon app-server bridge".to_string());
+    }
 
     enable_raw_mode().context("enable raw mode for attach tui")?;
     let mut stdout = io::stdout();
@@ -361,7 +363,7 @@ pub fn handle_attach_tui_interactive(
     let mut terminal = Terminal::new(backend).context("create attach tui terminal")?;
     terminal.clear().context("clear attach tui terminal")?;
 
-    let loop_result = run_attach_tui_loop(&mut terminal, &mut ui, state);
+    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
 
     let _ = disable_raw_mode();
     let _ = execute!(
@@ -372,302 +374,16 @@ pub fn handle_attach_tui_interactive(
     let _ = terminal.show_cursor();
 
     loop_result?;
+    state.last_thread_id = Some(widget.session_id().to_string());
     Ok(CommandOutput::Text(format!(
-        "session={session_id} detached"
+        "session={} detached",
+        widget.session_id()
     )))
-}
-
-fn run_attach_tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ui: &mut LiveAttachTui,
-    state: &mut CliState,
-) -> Result<()> {
-    let mut next_poll = Instant::now();
-    let mut needs_redraw = true;
-    loop {
-        match poll_live_tui_prompt_completion(state, ui) {
-            Ok(changed) => {
-                if changed {
-                    needs_redraw = true;
-                }
-            }
-            Err(error) => {
-                ui.status_message = Some(format!("prompt failed: {}", error_chain_summary(&error)));
-                needs_redraw = true;
-            }
-        }
-
-        if needs_redraw {
-            ui.draw(terminal)?;
-            needs_redraw = false;
-        }
-
-        let now = Instant::now();
-        if now >= next_poll {
-            match poll_live_tui_stream_updates(state, ui) {
-                Ok(changed) => {
-                    if changed {
-                        needs_redraw = true;
-                    }
-                }
-                Err(error) => {
-                    ui.status_message = Some(format!(
-                        "stream poll failed: {}",
-                        error_chain_summary(&error)
-                    ));
-                    needs_redraw = true;
-                }
-            }
-            next_poll = now + TUI_STREAM_POLL_INTERVAL;
-        }
-
-        if !event::poll(TUI_EVENT_WAIT_STEP).context("poll attach tui events")? {
-            continue;
-        }
-
-        match event::read().context("read attach tui event")? {
-            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
-                let action = handle_live_tui_key_event(key, state, ui);
-                match action {
-                    Ok(LiveTuiAction::Detach) => break,
-                    Ok(LiveTuiAction::Continue) => {
-                        needs_redraw = true;
-                        next_poll = Instant::now();
-                    }
-                    Err(error) => {
-                        ui.status_message =
-                            Some(format!("command failed: {}", error_chain_summary(&error)));
-                        needs_redraw = true;
-                    }
-                }
-            }
-            Event::Paste(pasted) => {
-                ui.input_insert_str(&pasted);
-                needs_redraw = true;
-            }
-            Event::Resize(_, _) => {
-                needs_redraw = true;
-            }
-            _ => {}
-        }
-    }
-    Ok(())
 }
 
 enum LiveTuiAction {
     Continue,
     Detach,
-}
-
-fn handle_live_tui_key_event(
-    key: crossterm::event::KeyEvent,
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-) -> Result<LiveTuiAction> {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Ok(LiveTuiAction::Detach);
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.clear_input();
-        }
-        KeyCode::Up => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_up();
-            } else {
-                ui.history_prev();
-            }
-        }
-        KeyCode::Down => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_down();
-            } else {
-                ui.history_next();
-            }
-        }
-        KeyCode::Left => ui.move_input_cursor_left(),
-        KeyCode::Right => ui.move_input_cursor_right(),
-        KeyCode::Home => ui.move_input_cursor_home(),
-        KeyCode::End => ui.move_input_cursor_end(),
-        KeyCode::Enter => {
-            if ui.should_apply_slash_picker_on_enter() {
-                let _ = ui.apply_selected_slash_entry();
-                return Ok(LiveTuiAction::Continue);
-            }
-            let input = ui.take_input();
-            return handle_live_tui_submit(state, ui, input);
-        }
-        KeyCode::Backspace => {
-            ui.input_backspace();
-        }
-        KeyCode::Delete => {
-            ui.input_delete();
-        }
-        KeyCode::Tab => {
-            if ui.slash_picker_is_active() {
-                let _ = ui.apply_selected_slash_entry();
-            } else {
-                ui.input_insert_char('\t');
-            }
-        }
-        KeyCode::Char(ch) => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                ui.input_insert_char(ch);
-            }
-        }
-        _ => {}
-    }
-    Ok(LiveTuiAction::Continue)
-}
-
-fn handle_live_tui_submit(
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-    input: String,
-) -> Result<LiveTuiAction> {
-    let command = input.trim();
-    if command.is_empty() || command == "/refresh" {
-        let _ = poll_live_tui_stream_updates(state, ui)?;
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    if command == "/exit" || command == "/quit" {
-        return Ok(LiveTuiAction::Detach);
-    }
-
-    if command == "/status" {
-        let status = daemon_get_session_status(
-            &state.config.daemon_endpoint,
-            &ui.session_id,
-            state.config.auth_token.as_deref(),
-        )?;
-        persist_daemon_session(state, &status)?;
-        ui.latest_state = status.state.clone();
-        ui.status_message = Some(format!(
-            "state={} last_event={} updated_at_unix_ms={}",
-            status.state, status.last_event, status.updated_at_unix_ms
-        ));
-        let _ = poll_live_tui_stream_updates(state, ui)?;
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    if command == "/interrupt" {
-        let status = daemon_interrupt_session(
-            &state.config.daemon_endpoint,
-            &ui.session_id,
-            state.config.auth_token.as_deref(),
-        )?;
-        persist_daemon_session(state, &status)?;
-        ui.latest_state = status.state.clone();
-        ui.status_message = Some("session interrupted".to_string());
-        let _ = poll_live_tui_stream_updates(state, ui)?;
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    if command == "/resume" {
-        let status = daemon_resume_session(
-            &state.config.daemon_endpoint,
-            &ui.session_id,
-            state.config.auth_token.as_deref(),
-        )?;
-        persist_daemon_session(state, &status)?;
-        ui.latest_state = status.state.clone();
-        ui.status_message = Some("session resumed".to_string());
-        let _ = poll_live_tui_stream_updates(state, ui)?;
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    if command.starts_with('/') {
-        ui.status_message = Some(format!("unknown command: {command}"));
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    if ui.has_pending_prompt() {
-        ui.status_message =
-            Some("wait for current response before sending another prompt".to_string());
-        ui.replace_input(input);
-        return Ok(LiveTuiAction::Continue);
-    }
-
-    ensure_daemon_ready(state).context("daemon unavailable before prompt submit")?;
-
-    ui.push_user_prompt(command);
-    ui.remember_history_entry(command);
-
-    ui.start_prompt_request(
-        state.config.daemon_endpoint.clone(),
-        state.config.auth_token.clone(),
-        command.to_string(),
-    )?;
-    Ok(LiveTuiAction::Continue)
-}
-
-fn poll_live_tui_prompt_completion(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let Some(pending) = ui.take_finished_prompt() else {
-        return Ok(false);
-    };
-
-    let prompt_text = pending.prompt;
-    let result = pending
-        .handle
-        .join()
-        .map_err(|_| anyhow!("prompt worker thread panicked"))?;
-    let prompt = result?;
-
-    persist_daemon_session(
-        state,
-        &DaemonSessionStatusResponse {
-            session_id: prompt.session_id.clone(),
-            state: prompt.state.clone(),
-            last_event: prompt.last_event.clone(),
-            updated_at_unix_ms: prompt.updated_at_unix_ms,
-        },
-    )?;
-    ui.latest_state = prompt.state.clone();
-    if prompt.state != "active" {
-        ui.status_message = Some(format!("session state: {}", prompt.state));
-    } else {
-        ui.status_message = Some(format!("response received for: {prompt_text}"));
-    }
-
-    match poll_live_tui_stream_updates(state, ui) {
-        Ok(_) => {}
-        Err(error) => {
-            ui.status_message = Some(format!(
-                "stream poll failed after prompt: {}",
-                error_chain_summary(&error)
-            ));
-        }
-    }
-    Ok(true)
-}
-
-fn poll_live_tui_stream_updates(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let stream_events = match fetch_daemon_stream_with_timeout(
-        &state.config.daemon_endpoint,
-        &ui.session_id,
-        state.config.auth_token.as_deref(),
-        Some(ui.last_sequence),
-        TUI_STREAM_REQUEST_TIMEOUT,
-    )? {
-        DaemonStreamFetchResult::Stream(events) => events,
-        DaemonStreamFetchResult::NotFound => {
-            bail!("session stream not found for session: {}", ui.session_id)
-        }
-    };
-
-    if stream_events.is_empty() {
-        return Ok(false);
-    }
-
-    ui.apply_stream_events(&stream_events);
-    persist_latest_session_state_from_stream(state, &ui.session_id, &stream_events)?;
-    if let Some(cached_state) = cached_session_state_label(state, &ui.session_id) {
-        ui.latest_state = cached_state.to_string();
-    }
-    Ok(true)
 }
 
 fn truncate_for_width(text: &str, width: usize) -> String {

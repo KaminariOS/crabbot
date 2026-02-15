@@ -102,6 +102,7 @@ struct ConfigSetArgs {
     clear_auth_token: bool,
 }
 
+mod core_compat;
 mod slash_command;
 pub mod tui;
 
