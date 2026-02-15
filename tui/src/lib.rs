@@ -134,14 +134,22 @@ struct ConfigSetArgs {
 }
 
 mod app;
+#[path = "bottom_pane/slash_commands.rs"]
+mod slash_commands;
+mod chatwidget;
+mod color;
 mod core_compat;
 mod custom_terminal;
 mod insert_history;
 mod key_hint;
+mod mention_codec;
 mod notifications;
 mod slash_command;
+mod style;
 mod terminal_palette;
+mod text_formatting;
 pub mod tui;
+mod version;
 mod wrapping;
 
 mod render {
@@ -172,7 +180,6 @@ mod render {
     }
 }
 
-pub(crate) use app::color;
 pub use app::handle_attach_tui_interactive;
 pub use app::handle_tui;
 fn truncate_for_width(text: &str, width: usize) -> String {

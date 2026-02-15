@@ -1,24 +1,5 @@
 use super::*;
 
-#[path = "chatwidget.rs"]
-mod chatwidget;
-#[path = "color.rs"]
-pub(crate) mod color;
-#[path = "key_hint.rs"]
-mod key_hint;
-#[path = "mention_codec.rs"]
-mod mention_codec;
-#[path = "bottom_pane/slash_commands.rs"]
-mod slash_commands;
-#[path = "style.rs"]
-mod style;
-#[path = "terminal_palette.rs"]
-pub(crate) mod terminal_palette;
-#[path = "text_formatting.rs"]
-mod text_formatting;
-#[path = "version.rs"]
-mod version;
-
 pub(super) use crate::core_compat::AppEvent;
 pub(super) use crate::core_compat::AppEventSender;
 pub(super) use crate::core_compat::AppExitInfo;
@@ -35,11 +16,11 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
-use chatwidget::ChatWidget;
-use chatwidget::LiveAttachTui;
-use slash_commands::find_builtin_command;
-use text_formatting::proper_join;
-use version::CODEX_CLI_VERSION;
+use crate::slash_commands::find_builtin_command;
+use crate::chatwidget::ChatWidget;
+use crate::chatwidget::LiveAttachTui;
+use crate::text_formatting::proper_join;
+use crate::version::CODEX_CLI_VERSION;
 
 // ---------------------------------------------------------------------------
 // App struct — mirrors upstream `app::App` but backed by app-server transport
@@ -386,7 +367,7 @@ pub fn handle_attach_tui_interactive(
 // Key event handling
 // ---------------------------------------------------------------------------
 
-fn handle_app_server_tui_key_event(
+pub(crate) fn handle_app_server_tui_key_event(
     key: crossterm::event::KeyEvent,
     state: &mut CliState,
     ui: &mut LiveAttachTui,
@@ -583,7 +564,7 @@ fn handle_app_server_approval_decision(
     Ok(())
 }
 
-fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+pub(crate) fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
     let events = stream_events(state, ui.last_sequence)?;
     if events.is_empty() {
         return Ok(false);
@@ -619,7 +600,7 @@ fn error_chain_summary(error: &anyhow::Error) -> String {
         .join(": ")
 }
 
-fn align_left_right(left: &str, right: &str, width: usize) -> String {
+pub(crate) fn align_left_right(left: &str, right: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
     }

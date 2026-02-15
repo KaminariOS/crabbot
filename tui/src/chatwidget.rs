@@ -1,43 +1,48 @@
-use super::UiApprovalRequest;
-use super::UiEvent;
-use super::key_hint;
-use super::map_daemon_stream_events;
-use super::map_rpc_stream_events;
-use super::mention_codec;
-use super::slash_commands::builtins_for_input;
-use super::style;
-use super::text_formatting;
-use super::*;
+use crate::app::align_left_right;
+use crate::app::handle_app_server_tui_key_event;
+use crate::app::poll_app_server_tui_stream_updates;
+use crate::core_compat::AppEvent;
+use crate::core_compat::LiveTuiAction;
+use crate::core_compat::UiApprovalRequest;
+use crate::core_compat::UiEvent;
+use crate::core_compat::map_daemon_stream_events;
+use crate::core_compat::map_rpc_stream_events;
+use crate::key_hint;
+use crate::mention_codec;
 use crate::slash_command::SlashCommand;
+use crate::slash_commands::builtins_for_input;
+use crate::style;
+use crate::text_formatting;
+use crate::*;
 use codex_utils_fuzzy_match::fuzzy_match;
 
-pub(super) struct InFlightPrompt {
-    pub(super) prompt: String,
+pub(crate) struct InFlightPrompt {
+    pub(crate) prompt: String,
     submitted_at: Instant,
-    pub(super) handle: thread::JoinHandle<Result<DaemonPromptResponse>>,
+    pub(crate) handle: thread::JoinHandle<Result<DaemonPromptResponse>>,
 }
 
-pub(super) struct LiveAttachTui {
-    pub(super) session_id: String,
+pub(crate) struct LiveAttachTui {
+    pub(crate) session_id: String,
     transcript: String,
-    pub(super) input: String,
+    pub(crate) input: String,
     input_cursor: usize,
     command_history: Vec<String>,
     history_index: Option<usize>,
-    pub(super) latest_state: String,
+    pub(crate) latest_state: String,
     previous_state: Option<String>,
     received_events: usize,
-    pub(super) last_sequence: u64,
-    pub(super) status_message: Option<String>,
-    pub(super) active_turn_id: Option<String>,
+    pub(crate) last_sequence: u64,
+    pub(crate) status_message: Option<String>,
+    pub(crate) active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
-    pub(super) pending_approvals: BTreeMap<String, UiApprovalRequest>,
+    pub(crate) pending_approvals: BTreeMap<String, UiApprovalRequest>,
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
 }
 
 impl LiveAttachTui {
-    pub(super) fn new(session_id: String, latest_state: String) -> Self {
+    pub(crate) fn new(session_id: String, latest_state: String) -> Self {
         Self {
             session_id,
             transcript: String::new(),
@@ -58,7 +63,7 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn apply_stream_events(&mut self, stream_events: &[DaemonStreamEnvelope]) {
+    pub(crate) fn apply_stream_events(&mut self, stream_events: &[DaemonStreamEnvelope]) {
         if let Some(last) = stream_events.last() {
             self.last_sequence = last.sequence;
         }
@@ -66,7 +71,7 @@ impl LiveAttachTui {
         self.apply_ui_events(map_daemon_stream_events(stream_events));
     }
 
-    pub(super) fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
+    pub(crate) fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
         if let Some(last) = stream_events.last() {
             self.last_sequence = last.sequence;
         }
@@ -162,7 +167,7 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn push_line(&mut self, line: &str) {
+    pub(crate) fn push_line(&mut self, line: &str) {
         if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
             self.transcript.push('\n');
         }
@@ -170,7 +175,7 @@ impl LiveAttachTui {
         self.transcript.push('\n');
     }
 
-    pub(super) fn push_user_prompt(&mut self, prompt: &str) {
+    pub(crate) fn push_user_prompt(&mut self, prompt: &str) {
         let decoded = mention_codec::decode_history_mentions(prompt);
         let display_prompt = decoded.text;
         if !self.transcript.is_empty() && !self.transcript.ends_with("\n\n") {
@@ -183,7 +188,7 @@ impl LiveAttachTui {
             .push_str(&format!("\u{203a} {display_prompt}\n\n"));
     }
 
-    pub(super) fn append_assistant_delta(&mut self, delta: &str) {
+    pub(crate) fn append_assistant_delta(&mut self, delta: &str) {
         if delta.is_empty() {
             return;
         }
@@ -200,7 +205,7 @@ impl LiveAttachTui {
         self.transcript.push_str(delta);
     }
 
-    pub(super) fn input_insert_str(&mut self, text: &str) {
+    pub(crate) fn input_insert_str(&mut self, text: &str) {
         self.shortcuts_overlay_visible = false;
         if self.input_cursor == self.input.len() {
             self.input.push_str(text);
@@ -213,7 +218,7 @@ impl LiveAttachTui {
         self.sync_slash_picker();
     }
 
-    pub(super) fn input_insert_char(&mut self, ch: char) {
+    pub(crate) fn input_insert_char(&mut self, ch: char) {
         self.shortcuts_overlay_visible = false;
         if self.input_cursor == self.input.len() {
             self.input.push(ch);
@@ -226,7 +231,7 @@ impl LiveAttachTui {
         self.sync_slash_picker();
     }
 
-    pub(super) fn input_backspace(&mut self) {
+    pub(crate) fn input_backspace(&mut self) {
         self.shortcuts_overlay_visible = false;
         if self.input_cursor == 0 {
             return;
@@ -237,7 +242,7 @@ impl LiveAttachTui {
         self.sync_slash_picker();
     }
 
-    pub(super) fn input_delete(&mut self) {
+    pub(crate) fn input_delete(&mut self) {
         self.shortcuts_overlay_visible = false;
         if self.input_cursor >= self.input.len() {
             return;
@@ -247,37 +252,37 @@ impl LiveAttachTui {
         self.sync_slash_picker();
     }
 
-    pub(super) fn move_input_cursor_left(&mut self) {
+    pub(crate) fn move_input_cursor_left(&mut self) {
         self.input_cursor = previous_char_boundary(&self.input, self.input_cursor);
     }
 
-    pub(super) fn move_input_cursor_right(&mut self) {
+    pub(crate) fn move_input_cursor_right(&mut self) {
         self.input_cursor = next_char_boundary(&self.input, self.input_cursor);
     }
 
-    pub(super) fn move_input_cursor_home(&mut self) {
+    pub(crate) fn move_input_cursor_home(&mut self) {
         self.input_cursor = 0;
     }
 
-    pub(super) fn move_input_cursor_end(&mut self) {
+    pub(crate) fn move_input_cursor_end(&mut self) {
         self.input_cursor = self.input.len();
     }
 
-    pub(super) fn clear_input(&mut self) {
+    pub(crate) fn clear_input(&mut self) {
         self.shortcuts_overlay_visible = false;
         self.input.clear();
         self.input_cursor = 0;
         self.sync_slash_picker();
     }
 
-    pub(super) fn replace_input(&mut self, text: String) {
+    pub(crate) fn replace_input(&mut self, text: String) {
         self.shortcuts_overlay_visible = false;
         self.input = text;
         self.input_cursor = self.input.len();
         self.sync_slash_picker();
     }
 
-    pub(super) fn take_input(&mut self) -> String {
+    pub(crate) fn take_input(&mut self) -> String {
         self.history_index = None;
         self.shortcuts_overlay_visible = false;
         self.input_cursor = 0;
@@ -286,7 +291,7 @@ impl LiveAttachTui {
         taken
     }
 
-    pub(super) fn remember_history_entry(&mut self, text: &str) {
+    pub(crate) fn remember_history_entry(&mut self, text: &str) {
         if text.is_empty() {
             return;
         }
@@ -301,7 +306,7 @@ impl LiveAttachTui {
         self.history_index = None;
     }
 
-    pub(super) fn history_prev(&mut self) {
+    pub(crate) fn history_prev(&mut self) {
         self.shortcuts_overlay_visible = false;
         if self.command_history.is_empty() {
             return;
@@ -315,7 +320,7 @@ impl LiveAttachTui {
         self.replace_input(self.command_history[next_index].clone());
     }
 
-    pub(super) fn history_next(&mut self) {
+    pub(crate) fn history_next(&mut self) {
         self.shortcuts_overlay_visible = false;
         let Some(index) = self.history_index else {
             return;
@@ -330,11 +335,11 @@ impl LiveAttachTui {
         self.replace_input(self.command_history[next_index].clone());
     }
 
-    pub(super) fn has_pending_prompt(&self) -> bool {
+    pub(crate) fn has_pending_prompt(&self) -> bool {
         self.pending_prompt.is_some()
     }
 
-    pub(super) fn start_prompt_request(
+    pub(crate) fn start_prompt_request(
         &mut self,
         daemon_endpoint: String,
         auth_token: Option<String>,
@@ -364,7 +369,7 @@ impl LiveAttachTui {
         Ok(())
     }
 
-    pub(super) fn take_finished_prompt(&mut self) -> Option<InFlightPrompt> {
+    pub(crate) fn take_finished_prompt(&mut self) -> Option<InFlightPrompt> {
         if self
             .pending_prompt
             .as_ref()
@@ -375,7 +380,7 @@ impl LiveAttachTui {
         None
     }
 
-    pub(super) fn input_view(&self, width: usize) -> (String, usize, usize) {
+    pub(crate) fn input_view(&self, width: usize) -> (String, usize, usize) {
         let prompt_width = TUI_COMPOSER_PROMPT.chars().count();
         if width == 0 {
             return (String::new(), 0, 0);
@@ -396,7 +401,7 @@ impl LiveAttachTui {
         (visible, cursor_col, offset)
     }
 
-    pub(super) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
             let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
             let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
@@ -470,7 +475,7 @@ impl LiveAttachTui {
         Ok(())
     }
 
-    pub(super) fn input_line(
+    pub(crate) fn input_line(
         &self,
         visible_input: String,
         offset: usize,
@@ -503,7 +508,7 @@ impl LiveAttachTui {
         Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
     }
 
-    pub(super) fn footer_line_text(&self, width: usize) -> String {
+    pub(crate) fn footer_line_text(&self, width: usize) -> String {
         let left = if self.shortcuts_overlay_visible {
             "  press ? to close shortcuts".to_string()
         } else if let Some(pending) = &self.pending_prompt {
@@ -528,12 +533,12 @@ impl LiveAttachTui {
         align_left_right(&left, &right, width)
     }
 
-    pub(super) fn context_left_percent(&self) -> usize {
+    pub(crate) fn context_left_percent(&self) -> usize {
         let consumed = (self.received_events / 12).min(99);
         100_usize.saturating_sub(consumed)
     }
 
-    pub(super) fn composer_row_style(&self) -> Style {
+    pub(crate) fn composer_row_style(&self) -> Style {
         let themed = style::user_message_style();
         if themed.bg.is_some() {
             themed
@@ -547,7 +552,7 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn special_token_style(&self, token: char) -> Option<Style> {
+    pub(crate) fn special_token_style(&self, token: char) -> Option<Style> {
         let style = match token {
             '!' => Style::default().fg(Color::Yellow).bold(),
             '@' => Style::default().fg(Color::Cyan).bold(),
@@ -558,7 +563,7 @@ impl LiveAttachTui {
         Some(style)
     }
 
-    pub(super) fn slash_picker_query(&self) -> Option<String> {
+    pub(crate) fn slash_picker_query(&self) -> Option<String> {
         let trimmed = self.input.trim_start();
         if !trimmed.starts_with('/') {
             return None;
@@ -568,7 +573,7 @@ impl LiveAttachTui {
         Some(token.split_whitespace().next().unwrap_or("").to_string())
     }
 
-    pub(super) fn slash_picker_entries(&self) -> Vec<(&'static str, SlashCommand)> {
+    pub(crate) fn slash_picker_entries(&self) -> Vec<(&'static str, SlashCommand)> {
         let Some(query) = self.slash_picker_query() else {
             return Vec::new();
         };
@@ -583,11 +588,11 @@ impl LiveAttachTui {
         .collect()
     }
 
-    pub(super) fn slash_picker_is_active(&self) -> bool {
+    pub(crate) fn slash_picker_is_active(&self) -> bool {
         !self.slash_picker_entries().is_empty()
     }
 
-    pub(super) fn sync_slash_picker(&mut self) {
+    pub(crate) fn sync_slash_picker(&mut self) {
         let len = self.slash_picker_entries().len();
         if len == 0 {
             self.slash_picker_index = 0;
@@ -596,7 +601,7 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn slash_picker_move_up(&mut self) {
+    pub(crate) fn slash_picker_move_up(&mut self) {
         self.shortcuts_overlay_visible = false;
         let len = self.slash_picker_entries().len();
         if len == 0 {
@@ -610,7 +615,7 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn slash_picker_move_down(&mut self) {
+    pub(crate) fn slash_picker_move_down(&mut self) {
         self.shortcuts_overlay_visible = false;
         let len = self.slash_picker_entries().len();
         if len == 0 {
@@ -620,13 +625,13 @@ impl LiveAttachTui {
         self.slash_picker_index = (self.slash_picker_index + 1) % len;
     }
 
-    pub(super) fn selected_slash_entry(&self) -> Option<(&'static str, SlashCommand)> {
+    pub(crate) fn selected_slash_entry(&self) -> Option<(&'static str, SlashCommand)> {
         let entries = self.slash_picker_entries();
         let selected = self.slash_picker_index.min(entries.len().saturating_sub(1));
         entries.get(selected).copied()
     }
 
-    pub(super) fn apply_selected_slash_entry(&mut self) -> bool {
+    pub(crate) fn apply_selected_slash_entry(&mut self) -> bool {
         self.shortcuts_overlay_visible = false;
         let Some(selected) = self.selected_slash_entry() else {
             return false;
@@ -635,7 +640,7 @@ impl LiveAttachTui {
         true
     }
 
-    pub(super) fn should_apply_slash_picker_on_enter(&self) -> bool {
+    pub(crate) fn should_apply_slash_picker_on_enter(&self) -> bool {
         if !self.slash_picker_is_active() {
             return false;
         }
@@ -645,7 +650,7 @@ impl LiveAttachTui {
         self.input.trim() != format!("/{}", selected.0)
     }
 
-    pub(super) fn slash_picker_lines(&self, width: usize) -> Vec<Line<'static>> {
+    pub(crate) fn slash_picker_lines(&self, width: usize) -> Vec<Line<'static>> {
         let entries = self.slash_picker_entries();
         if entries.is_empty() || width == 0 {
             return Vec::new();
@@ -689,7 +694,7 @@ impl LiveAttachTui {
         lines
     }
 
-    pub(super) fn live_input_hint(&self) -> Option<String> {
+    pub(crate) fn live_input_hint(&self) -> Option<String> {
         if self.shortcuts_overlay_visible {
             return Some("  shortcuts overlay".to_string());
         }
@@ -709,11 +714,11 @@ impl LiveAttachTui {
         }
     }
 
-    pub(super) fn toggle_shortcuts_overlay(&mut self) {
+    pub(crate) fn toggle_shortcuts_overlay(&mut self) {
         self.shortcuts_overlay_visible = !self.shortcuts_overlay_visible;
     }
 
-    pub(super) fn hide_shortcuts_overlay(&mut self) {
+    pub(crate) fn hide_shortcuts_overlay(&mut self) {
         self.shortcuts_overlay_visible = false;
     }
 
@@ -767,37 +772,35 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .unwrap_or(0)
 }
 
-use super::AppEvent;
-use super::LiveTuiAction;
 
-pub(super) struct ChatWidget {
+pub(crate) struct ChatWidget {
     ui: LiveAttachTui,
 }
 
 impl ChatWidget {
-    pub(super) fn new(thread_id: String) -> Self {
+    pub(crate) fn new(thread_id: String) -> Self {
         Self {
             ui: LiveAttachTui::new(thread_id, "active".to_string()),
         }
     }
 
-    pub(super) fn ui_mut(&mut self) -> &mut LiveAttachTui {
+    pub(crate) fn ui_mut(&mut self) -> &mut LiveAttachTui {
         &mut self.ui
     }
 
-    pub(super) fn session_id(&self) -> &str {
+    pub(crate) fn session_id(&self) -> &str {
         &self.ui.session_id
     }
 
-    pub(super) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         self.ui.draw(terminal)
     }
 
-    pub(super) fn poll_stream_updates(&mut self, state: &CliState) -> Result<bool> {
+    pub(crate) fn poll_stream_updates(&mut self, state: &CliState) -> Result<bool> {
         poll_app_server_tui_stream_updates(state, &mut self.ui)
     }
 
-    pub(super) fn on_event(
+    pub(crate) fn on_event(
         &mut self,
         event: AppEvent,
         state: &mut CliState,
