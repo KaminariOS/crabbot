@@ -1,6 +1,8 @@
-pub(super) struct TuiSlashCommand {
-    pub(super) command: &'static str,
-    pub(super) description: &'static str,
+use super::super::fuzzy_match::fuzzy_match;
+
+pub(crate) struct TuiSlashCommand {
+    pub(crate) command: &'static str,
+    pub(crate) description: &'static str,
     hide_in_empty_picker: bool,
     requires_collaboration_modes: bool,
     requires_connectors: bool,
@@ -425,7 +427,7 @@ fn slash_command_visible_in_picker(command: &TuiSlashCommand) -> bool {
     true
 }
 
-pub(super) fn filtered_slash_commands(query: &str) -> Vec<&'static TuiSlashCommand> {
+pub(crate) fn filtered_slash_commands(query: &str) -> Vec<&'static TuiSlashCommand> {
     let builtins: Vec<&'static TuiSlashCommand> = TUI_SLASH_COMMANDS
         .iter()
         .filter(|command| slash_command_visible_in_picker(command))
@@ -438,17 +440,72 @@ pub(super) fn filtered_slash_commands(query: &str) -> Vec<&'static TuiSlashComma
             .collect();
     }
 
+    let filter_lower = filter.to_ascii_lowercase();
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
-    let filter_lower = filter.to_ascii_lowercase();
-    for command in builtins {
+    let mut fuzzy = Vec::new();
+
+    for (index, command) in builtins.into_iter().enumerate() {
         let command_lower = command.command.to_ascii_lowercase();
         if command_lower == filter_lower {
             exact.push(command);
-        } else if command_lower.starts_with(&filter_lower) {
+            continue;
+        }
+        if command_lower.starts_with(&filter_lower) {
             prefix.push(command);
+            continue;
+        }
+        fuzzy.push((command, index));
+    }
+
+    if !exact.is_empty() || !prefix.is_empty() {
+        let mut ordered = Vec::with_capacity(exact.len() + prefix.len());
+        ordered.extend(exact);
+        ordered.extend(prefix);
+        return ordered;
+    }
+
+    let mut fuzzy_ranked = Vec::new();
+    for (command, index) in fuzzy {
+        if let Some((_, score)) = fuzzy_match(command.command, filter) {
+            fuzzy_ranked.push((command, score, index));
         }
     }
-    exact.extend(prefix);
-    exact
+
+    fuzzy_ranked.sort_by(|lhs, rhs| lhs.1.cmp(&rhs.1).then(lhs.2.cmp(&rhs.2)));
+
+    fuzzy_ranked
+        .into_iter()
+        .map(|(command, _, _)| command)
+        .collect()
+}
+
+pub(crate) fn find_visible_slash_command(name: &str) -> Option<&'static TuiSlashCommand> {
+    let normalized = name.trim().trim_start_matches('/');
+    if normalized.is_empty() {
+        return None;
+    }
+    TUI_SLASH_COMMANDS.iter().find(|command| {
+        slash_command_visible_in_picker(command) && command.command.eq_ignore_ascii_case(normalized)
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{filtered_slash_commands, find_visible_slash_command};
+
+    #[test]
+    fn fuzzy_fallback_works_when_no_prefix_matches() {
+        let matches = filtered_slash_commands("mdl")
+            .into_iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+        assert_eq!(matches.first().copied(), Some("model"));
+    }
+
+    #[test]
+    fn exact_visible_command_lookup_is_case_insensitive() {
+        assert!(find_visible_slash_command("/ReSuMe").is_some());
+        assert!(find_visible_slash_command("   ").is_none());
+    }
 }

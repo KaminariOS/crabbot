@@ -1,8 +1,11 @@
 use super::*;
 
+mod bottom_pane;
+mod fuzzy_match;
+mod key_hint;
 mod live_ui;
-mod slash_commands;
 
+use bottom_pane::slash_commands::find_visible_slash_command;
 use live_ui::LiveAttachTui;
 
 pub(crate) fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
@@ -77,16 +80,25 @@ fn run_app_server_tui_loop(
         let mut should_redraw = false;
 
         if event::poll(TUI_EVENT_WAIT_STEP).context("poll app-server tui input event")? {
-            let event = event::read().context("read app-server tui input event")?;
-            if let Event::Key(key_event) = event {
-                if key_event.kind != KeyEventKind::Press {
-                    continue;
+            match event::read().context("read app-server tui input event")? {
+                Event::Key(key_event) => {
+                    if key_event.kind != KeyEventKind::Press {
+                        continue;
+                    }
+                    match handle_app_server_tui_key_event(key_event, state, ui)? {
+                        LiveTuiAction::Continue => {}
+                        LiveTuiAction::Detach => return Ok(()),
+                    }
+                    should_redraw = true;
                 }
-                match handle_app_server_tui_key_event(key_event, state, ui)? {
-                    LiveTuiAction::Continue => {}
-                    LiveTuiAction::Detach => return Ok(()),
+                Event::Paste(pasted) => {
+                    ui.input_insert_str(&pasted);
+                    should_redraw = true;
                 }
-                should_redraw = true;
+                Event::Resize(_, _) => {
+                    should_redraw = true;
+                }
+                _ => {}
             }
         }
 
@@ -130,7 +142,14 @@ fn handle_app_server_tui_key_event(
         KeyCode::Right => ui.move_input_cursor_right(),
         KeyCode::Home => ui.move_input_cursor_home(),
         KeyCode::End => ui.move_input_cursor_end(),
+        KeyCode::Esc => {
+            ui.hide_shortcuts_overlay();
+        }
         KeyCode::Enter => {
+            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                ui.input_insert_char('\n');
+                return Ok(LiveTuiAction::Continue);
+            }
             if ui.should_apply_slash_picker_on_enter() {
                 let _ = ui.apply_selected_slash_entry();
                 return Ok(LiveTuiAction::Continue);
@@ -152,6 +171,18 @@ fn handle_app_server_tui_key_event(
                 ui.input_insert_char('\t');
             }
         }
+        KeyCode::Char('?') => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+                && ui.input.trim().is_empty()
+            {
+                ui.toggle_shortcuts_overlay();
+            } else if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                ui.input_insert_char('?');
+            }
+        }
         KeyCode::Char(ch) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
@@ -170,6 +201,7 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     if trimmed.is_empty() {
         return Ok(false);
     }
+    ui.hide_shortcuts_overlay();
     ui.remember_history_entry(trimmed);
 
     match trimmed {
@@ -252,6 +284,17 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     }
     if let Some(rest) = trimmed.strip_prefix("/deny") {
         return handle_app_server_approval_decision(state, ui, rest.trim(), false).map(|_| false);
+    }
+
+    if let Some(command) = trimmed
+        .strip_prefix('/')
+        .and_then(|value| value.split_whitespace().next())
+        && find_visible_slash_command(command).is_some()
+    {
+        ui.status_message = Some(format!(
+            "slash command /{command} is not implemented in crabbot app-server tui yet"
+        ));
+        return Ok(false);
     }
 
     ui.push_user_prompt(trimmed);

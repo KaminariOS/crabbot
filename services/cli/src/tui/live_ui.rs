@@ -1,5 +1,5 @@
-use super::slash_commands::{TuiSlashCommand, filtered_slash_commands};
-use super::*;
+use super::bottom_pane::slash_commands::{TuiSlashCommand, filtered_slash_commands};
+use super::{key_hint, *};
 
 pub(super) struct InFlightPrompt {
     pub(super) prompt: String,
@@ -23,6 +23,7 @@ pub(super) struct LiveAttachTui {
     pending_prompt: Option<InFlightPrompt>,
     pub(super) pending_approvals: BTreeMap<String, DaemonRpcServerRequest>,
     slash_picker_index: usize,
+    shortcuts_overlay_visible: bool,
 }
 
 impl LiveAttachTui {
@@ -43,6 +44,7 @@ impl LiveAttachTui {
             pending_prompt: None,
             pending_approvals: BTreeMap::new(),
             slash_picker_index: 0,
+            shortcuts_overlay_visible: false,
         }
     }
 
@@ -225,6 +227,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn input_insert_str(&mut self, text: &str) {
+        self.shortcuts_overlay_visible = false;
         if self.input_cursor == self.input.len() {
             self.input.push_str(text);
             self.input_cursor = self.input.len();
@@ -237,6 +240,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn input_insert_char(&mut self, ch: char) {
+        self.shortcuts_overlay_visible = false;
         if self.input_cursor == self.input.len() {
             self.input.push(ch);
             self.input_cursor = self.input.len();
@@ -249,6 +253,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn input_backspace(&mut self) {
+        self.shortcuts_overlay_visible = false;
         if self.input_cursor == 0 {
             return;
         }
@@ -259,6 +264,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn input_delete(&mut self) {
+        self.shortcuts_overlay_visible = false;
         if self.input_cursor >= self.input.len() {
             return;
         }
@@ -284,12 +290,14 @@ impl LiveAttachTui {
     }
 
     pub(super) fn clear_input(&mut self) {
+        self.shortcuts_overlay_visible = false;
         self.input.clear();
         self.input_cursor = 0;
         self.sync_slash_picker();
     }
 
     pub(super) fn replace_input(&mut self, text: String) {
+        self.shortcuts_overlay_visible = false;
         self.input = text;
         self.input_cursor = self.input.len();
         self.sync_slash_picker();
@@ -297,6 +305,7 @@ impl LiveAttachTui {
 
     pub(super) fn take_input(&mut self) -> String {
         self.history_index = None;
+        self.shortcuts_overlay_visible = false;
         self.input_cursor = 0;
         let taken = std::mem::take(&mut self.input);
         self.sync_slash_picker();
@@ -319,6 +328,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn history_prev(&mut self) {
+        self.shortcuts_overlay_visible = false;
         if self.command_history.is_empty() {
             return;
         }
@@ -332,6 +342,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn history_next(&mut self) {
+        self.shortcuts_overlay_visible = false;
         let Some(index) = self.history_index else {
             return;
         };
@@ -413,12 +424,15 @@ impl LiveAttachTui {
 
     pub(super) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
+            let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
+            let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
             let slash_picker_lines = self.slash_picker_lines(frame.area().width as usize);
             let slash_picker_height = slash_picker_lines.len() as u16;
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1),
+                    Constraint::Length(shortcuts_overlay_height),
                     Constraint::Length(slash_picker_height),
                     Constraint::Length(1),
                     Constraint::Length(1),
@@ -435,15 +449,28 @@ impl LiveAttachTui {
                 chunks[0],
             );
 
-            if slash_picker_height > 0 {
+            if shortcuts_overlay_height > 0 {
                 frame.render_widget(
-                    Paragraph::new(slash_picker_lines).style(self.composer_row_style()),
+                    Paragraph::new(shortcuts_overlay_lines).style(self.composer_row_style()),
                     chunks[1],
                 );
             }
 
-            let input_chunk_index = if slash_picker_height > 0 { 2 } else { 1 };
-            let footer_chunk_index = if slash_picker_height > 0 { 3 } else { 2 };
+            if slash_picker_height > 0 {
+                frame.render_widget(
+                    Paragraph::new(slash_picker_lines).style(self.composer_row_style()),
+                    chunks[2],
+                );
+            }
+
+            let input_chunk_index = if shortcuts_overlay_height > 0 && slash_picker_height > 0 {
+                3
+            } else if shortcuts_overlay_height > 0 || slash_picker_height > 0 {
+                2
+            } else {
+                1
+            };
+            let footer_chunk_index = input_chunk_index + 1;
 
             let input_width = chunks[input_chunk_index].width as usize;
             let (visible_input, cursor_col, offset) = self.input_view(input_width);
@@ -503,7 +530,9 @@ impl LiveAttachTui {
     }
 
     pub(super) fn footer_line_text(&self, width: usize) -> String {
-        let left = if let Some(pending) = &self.pending_prompt {
+        let left = if self.shortcuts_overlay_visible {
+            "  press ? to close shortcuts".to_string()
+        } else if let Some(pending) = &self.pending_prompt {
             let elapsed = pending.submitted_at.elapsed().as_secs_f32();
             format!("  esc to interrupt ({elapsed:.1}s)")
         } else if let Some(status) = &self.status_message {
@@ -583,6 +612,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn slash_picker_move_up(&mut self) {
+        self.shortcuts_overlay_visible = false;
         let len = self.slash_picker_entries().len();
         if len == 0 {
             self.slash_picker_index = 0;
@@ -596,6 +626,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn slash_picker_move_down(&mut self) {
+        self.shortcuts_overlay_visible = false;
         let len = self.slash_picker_entries().len();
         if len == 0 {
             self.slash_picker_index = 0;
@@ -611,6 +642,7 @@ impl LiveAttachTui {
     }
 
     pub(super) fn apply_selected_slash_entry(&mut self) -> bool {
+        self.shortcuts_overlay_visible = false;
         let Some(selected) = self.selected_slash_entry() else {
             return false;
         };
@@ -673,6 +705,9 @@ impl LiveAttachTui {
     }
 
     pub(super) fn live_input_hint(&self) -> Option<String> {
+        if self.shortcuts_overlay_visible {
+            return Some("  shortcuts overlay".to_string());
+        }
         if let Some(selected) = self.selected_slash_entry() {
             return Some(format!(
                 "  {} \u{2022} {}",
@@ -687,6 +722,40 @@ impl LiveAttachTui {
             Some('/') => Some("  / command mode".to_string()),
             _ => None,
         }
+    }
+
+    pub(super) fn toggle_shortcuts_overlay(&mut self) {
+        self.shortcuts_overlay_visible = !self.shortcuts_overlay_visible;
+    }
+
+    pub(super) fn hide_shortcuts_overlay(&mut self) {
+        self.shortcuts_overlay_visible = false;
+    }
+
+    fn shortcuts_overlay_lines(&self) -> Vec<Line<'static>> {
+        if !self.shortcuts_overlay_visible {
+            return Vec::new();
+        }
+
+        let mut first = Line::default();
+        first.push_span(Span::from(key_hint::plain(KeyCode::Char('?'))));
+        first.push_span(" help  ");
+        first.push_span(Span::from(key_hint::plain(KeyCode::Enter)));
+        first.push_span(" send  ");
+        first.push_span(Span::from(key_hint::shift(KeyCode::Enter)));
+        first.push_span(" newline");
+
+        let mut second = Line::default();
+        second.push_span(Span::from(key_hint::ctrl(KeyCode::Char('c'))));
+        second.push_span(" detach  ");
+        second.push_span(Span::from(key_hint::plain(KeyCode::Up)));
+        second.push_span("/");
+        second.push_span(Span::from(key_hint::plain(KeyCode::Down)));
+        second.push_span(" history  ");
+        second.push_span(Span::from(key_hint::plain(KeyCode::Tab)));
+        second.push_span(" apply slash command");
+
+        vec![first, second]
     }
 }
 
