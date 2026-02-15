@@ -1,0 +1,25 @@
+[package]
+name = "crabbot_tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "crabbot_tui"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+crabbot_protocol = { path = "../crates/protocol" }
+crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
+ratatui = "0.29"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde.workspace = true
+serde_json = { workspace = true, features = ["preserve_order"] }
+supports-color = "3"
+unicode-segmentation = "1"
+unicode-width = "0.2"
+
+[dev-dependencies]
+pretty_assertions = "1"
+tempfile = "3"

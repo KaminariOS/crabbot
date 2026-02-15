@@ -1,7 +1,7 @@
-use crate::color::blend;
-use crate::color::is_light;
-use crate::terminal_palette::best_color;
-use crate::terminal_palette::default_bg;
+use super::color::blend;
+use super::color::is_light;
+use super::terminal_palette::best_color;
+use super::terminal_palette::default_bg;
 use ratatui::style::Color;
 use ratatui::style::Style;
 

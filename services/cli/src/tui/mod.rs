@@ -4,9 +4,15 @@ mod app_event;
 mod app_server_bridge;
 mod bottom_pane;
 mod chatwidget;
+mod color;
 mod fuzzy_match;
 mod key_hint;
 mod live_ui;
+mod mention_codec;
+mod style;
+mod terminal_palette;
+mod text_formatting;
+mod version;
 
 use app_event::AppEvent;
 use app_server_bridge::{
@@ -15,6 +21,8 @@ use app_server_bridge::{
 use bottom_pane::slash_commands::find_visible_slash_command;
 use chatwidget::ChatWidget;
 use live_ui::LiveAttachTui;
+use text_formatting::proper_join;
+use version::CODEX_CLI_VERSION;
 
 pub(crate) fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
@@ -209,11 +217,15 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     match trimmed {
         "/exit" | "/quit" => return Ok(true),
         "/status" => {
+            let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
+            let approvals = if approval_ids.is_empty() {
+                "none".to_string()
+            } else {
+                proper_join(&approval_ids)
+            };
             ui.status_message = Some(format!(
-                "thread={} approvals={} seq={}",
-                ui.session_id,
-                ui.pending_approvals.len(),
-                ui.last_sequence
+                "thread={} approvals={} seq={} v={}",
+                ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
             ));
             return Ok(false);
         }

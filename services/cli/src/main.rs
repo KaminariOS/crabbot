@@ -37,8 +37,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-mod tui;
-
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
 const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
@@ -200,6 +198,47 @@ impl CommandOutput {
     }
 }
 
+fn convert_state_to_tui(state: &CliState) -> Result<crabbot_tui::CliState> {
+    let value = serde_json::to_value(state).context("serialize cli state for tui crate")?;
+    serde_json::from_value(value).context("deserialize cli state into tui crate state")
+}
+
+fn convert_state_from_tui(state: crabbot_tui::CliState) -> Result<CliState> {
+    let value = serde_json::to_value(state).context("serialize tui crate state for cli")?;
+    serde_json::from_value(value).context("deserialize tui crate state into cli state")
+}
+
+fn convert_output_from_tui(output: crabbot_tui::CommandOutput) -> CommandOutput {
+    match output {
+        crabbot_tui::CommandOutput::Json(value) => CommandOutput::Json(value),
+        crabbot_tui::CommandOutput::Text(value) => CommandOutput::Text(value),
+    }
+}
+
+fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+    let mut tui_state = convert_state_to_tui(state)?;
+    let output = crabbot_tui::handle_tui(
+        crabbot_tui::TuiArgs {
+            thread_id: args.thread_id,
+        },
+        &mut tui_state,
+    )?;
+    *state = convert_state_from_tui(tui_state)?;
+    Ok(convert_output_from_tui(output))
+}
+
+fn handle_attach_tui_interactive_with_crate(
+    session_id: String,
+    initial_events: Vec<DaemonStreamEnvelope>,
+    state: &mut CliState,
+) -> Result<CommandOutput> {
+    let mut tui_state = convert_state_to_tui(state)?;
+    let output =
+        crabbot_tui::handle_attach_tui_interactive(session_id, initial_events, &mut tui_state)?;
+    *state = convert_state_from_tui(tui_state)?;
+    Ok(convert_output_from_tui(output))
+}
+
 fn main() {
     if let Err(error) = run(Cli::parse()) {
         eprintln!("error: {error:#}");
@@ -247,7 +286,7 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
         }
         Some(CodexSubcommand::Tui(args)) => {
             should_persist = true;
-            tui::handle_tui(args, &mut state)
+            handle_tui_with_crate(args, &mut state)
         }
         Some(CodexSubcommand::Attach(args)) => {
             should_persist = true;
@@ -290,7 +329,7 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
             state,
         );
     }
-    tui::handle_tui(
+    handle_tui_with_crate(
         TuiArgs {
             thread_id: state.last_thread_id.clone(),
         },
@@ -528,7 +567,7 @@ fn handle_attach(args: AttachArgs, state: &mut CliState) -> Result<CommandOutput
 
     if args.tui {
         if is_interactive_tui {
-            return tui::handle_attach_tui_interactive(session_id, stream_events, state);
+            return handle_attach_tui_interactive_with_crate(session_id, stream_events, state);
         }
         return Ok(CommandOutput::Text(render_attach_tui(
             &session_id,

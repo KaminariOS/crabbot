@@ -8,6 +8,7 @@ license.workspace = true
 anyhow.workspace = true
 clap = { version = "4.5", features = ["derive"] }
 crabbot_protocol = { path = "../../crates/protocol" }
+crabbot_tui = { path = "../../tui" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
