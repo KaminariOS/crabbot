@@ -41,6 +41,39 @@ const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
 const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const TUI_COMPOSER_PROMPT: &str = "\u{203a} ";
 const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
+const TUI_SLASH_PICKER_MAX_ROWS: usize = 4;
+
+struct TuiSlashCommand {
+    command: &'static str,
+    description: &'static str,
+}
+
+const TUI_SLASH_COMMANDS: &[TuiSlashCommand] = &[
+    TuiSlashCommand {
+        command: "/status",
+        description: "check current session state",
+    },
+    TuiSlashCommand {
+        command: "/refresh",
+        description: "poll latest stream updates",
+    },
+    TuiSlashCommand {
+        command: "/interrupt",
+        description: "interrupt active session",
+    },
+    TuiSlashCommand {
+        command: "/resume",
+        description: "resume interrupted session",
+    },
+    TuiSlashCommand {
+        command: "/exit",
+        description: "detach from attach tui",
+    },
+    TuiSlashCommand {
+        command: "/quit",
+        description: "detach from attach tui",
+    },
+];
 
 #[derive(Debug, Parser)]
 #[command(name = "crabbot", about = "Crabbot Linux CLI")]
@@ -571,6 +604,7 @@ struct LiveAttachTui {
     status_message: Option<String>,
     active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
+    slash_picker_index: usize,
 }
 
 impl LiveAttachTui {
@@ -589,6 +623,7 @@ impl LiveAttachTui {
             status_message: None,
             active_turn_id: None,
             pending_prompt: None,
+            slash_picker_index: 0,
         }
     }
 
@@ -692,20 +727,24 @@ impl LiveAttachTui {
         if self.input_cursor == self.input.len() {
             self.input.push_str(text);
             self.input_cursor = self.input.len();
+            self.sync_slash_picker();
             return;
         }
         self.input.insert_str(self.input_cursor, text);
         self.input_cursor += text.len();
+        self.sync_slash_picker();
     }
 
     fn input_insert_char(&mut self, ch: char) {
         if self.input_cursor == self.input.len() {
             self.input.push(ch);
             self.input_cursor = self.input.len();
+            self.sync_slash_picker();
             return;
         }
         self.input.insert(self.input_cursor, ch);
         self.input_cursor += ch.len_utf8();
+        self.sync_slash_picker();
     }
 
     fn input_backspace(&mut self) {
@@ -715,6 +754,7 @@ impl LiveAttachTui {
         let previous = previous_char_boundary(&self.input, self.input_cursor);
         self.input.drain(previous..self.input_cursor);
         self.input_cursor = previous;
+        self.sync_slash_picker();
     }
 
     fn input_delete(&mut self) {
@@ -723,6 +763,7 @@ impl LiveAttachTui {
         }
         let next = next_char_boundary(&self.input, self.input_cursor);
         self.input.drain(self.input_cursor..next);
+        self.sync_slash_picker();
     }
 
     fn move_input_cursor_left(&mut self) {
@@ -744,17 +785,21 @@ impl LiveAttachTui {
     fn clear_input(&mut self) {
         self.input.clear();
         self.input_cursor = 0;
+        self.sync_slash_picker();
     }
 
     fn replace_input(&mut self, text: String) {
         self.input = text;
         self.input_cursor = self.input.len();
+        self.sync_slash_picker();
     }
 
     fn take_input(&mut self) -> String {
         self.history_index = None;
         self.input_cursor = 0;
-        std::mem::take(&mut self.input)
+        let taken = std::mem::take(&mut self.input);
+        self.sync_slash_picker();
+        taken
     }
 
     fn remember_history_entry(&mut self, text: &str) {
@@ -844,13 +889,13 @@ impl LiveAttachTui {
         None
     }
 
-    fn input_view(&self, width: usize) -> (String, usize) {
+    fn input_view(&self, width: usize) -> (String, usize, usize) {
         let prompt_width = TUI_COMPOSER_PROMPT.chars().count();
         if width == 0 {
-            return (String::new(), 0);
+            return (String::new(), 0, 0);
         }
         if width <= prompt_width {
-            return (String::new(), width - 1);
+            return (String::new(), width - 1, 0);
         }
 
         let input_width = width - prompt_width;
@@ -862,15 +907,18 @@ impl LiveAttachTui {
         };
         let visible = self.input.chars().skip(offset).take(input_width).collect();
         let cursor_col = (prompt_width + cursor_chars.saturating_sub(offset)).min(width - 1);
-        (visible, cursor_col)
+        (visible, cursor_col, offset)
     }
 
     fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
+            let slash_picker_lines = self.slash_picker_lines(frame.area().width as usize);
+            let slash_picker_height = slash_picker_lines.len() as u16;
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1),
+                    Constraint::Length(slash_picker_height),
                     Constraint::Length(1),
                     Constraint::Length(1),
                 ])
@@ -886,35 +934,71 @@ impl LiveAttachTui {
                 chunks[0],
             );
 
-            let input_width = chunks[1].width as usize;
-            let (visible_input, cursor_col) = self.input_view(input_width);
-            let input_line: Line<'static> = if visible_input.is_empty() {
-                let placeholder_width =
-                    input_width.saturating_sub(TUI_COMPOSER_PROMPT.chars().count());
-                let placeholder = truncate_for_width(TUI_COMPOSER_PLACEHOLDER, placeholder_width);
-                Line::from(vec![
-                    Span::raw(TUI_COMPOSER_PROMPT.to_string()),
-                    Span::raw(placeholder).dim(),
-                ])
-            } else {
-                Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
-            };
+            if slash_picker_height > 0 {
+                frame.render_widget(
+                    Paragraph::new(slash_picker_lines).style(self.composer_row_style()),
+                    chunks[1],
+                );
+            }
+
+            let input_chunk_index = if slash_picker_height > 0 { 2 } else { 1 };
+            let footer_chunk_index = if slash_picker_height > 0 { 3 } else { 2 };
+
+            let input_width = chunks[input_chunk_index].width as usize;
+            let (visible_input, cursor_col, offset) = self.input_view(input_width);
+            let input_line = self.input_line(visible_input, offset, input_width);
             frame.render_widget(
                 Paragraph::new(input_line).style(self.composer_row_style()),
-                chunks[1],
+                chunks[input_chunk_index],
             );
 
             frame.render_widget(
-                Paragraph::new(Line::from(self.footer_line_text(chunks[2].width as usize)).dim()),
-                chunks[2],
+                Paragraph::new(
+                    Line::from(self.footer_line_text(chunks[footer_chunk_index].width as usize))
+                        .dim(),
+                ),
+                chunks[footer_chunk_index],
             );
 
-            let cursor_x = chunks[1]
+            let cursor_x = chunks[input_chunk_index]
                 .x
                 .saturating_add(cursor_col.try_into().unwrap_or(u16::MAX));
-            frame.set_cursor_position((cursor_x, chunks[1].y));
+            frame.set_cursor_position((cursor_x, chunks[input_chunk_index].y));
         })?;
         Ok(())
+    }
+
+    fn input_line(
+        &self,
+        visible_input: String,
+        offset: usize,
+        input_width: usize,
+    ) -> Line<'static> {
+        if visible_input.is_empty() {
+            let placeholder_width = input_width.saturating_sub(TUI_COMPOSER_PROMPT.chars().count());
+            let placeholder = truncate_for_width(TUI_COMPOSER_PLACEHOLDER, placeholder_width);
+            return Line::from(vec![
+                Span::raw(TUI_COMPOSER_PROMPT.to_string()),
+                Span::raw(placeholder).dim(),
+            ]);
+        }
+
+        if offset == 0 {
+            let mut chars = visible_input.chars();
+            if let Some(first) = chars.next() {
+                let first_len = first.len_utf8();
+                let rest = visible_input[first_len..].to_string();
+                if let Some(style) = self.special_token_style(first) {
+                    return Line::from(vec![
+                        Span::raw(TUI_COMPOSER_PROMPT.to_string()),
+                        Span::raw(first.to_string()).style(style),
+                        Span::raw(rest),
+                    ]);
+                }
+            }
+        }
+
+        Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
     }
 
     fn footer_line_text(&self, width: usize) -> String {
@@ -923,6 +1007,8 @@ impl LiveAttachTui {
             format!("  esc to interrupt ({elapsed:.1}s)")
         } else if let Some(status) = &self.status_message {
             format!("  {}", status.trim())
+        } else if let Some(left_hint) = self.live_input_hint() {
+            left_hint
         } else if self.latest_state == "interrupted" {
             "  interrupted \u{2022} /resume to continue".to_string()
         } else {
@@ -951,6 +1037,151 @@ impl LiveAttachTui {
             Style::default().bg(Color::Rgb(38, 42, 46))
         } else {
             Style::default().bg(Color::DarkGray)
+        }
+    }
+
+    fn special_token_style(&self, token: char) -> Option<Style> {
+        let style = match token {
+            '!' => Style::default().fg(Color::Yellow).bold(),
+            '@' => Style::default().fg(Color::Cyan).bold(),
+            '$' => Style::default().fg(Color::Magenta).bold(),
+            '/' => Style::default().fg(Color::Green).bold(),
+            _ => return None,
+        };
+        Some(style)
+    }
+
+    fn slash_picker_query(&self) -> Option<String> {
+        let trimmed = self.input.trim_start();
+        if !trimmed.starts_with('/') || trimmed.chars().any(char::is_whitespace) {
+            return None;
+        }
+        Some(trimmed.trim_start_matches('/').to_ascii_lowercase())
+    }
+
+    fn slash_picker_entries(&self) -> Vec<&'static TuiSlashCommand> {
+        let Some(query) = self.slash_picker_query() else {
+            return Vec::new();
+        };
+
+        TUI_SLASH_COMMANDS
+            .iter()
+            .filter(|entry| {
+                entry
+                    .command
+                    .trim_start_matches('/')
+                    .to_ascii_lowercase()
+                    .starts_with(&query)
+            })
+            .collect()
+    }
+
+    fn slash_picker_is_active(&self) -> bool {
+        !self.slash_picker_entries().is_empty()
+    }
+
+    fn sync_slash_picker(&mut self) {
+        let len = self.slash_picker_entries().len();
+        if len == 0 {
+            self.slash_picker_index = 0;
+        } else if self.slash_picker_index >= len {
+            self.slash_picker_index = len - 1;
+        }
+    }
+
+    fn slash_picker_move_up(&mut self) {
+        let len = self.slash_picker_entries().len();
+        if len == 0 {
+            self.slash_picker_index = 0;
+            return;
+        }
+        if self.slash_picker_index == 0 {
+            self.slash_picker_index = len - 1;
+        } else {
+            self.slash_picker_index = self.slash_picker_index.saturating_sub(1);
+        }
+    }
+
+    fn slash_picker_move_down(&mut self) {
+        let len = self.slash_picker_entries().len();
+        if len == 0 {
+            self.slash_picker_index = 0;
+            return;
+        }
+        self.slash_picker_index = (self.slash_picker_index + 1) % len;
+    }
+
+    fn selected_slash_entry(&self) -> Option<&'static TuiSlashCommand> {
+        let entries = self.slash_picker_entries();
+        let selected = self.slash_picker_index.min(entries.len().saturating_sub(1));
+        entries.get(selected).copied()
+    }
+
+    fn apply_selected_slash_entry(&mut self) -> bool {
+        let Some(selected) = self.selected_slash_entry() else {
+            return false;
+        };
+        self.replace_input(selected.command.to_string());
+        true
+    }
+
+    fn should_apply_slash_picker_on_enter(&self) -> bool {
+        if !self.slash_picker_is_active() {
+            return false;
+        }
+        let Some(selected) = self.selected_slash_entry() else {
+            return false;
+        };
+        self.input.trim() != selected.command
+    }
+
+    fn slash_picker_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let entries = self.slash_picker_entries();
+        if entries.is_empty() || width == 0 {
+            return Vec::new();
+        }
+
+        let selected = self.slash_picker_index.min(entries.len().saturating_sub(1));
+        let total = entries.len();
+        let visible = total.min(TUI_SLASH_PICKER_MAX_ROWS);
+        let start = selected.saturating_sub(visible.saturating_sub(1));
+        let end = (start + visible).min(total);
+
+        let command_budget = width.saturating_sub(12).max(8);
+        let mut lines = Vec::with_capacity(end.saturating_sub(start));
+        for (index, entry) in entries[start..end].iter().enumerate() {
+            let absolute = start + index;
+            let is_selected = absolute == selected;
+            let prefix = if is_selected { "› " } else { "  " };
+            let command = truncate_for_width(entry.command, command_budget);
+            let description = truncate_for_width(entry.description, width.saturating_sub(6));
+
+            let mut line = Line::from(vec![
+                Span::raw(prefix),
+                Span::raw(format!("{command:<12}")),
+                Span::raw(description).dim(),
+            ]);
+            if is_selected {
+                line = line.style(Style::default().fg(Color::Green));
+            }
+            lines.push(line);
+        }
+        lines
+    }
+
+    fn live_input_hint(&self) -> Option<String> {
+        if let Some(selected) = self.selected_slash_entry() {
+            return Some(format!(
+                "  {} \u{2022} {}",
+                selected.command, selected.description
+            ));
+        }
+        match self.input.trim_start().chars().next() {
+            Some('!') => Some("  ! shell command mode".to_string()),
+            Some('@') => Some("  @ file mention mode".to_string()),
+            Some('$') => Some("  $ variable/prompt mode".to_string()),
+            Some('/') => Some("  / command mode".to_string()),
+            _ => None,
         }
     }
 }
@@ -1072,13 +1303,29 @@ fn handle_live_tui_key_event(
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
             ui.clear_input();
         }
-        KeyCode::Up => ui.history_prev(),
-        KeyCode::Down => ui.history_next(),
+        KeyCode::Up => {
+            if ui.slash_picker_is_active() {
+                ui.slash_picker_move_up();
+            } else {
+                ui.history_prev();
+            }
+        }
+        KeyCode::Down => {
+            if ui.slash_picker_is_active() {
+                ui.slash_picker_move_down();
+            } else {
+                ui.history_next();
+            }
+        }
         KeyCode::Left => ui.move_input_cursor_left(),
         KeyCode::Right => ui.move_input_cursor_right(),
         KeyCode::Home => ui.move_input_cursor_home(),
         KeyCode::End => ui.move_input_cursor_end(),
         KeyCode::Enter => {
+            if ui.should_apply_slash_picker_on_enter() {
+                let _ = ui.apply_selected_slash_entry();
+                return Ok(LiveTuiAction::Continue);
+            }
             let input = ui.take_input();
             return handle_live_tui_submit(state, ui, input);
         }
@@ -1088,7 +1335,13 @@ fn handle_live_tui_key_event(
         KeyCode::Delete => {
             ui.input_delete();
         }
-        KeyCode::Tab => ui.input_insert_char('\t'),
+        KeyCode::Tab => {
+            if ui.slash_picker_is_active() {
+                let _ = ui.apply_selected_slash_entry();
+            } else {
+                ui.input_insert_char('\t');
+            }
+        }
         KeyCode::Char(ch) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL)
                 && !key.modifiers.contains(KeyModifiers::ALT)
@@ -2962,5 +3215,62 @@ mod tests {
 
         ui.history_next();
         assert_eq!(ui.input, "");
+    }
+
+    #[test]
+    fn live_tui_slash_picker_opens_and_filters_commands() {
+        let mut ui = LiveAttachTui::new("sess_picker".to_string(), "active".to_string());
+        ui.input_insert_char('/');
+        assert!(ui.slash_picker_is_active());
+        assert_eq!(
+            ui.selected_slash_entry().map(|entry| entry.command),
+            Some("/status")
+        );
+
+        ui.input_insert_str("re");
+        let filtered = ui
+            .slash_picker_entries()
+            .iter()
+            .map(|entry| entry.command)
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, vec!["/refresh", "/resume"]);
+    }
+
+    #[test]
+    fn live_tui_slash_picker_selection_applies_command() {
+        let mut ui = LiveAttachTui::new("sess_picker_select".to_string(), "active".to_string());
+        ui.input_insert_char('/');
+        ui.slash_picker_move_down();
+        assert_eq!(
+            ui.selected_slash_entry().map(|entry| entry.command),
+            Some("/refresh")
+        );
+        assert!(ui.should_apply_slash_picker_on_enter());
+        assert!(ui.apply_selected_slash_entry());
+        assert_eq!(ui.input, "/refresh");
+        assert!(!ui.should_apply_slash_picker_on_enter());
+    }
+
+    #[test]
+    fn live_tui_special_token_hints_match_native_modes() {
+        let mut ui = LiveAttachTui::new("sess_tokens".to_string(), "active".to_string());
+
+        ui.replace_input("!ls -la".to_string());
+        assert_eq!(
+            ui.live_input_hint().as_deref(),
+            Some("  ! shell command mode")
+        );
+
+        ui.replace_input("@src/main.rs".to_string());
+        assert_eq!(
+            ui.live_input_hint().as_deref(),
+            Some("  @ file mention mode")
+        );
+
+        ui.replace_input("$VAR".to_string());
+        assert_eq!(
+            ui.live_input_hint().as_deref(),
+            Some("  $ variable/prompt mode")
+        );
     }
 }
