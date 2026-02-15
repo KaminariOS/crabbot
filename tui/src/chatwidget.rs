@@ -1,5 +1,11 @@
-use super::bottom_pane::slash_commands::{TuiSlashCommand, filtered_slash_commands};
+use super::app::UiApprovalRequest;
+use super::app::UiEvent;
+use super::app::map_daemon_stream_events;
+use super::app::map_rpc_stream_events;
+use super::slash_commands::builtins_for_input;
 use super::{key_hint, mention_codec, style, text_formatting, *};
+use crate::slash_command::SlashCommand;
+use codex_utils_fuzzy_match::fuzzy_match;
 
 pub(super) struct InFlightPrompt {
     pub(super) prompt: String,
@@ -21,7 +27,7 @@ pub(super) struct LiveAttachTui {
     pub(super) status_message: Option<String>,
     pub(super) active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
-    pub(super) pending_approvals: BTreeMap<String, DaemonRpcServerRequest>,
+    pub(super) pending_approvals: BTreeMap<String, UiApprovalRequest>,
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
 }
@@ -49,179 +55,81 @@ impl LiveAttachTui {
     }
 
     pub(super) fn apply_stream_events(&mut self, stream_events: &[DaemonStreamEnvelope]) {
-        for envelope in stream_events {
-            self.received_events += 1;
-            self.last_sequence = envelope.sequence;
-            match &envelope.event {
-                DaemonStreamEvent::SessionState(payload) => {
-                    if self.previous_state.as_deref() != Some(payload.state.as_str()) {
-                        if payload.state == "interrupted" {
-                            self.push_line(&format!(
-                                "[session interrupted] resume with: crabbot codex resume --session-id {}",
-                                self.session_id
-                            ));
-                        } else if self.previous_state.as_deref() == Some("interrupted")
-                            && payload.state == "active"
-                        {
-                            self.push_line("[session resumed] stream is active again");
-                        }
-                    }
-                    self.latest_state = payload.state.clone();
-                    self.previous_state = Some(payload.state.clone());
-                }
-                DaemonStreamEvent::TurnStreamDelta(payload) => {
-                    let is_new_turn =
-                        self.active_turn_id.as_deref() != Some(payload.turn_id.as_str());
-                    if is_new_turn {
-                        self.active_turn_id = Some(payload.turn_id.clone());
-                    }
-                    let delta = if is_new_turn {
-                        payload
-                            .delta
-                            .strip_prefix("Assistant: ")
-                            .unwrap_or(&payload.delta)
-                    } else {
-                        &payload.delta
-                    };
-                    self.append_assistant_delta(delta);
-                }
-                DaemonStreamEvent::TurnCompleted(payload) => {
-                    self.active_turn_id = None;
-                    if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
-                        self.transcript.push('\n');
-                    }
-                    let _ = payload;
-                    self.status_message = None;
-                }
-                DaemonStreamEvent::ApprovalRequired(payload) => {
-                    self.push_line(&format!(
-                        "[approval required] id={} action={}",
-                        payload.approval_id, payload.action_kind
-                    ));
-                    self.push_line(&format!("prompt: {}", payload.prompt));
-                    self.push_line(&format!(
-                        "after approval, resume with: crabbot codex resume --session-id {}",
-                        self.session_id
-                    ));
-                }
-                DaemonStreamEvent::Heartbeat(_) => {}
-            }
+        if let Some(last) = stream_events.last() {
+            self.last_sequence = last.sequence;
         }
+        self.received_events += stream_events.len();
+        self.apply_ui_events(map_daemon_stream_events(stream_events));
     }
 
     pub(super) fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
-        for envelope in stream_events {
-            self.received_events += 1;
-            self.last_sequence = envelope.sequence;
-            match &envelope.event {
-                DaemonRpcStreamEvent::Notification(notification) => {
-                    self.apply_rpc_notification(notification);
-                }
-                DaemonRpcStreamEvent::ServerRequest(request) => {
-                    let key = request_id_key_for_cli(&request.request_id);
-                    self.pending_approvals.insert(key.clone(), request.clone());
-                    self.push_line(&format!(
-                        "[approval required] request_id={key} method={}",
-                        request.method
-                    ));
-                    if let Some(reason) = request.params.get("reason").and_then(Value::as_str) {
-                        self.push_line(&format!("reason: {reason}"));
-                    }
-                }
-                DaemonRpcStreamEvent::DecodeError(error) => {
-                    self.push_line(&format!("[daemon rpc decode error] {}", error.message));
-                }
-            }
+        if let Some(last) = stream_events.last() {
+            self.last_sequence = last.sequence;
+        }
+        self.received_events += stream_events.len();
+        self.apply_ui_events(map_rpc_stream_events(stream_events));
+    }
+
+    fn apply_ui_events(&mut self, events: Vec<UiEvent>) {
+        for event in events {
+            self.apply_ui_event(event);
         }
     }
 
-    pub(super) fn apply_rpc_notification(&mut self, notification: &DaemonRpcNotification) {
-        match notification.method.as_str() {
-            "thread/started" => {
-                if let Some(thread_id) = notification
-                    .params
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    self.session_id = thread_id.to_string();
-                    self.push_line(&format!("[thread started] {thread_id}"));
+    fn apply_ui_event(&mut self, event: UiEvent) {
+        match event {
+            UiEvent::SessionState(state) => {
+                if self.previous_state.as_deref() != Some(state.as_str()) {
+                    if state == "interrupted" {
+                        self.push_line(&format!(
+                            "[session interrupted] resume with: crabbot codex resume --session-id {}",
+                            self.session_id
+                        ));
+                    } else if self.previous_state.as_deref() == Some("interrupted")
+                        && state == "active"
+                    {
+                        self.push_line("[session resumed] stream is active again");
+                    }
                 }
+                self.latest_state = state.clone();
+                self.previous_state = Some(state);
             }
-            "turn/started" => {
-                if let Some(turn_id) = notification
-                    .params
-                    .get("turn")
-                    .and_then(|turn| turn.get("id"))
-                    .and_then(Value::as_str)
-                {
-                    self.active_turn_id = Some(turn_id.to_string());
-                    self.status_message = Some("running turn...".to_string());
-                }
+            UiEvent::ThreadStarted(thread_id) => {
+                self.session_id = thread_id.clone();
+                self.push_line(&format!("[thread started] {thread_id}"));
             }
-            "thread/name/updated" => {
-                if let Some(name) = notification
-                    .params
-                    .get("thread")
-                    .and_then(|thread| thread.get("name"))
-                    .and_then(Value::as_str)
-                {
-                    self.push_line(&format!("[thread renamed] {name}"));
-                }
+            UiEvent::ThreadRenamed(name) => {
+                self.push_line(&format!("[thread renamed] {name}"));
             }
-            "item/agentMessage/delta" => {
-                if let Some(delta) = delta_from_params(&notification.params) {
-                    self.append_assistant_delta(delta);
-                }
+            UiEvent::TurnStarted(turn_id) => {
+                self.active_turn_id = Some(turn_id);
+                self.status_message = Some("running turn...".to_string());
             }
-            "item/plan/delta" => {
-                if let Some(delta) = delta_from_params(&notification.params) {
-                    self.append_assistant_delta(delta);
-                }
+            UiEvent::AssistantDelta { turn_id, delta } => {
+                let is_new_turn = if let Some(turn_id) = turn_id {
+                    let is_new = self.active_turn_id.as_deref() != Some(turn_id.as_str());
+                    if is_new {
+                        self.active_turn_id = Some(turn_id);
+                    }
+                    is_new
+                } else {
+                    false
+                };
+                let delta = if is_new_turn {
+                    delta.strip_prefix("Assistant: ").unwrap_or(&delta)
+                } else {
+                    &delta
+                };
+                self.append_assistant_delta(delta);
             }
-            "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-                if delta_from_params(&notification.params).is_some() {
-                    self.status_message = Some("reasoning...".to_string());
-                }
-            }
-            "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
-                if let Some(delta) = delta_from_params(&notification.params) {
-                    self.push_line(delta);
-                }
-            }
-            "item/commandExecution/terminalInteraction" => {
-                if let Some(prompt) = notification.params.get("prompt").and_then(Value::as_str) {
-                    self.push_line(&format!("[terminal interaction] {prompt}"));
-                }
-            }
-            "item/completed" => {
-                if let Some(item_type) = notification
-                    .params
-                    .get("item")
-                    .and_then(|item| item.get("type"))
-                    .and_then(Value::as_str)
-                    && item_type == "agent_message"
-                    && let Some(text) = notification
-                        .params
-                        .get("item")
-                        .and_then(|item| item.get("text"))
-                        .and_then(Value::as_str)
-                {
-                    self.append_assistant_delta(text);
-                }
-            }
-            "turn/completed" => {
+            UiEvent::TurnCompleted { status } => {
                 self.active_turn_id = None;
-                if let Some(status) = notification
-                    .params
-                    .get("turn")
-                    .and_then(|turn| turn.get("status"))
-                    .and_then(Value::as_str)
+                if let Some(status) = status
                     && status != "completed"
                 {
                     self.status_message = Some(format!(
                         "turn {}",
-                        text_formatting::capitalize_first(status)
+                        text_formatting::capitalize_first(&status)
                     ));
                 } else {
                     self.status_message = None;
@@ -230,13 +138,23 @@ impl LiveAttachTui {
                     self.transcript.push('\n');
                 }
             }
-            "turn/diff/updated" => {
-                self.status_message = Some("diff updated".to_string());
+            UiEvent::TranscriptLine(line) => {
+                self.push_line(&line);
             }
-            "thread/tokenUsage/updated" => {
-                self.status_message = Some("token usage updated".to_string());
+            UiEvent::StatusMessage(message) => {
+                self.status_message = Some(message);
             }
-            _ => {}
+            UiEvent::ApprovalRequired(request) => {
+                let key = request.key.clone();
+                self.pending_approvals.insert(key.clone(), request.clone());
+                self.push_line(&format!(
+                    "[approval required] request_id={key} method={}",
+                    request.method
+                ));
+                if let Some(reason) = &request.reason {
+                    self.push_line(&format!("reason: {reason}"));
+                }
+            }
         }
     }
 
@@ -646,11 +564,19 @@ impl LiveAttachTui {
         Some(token.split_whitespace().next().unwrap_or("").to_string())
     }
 
-    pub(super) fn slash_picker_entries(&self) -> Vec<&'static TuiSlashCommand> {
+    pub(super) fn slash_picker_entries(&self) -> Vec<(&'static str, SlashCommand)> {
         let Some(query) = self.slash_picker_query() else {
             return Vec::new();
         };
-        filtered_slash_commands(&query)
+        builtins_for_input(
+            true, // collaboration_modes_enabled
+            true, // connectors_enabled
+            true, // personality_command_enabled
+            true, // allow_elevate_sandbox
+        )
+        .into_iter()
+        .filter(|(command_name, _)| fuzzy_match(command_name, &query).is_some())
+        .collect()
     }
 
     pub(super) fn slash_picker_is_active(&self) -> bool {
@@ -690,7 +616,7 @@ impl LiveAttachTui {
         self.slash_picker_index = (self.slash_picker_index + 1) % len;
     }
 
-    pub(super) fn selected_slash_entry(&self) -> Option<&'static TuiSlashCommand> {
+    pub(super) fn selected_slash_entry(&self) -> Option<(&'static str, SlashCommand)> {
         let entries = self.slash_picker_entries();
         let selected = self.slash_picker_index.min(entries.len().saturating_sub(1));
         entries.get(selected).copied()
@@ -701,7 +627,7 @@ impl LiveAttachTui {
         let Some(selected) = self.selected_slash_entry() else {
             return false;
         };
-        self.replace_input(format!("/{}", selected.command));
+        self.replace_input(format!("/{}", selected.0));
         true
     }
 
@@ -712,7 +638,7 @@ impl LiveAttachTui {
         let Some(selected) = self.selected_slash_entry() else {
             return false;
         };
-        self.input.trim() != format!("/{}", selected.command)
+        self.input.trim() != format!("/{}", selected.0)
     }
 
     pub(super) fn slash_picker_lines(&self, width: usize) -> Vec<Line<'static>> {
@@ -729,7 +655,7 @@ impl LiveAttachTui {
 
         let command_col_width = entries[start..end]
             .iter()
-            .map(|entry| entry.command.len() + 1)
+            .map(|entry| entry.0.len() + 1)
             .max()
             .unwrap_or(12)
             .clamp(12, 30);
@@ -739,10 +665,10 @@ impl LiveAttachTui {
             let absolute = start + index;
             let is_selected = absolute == selected;
             let prefix = if is_selected { "› " } else { "  " };
-            let command = truncate_for_width(entry.command, command_budget);
+            let command = truncate_for_width(entry.0, command_budget);
             let command_display = format!("/{command}");
             let description = truncate_for_width(
-                entry.description,
+                entry.1.description(),
                 width.saturating_sub(command_col_width + 4),
             );
 
@@ -766,8 +692,8 @@ impl LiveAttachTui {
         if let Some(selected) = self.selected_slash_entry() {
             return Some(format!(
                 "  {} \u{2022} {}",
-                format!("/{}", selected.command),
-                selected.description
+                format!("/{}", selected.0),
+                selected.1.description()
             ));
         }
         match self.input.trim_start().chars().next() {
@@ -837,9 +763,49 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .unwrap_or(0)
 }
 
-fn delta_from_params(params: &Value) -> Option<&str> {
-    params
-        .get("delta")
-        .or_else(|| params.get("outputDelta"))
-        .and_then(Value::as_str)
+use super::AppEvent;
+
+pub(super) struct ChatWidget {
+    ui: LiveAttachTui,
+}
+
+impl ChatWidget {
+    pub(super) fn new(thread_id: String) -> Self {
+        Self {
+            ui: LiveAttachTui::new(thread_id, "active".to_string()),
+        }
+    }
+
+    pub(super) fn ui_mut(&mut self) -> &mut LiveAttachTui {
+        &mut self.ui
+    }
+
+    pub(super) fn session_id(&self) -> &str {
+        &self.ui.session_id
+    }
+
+    pub(super) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+        self.ui.draw(terminal)
+    }
+
+    pub(super) fn poll_stream_updates(&mut self, state: &CliState) -> Result<bool> {
+        poll_app_server_tui_stream_updates(state, &mut self.ui)
+    }
+
+    pub(super) fn on_event(
+        &mut self,
+        event: AppEvent,
+        state: &mut CliState,
+    ) -> Result<LiveTuiAction> {
+        match event {
+            AppEvent::Key(key_event) => {
+                handle_app_server_tui_key_event(key_event, state, &mut self.ui)
+            }
+            AppEvent::Paste(pasted) => {
+                self.ui.input_insert_str(&pasted);
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::Resize | AppEvent::Tick => Ok(LiveTuiAction::Continue),
+        }
+    }
 }

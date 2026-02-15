@@ -1,9 +1,9 @@
 use anyhow::{Context, Result, anyhow, bail};
 use crabbot_protocol::{
     DaemonPromptRequest, DaemonPromptResponse, DaemonRpcNotification, DaemonRpcRequest,
-    DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcServerRequest,
-    DaemonRpcStreamEnvelope, DaemonRpcStreamEvent, DaemonSessionStatusResponse,
-    DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
+    DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcStreamEnvelope,
+    DaemonRpcStreamEvent, DaemonSessionStatusResponse, DaemonStartSessionRequest,
+    DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
 };
 use crossterm::{
     event::{
@@ -34,13 +34,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-
-pub mod tui;
-
-pub(crate) use tui::color;
-pub use tui::handle_attach_tui_interactive;
-pub use tui::handle_tui;
-pub(crate) use tui::terminal_palette;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
@@ -101,6 +94,21 @@ pub enum CommandOutput {
     Text(String),
 }
 
+#[derive(Debug, Default, Clone)]
+struct ConfigSetArgs {
+    api_endpoint: Option<String>,
+    daemon_endpoint: Option<String>,
+    auth_token: Option<String>,
+    clear_auth_token: bool,
+}
+
+mod slash_command;
+pub mod tui;
+
+pub(crate) use tui::color;
+pub use tui::handle_attach_tui_interactive;
+pub use tui::handle_tui;
+pub(crate) use tui::terminal_palette;
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
@@ -154,6 +162,56 @@ fn persist_latest_session_state_from_stream(
         );
     }
     Ok(())
+}
+
+fn handle_config_show(state: &CliState) -> Value {
+    json!({
+        "ok": true,
+        "config": state.config,
+    })
+}
+
+fn handle_config_set(args: ConfigSetArgs, state: &mut CliState) -> Result<Value> {
+    let mut changed = false;
+
+    if let Some(api_endpoint) = args.api_endpoint {
+        if api_endpoint.trim().is_empty() {
+            bail!("api_endpoint cannot be empty");
+        }
+        state.config.api_endpoint = api_endpoint;
+        changed = true;
+    }
+
+    if let Some(daemon_endpoint) = args.daemon_endpoint {
+        if daemon_endpoint.trim().is_empty() {
+            bail!("daemon_endpoint cannot be empty");
+        }
+        state.config.daemon_endpoint = daemon_endpoint;
+        changed = true;
+    }
+
+    if let Some(auth_token) = args.auth_token {
+        if auth_token.trim().is_empty() {
+            bail!("auth_token cannot be empty");
+        }
+        state.config.auth_token = Some(auth_token);
+        changed = true;
+    }
+
+    if args.clear_auth_token {
+        state.config.auth_token = None;
+        changed = true;
+    }
+
+    if !changed {
+        bail!("no config fields were provided");
+    }
+
+    Ok(json!({
+        "ok": true,
+        "action": "config_set",
+        "config": state.config,
+    }))
 }
 
 fn parse_session_status(state: &str) -> Result<SessionStatus> {
@@ -215,6 +273,19 @@ fn apply_auth(
         }
     }
     request
+}
+
+fn fetch_api_health(api_endpoint: &str, auth_token: Option<&str>) -> Result<HealthResponse> {
+    let client = http_client()?;
+    let url = endpoint_url(api_endpoint, "/health");
+    let response = apply_auth(client.get(url), auth_token)
+        .send()
+        .context("request api health")?
+        .error_for_status()
+        .context("api health returned error status")?;
+    response
+        .json::<HealthResponse>()
+        .context("parse api health response")
 }
 
 fn health_http_client() -> Result<Client> {
@@ -552,6 +623,21 @@ enum DaemonStreamFetchResult {
     NotFound,
 }
 
+fn fetch_daemon_stream(
+    daemon_endpoint: &str,
+    session_id: &str,
+    auth_token: Option<&str>,
+    since_sequence: Option<u64>,
+) -> Result<DaemonStreamFetchResult> {
+    fetch_daemon_stream_with_timeout(
+        daemon_endpoint,
+        session_id,
+        auth_token,
+        since_sequence,
+        Duration::from_secs(5),
+    )
+}
+
 fn fetch_daemon_stream_with_timeout(
     daemon_endpoint: &str,
     session_id: &str,
@@ -587,6 +673,135 @@ fn fetch_daemon_stream_with_timeout(
     Ok(DaemonStreamFetchResult::Stream(stream_events))
 }
 
+fn latest_cached_session_id(state: &CliState) -> Option<String> {
+    state
+        .sessions
+        .iter()
+        .max_by_key(|(_, value)| value.updated_at_unix_ms)
+        .map(|(key, _)| key.clone())
+}
+
+fn cached_last_sequence(state: &CliState, session_id: &str) -> Option<u64> {
+    state
+        .sessions
+        .get(session_id)
+        .map(|runtime| runtime.last_sequence)
+}
+
+fn render_attach_tui(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+) -> String {
+    render_attach_tui_with_columns_and_fallback(
+        session_id,
+        stream_events,
+        daemon_endpoint,
+        terminal_columns(),
+        None,
+    )
+}
+
+#[cfg(test)]
+fn render_attach_tui_with_columns(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+    columns: usize,
+) -> String {
+    render_attach_tui_with_columns_and_fallback(
+        session_id,
+        stream_events,
+        daemon_endpoint,
+        columns,
+        None,
+    )
+}
+
+fn render_attach_tui_with_columns_and_fallback(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+    columns: usize,
+    fallback_state: Option<&str>,
+) -> String {
+    let mut output = String::new();
+    let mut latest_state = fallback_state.unwrap_or("unknown").to_string();
+    let mut previous_state: Option<String> = None;
+
+    for envelope in stream_events {
+        match &envelope.event {
+            DaemonStreamEvent::SessionState(payload) => {
+                if previous_state.as_deref() != Some(payload.state.as_str()) {
+                    if payload.state == "interrupted" {
+                        if !output.is_empty() && !output.ends_with('\n') {
+                            output.push('\n');
+                        }
+                        output.push_str(&format!(
+                            "[session interrupted] resume with: crabbot codex resume --session-id {session_id}\n"
+                        ));
+                    }
+
+                    if previous_state.as_deref() == Some("interrupted")
+                        && payload.state.as_str() == "active"
+                    {
+                        output.push_str("[session resumed] stream is active again\n");
+                    }
+                }
+                latest_state = payload.state.clone();
+                previous_state = Some(payload.state.clone());
+            }
+            DaemonStreamEvent::TurnStreamDelta(payload) => output.push_str(&payload.delta),
+            DaemonStreamEvent::TurnCompleted(payload) => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "[turn {} complete] {}\n",
+                    payload.turn_id, payload.output_summary
+                ));
+            }
+            DaemonStreamEvent::ApprovalRequired(payload) => {
+                if !output.is_empty() && !output.ends_with('\n') {
+                    output.push('\n');
+                }
+                output.push_str(&format!(
+                    "[approval required] id={} action={}\n",
+                    payload.approval_id, payload.action_kind
+                ));
+                output.push_str(&format!("prompt: {}\n", payload.prompt));
+                output.push_str(&format!(
+                    "after approval, resume with: crabbot codex resume --session-id {session_id}\n"
+                ));
+            }
+            DaemonStreamEvent::Heartbeat(_) => {}
+        }
+    }
+
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+
+    let last_sequence = stream_events
+        .last()
+        .map(|event| event.sequence)
+        .unwrap_or(0);
+    let footer = build_attach_footer(
+        session_id,
+        &latest_state,
+        stream_events.len(),
+        last_sequence,
+        daemon_endpoint,
+        columns,
+    );
+
+    let separator_width = columns.clamp(24, 80);
+    output.push_str(&"-".repeat(separator_width));
+    output.push('\n');
+    output.push_str(&footer);
+    output
+}
+
 fn cached_session_state_label<'a>(state: &'a CliState, session_id: &str) -> Option<&'a str> {
     state
         .sessions
@@ -597,17 +812,47 @@ fn cached_session_state_label<'a>(state: &'a CliState, session_id: &str) -> Opti
         })
 }
 
+fn terminal_columns() -> usize {
+    env::var("COLUMNS")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .filter(|columns| *columns > 0)
+        .unwrap_or(100)
+}
+
+fn build_attach_footer(
+    session_id: &str,
+    state: &str,
+    received_events: usize,
+    last_sequence: u64,
+    daemon_endpoint: &str,
+    columns: usize,
+) -> String {
+    let full = format!(
+        "session={session_id} state={state} events={received_events} seq={last_sequence} daemon={daemon_endpoint}"
+    );
+    if full.len() <= columns {
+        return full;
+    }
+
+    format!("session={session_id} state={state} events={received_events} seq={last_sequence}")
+}
+
+fn resolve_state_path() -> Result<PathBuf> {
+    if let Some(path) = env::var_os("CRABBOT_CLI_STATE_PATH") {
+        let candidate = PathBuf::from(path);
+        if !candidate.as_os_str().is_empty() {
+            return Ok(candidate);
+        }
+    }
+
+    let home = env::var_os("HOME").ok_or_else(|| anyhow!("HOME is not set"))?;
+    Ok(PathBuf::from(home).join(".crabbot").join("cli-state.json"))
+}
+
 fn now_unix_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
-}
-
-fn error_chain_summary(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(": ")
 }

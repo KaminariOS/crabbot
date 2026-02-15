@@ -1,27 +1,42 @@
 use super::*;
 
-mod app_event;
-mod app_server_bridge;
-mod bottom_pane;
+#[path = "app.rs"]
+mod app;
+#[path = "chatwidget.rs"]
 mod chatwidget;
+#[path = "color.rs"]
 pub(crate) mod color;
+#[path = "key_hint.rs"]
 mod key_hint;
-mod live_ui;
+#[path = "mention_codec.rs"]
 mod mention_codec;
+#[path = "bottom_pane/slash_commands.rs"]
+mod slash_commands;
+#[path = "style.rs"]
 mod style;
+#[path = "terminal_palette.rs"]
 pub(crate) mod terminal_palette;
+#[path = "text_formatting.rs"]
 mod text_formatting;
+#[path = "version.rs"]
 mod version;
 
-use app_event::AppEvent;
-use app_server_bridge::{
+use app::{
     interrupt_turn, respond_to_approval, resume_thread, start_thread, start_turn, stream_events,
 };
-use bottom_pane::slash_commands::find_visible_slash_command;
 use chatwidget::ChatWidget;
-use live_ui::LiveAttachTui;
+use chatwidget::LiveAttachTui;
+use slash_commands::find_builtin_command;
 use text_formatting::proper_join;
 use version::CODEX_CLI_VERSION;
+
+#[derive(Debug)]
+enum AppEvent {
+    Key(crossterm::event::KeyEvent),
+    Paste(String),
+    Resize,
+    Tick,
+}
 
 pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
@@ -121,7 +136,7 @@ fn run_app_server_tui_loop(
     }
 }
 
-pub(in crate::tui) fn handle_app_server_tui_key_event(
+fn handle_app_server_tui_key_event(
     key: crossterm::event::KeyEvent,
     state: &mut CliState,
     ui: &mut LiveAttachTui,
@@ -276,7 +291,7 @@ fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) ->
     if let Some(command) = trimmed
         .strip_prefix('/')
         .and_then(|value| value.split_whitespace().next())
-        && find_visible_slash_command(command).is_some()
+        && find_builtin_command(command, true, true, true, true).is_some()
     {
         ui.status_message = Some(format!(
             "slash command /{command} is not implemented in crabbot app-server tui yet"
@@ -316,10 +331,7 @@ fn handle_app_server_approval_decision(
     Ok(())
 }
 
-pub(in crate::tui) fn poll_app_server_tui_stream_updates(
-    state: &CliState,
-    ui: &mut LiveAttachTui,
-) -> Result<bool> {
+fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
     let events = stream_events(state, ui.last_sequence)?;
     if events.is_empty() {
         return Ok(false);
@@ -442,7 +454,7 @@ fn run_attach_tui_loop(
     Ok(())
 }
 
-pub(in crate::tui) enum LiveTuiAction {
+enum LiveTuiAction {
     Continue,
     Detach,
 }

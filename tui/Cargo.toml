@@ -3,6 +3,7 @@ name = "crabbot_tui"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autobins = false
 
 [lib]
 name = "crabbot_tui"
@@ -10,6 +11,7 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+codex-utils-fuzzy-match = { path = "/home/kosumi/repos/codex/codex-rs/utils/fuzzy-match" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 ratatui = "0.29"
@@ -17,6 +19,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"
+strum = "0.27.2"
+strum_macros = "0.27.2"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
