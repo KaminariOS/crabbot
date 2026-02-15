@@ -1,8 +1,22 @@
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use crabbot_protocol::{
-    DaemonSessionStatusResponse, DaemonStartSessionRequest, DaemonStreamEnvelope,
-    DaemonStreamEvent, HealthResponse,
+    DaemonPromptRequest, DaemonPromptResponse, DaemonSessionStatusResponse,
+    DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
+};
+use crossterm::{
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout},
+    widgets::{Paragraph, Wrap},
 };
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
@@ -10,9 +24,16 @@ use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
     env, fs,
+    io::{self, IsTerminal},
     path::{Path, PathBuf},
-    time::Duration,
+    process::{Command, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
+
+const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
+const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
 
 #[derive(Debug, Parser)]
 #[command(name = "crabbot", about = "Crabbot Linux CLI")]
@@ -29,12 +50,13 @@ enum TopLevelCommand {
 #[derive(Debug, Args)]
 struct CodexCommand {
     #[command(subcommand)]
-    command: CodexSubcommand,
+    command: Option<CodexSubcommand>,
 }
 
 #[derive(Debug, Subcommand)]
 enum CodexSubcommand {
     Start(StartArgs),
+    Prompt(PromptArgs),
     Resume(SessionArgs),
     Interrupt(SessionArgs),
     Status(StatusArgs),
@@ -55,9 +77,17 @@ struct SessionArgs {
 }
 
 #[derive(Debug, Args)]
-struct AttachArgs {
+struct PromptArgs {
     #[arg(long)]
     session_id: String,
+    #[arg(long)]
+    text: String,
+}
+
+#[derive(Debug, Args)]
+struct AttachArgs {
+    #[arg(long)]
+    session_id: Option<String>,
     #[arg(long, default_value_t = false)]
     tui: bool,
 }
@@ -106,6 +136,8 @@ struct SessionRuntimeState {
     state: SessionStatus,
     updated_at_unix_ms: u64,
     last_event: String,
+    #[serde(default)]
+    last_sequence: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -172,33 +204,41 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
     let mut should_persist = false;
 
     let output = match command.command {
-        CodexSubcommand::Start(args) => {
+        Some(CodexSubcommand::Start(args)) => {
             should_persist = true;
             handle_start(args, &mut state).map(CommandOutput::Json)
         }
-        CodexSubcommand::Resume(args) => {
+        Some(CodexSubcommand::Prompt(args)) => {
+            should_persist = true;
+            handle_prompt(args, &mut state).map(CommandOutput::Json)
+        }
+        Some(CodexSubcommand::Resume(args)) => {
             should_persist = true;
             handle_resume(args, &mut state).map(CommandOutput::Json)
         }
-        CodexSubcommand::Interrupt(args) => {
+        Some(CodexSubcommand::Interrupt(args)) => {
             should_persist = true;
             handle_interrupt(args, &mut state).map(CommandOutput::Json)
         }
-        CodexSubcommand::Status(args) => {
+        Some(CodexSubcommand::Status(args)) => {
             should_persist = args.session_id.is_some();
             handle_status(args, &mut state).map(CommandOutput::Json)
         }
-        CodexSubcommand::Attach(args) => {
+        Some(CodexSubcommand::Attach(args)) => {
             should_persist = true;
             handle_attach(args, &mut state)
         }
-        CodexSubcommand::Config(command) => match command.command {
+        Some(CodexSubcommand::Config(command)) => match command.command {
             ConfigSubcommand::Show => Ok(CommandOutput::Json(handle_config_show(&state))),
             ConfigSubcommand::Set(args) => {
                 should_persist = true;
                 handle_config_set(args, &mut state).map(CommandOutput::Json)
             }
         },
+        None => {
+            should_persist = true;
+            handle_codex_default(&mut state)
+        }
     }?;
 
     if should_persist {
@@ -206,6 +246,23 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
     }
 
     output.into_string()
+}
+
+fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
+    ensure_daemon_ready(state)?;
+    let daemon_session = daemon_start_session(
+        &state.config.daemon_endpoint,
+        None,
+        state.config.auth_token.as_deref(),
+    )?;
+    persist_daemon_session(state, &daemon_session)?;
+    handle_attach(
+        AttachArgs {
+            session_id: Some(daemon_session.session_id),
+            tui: true,
+        },
+        state,
+    )
 }
 
 fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
@@ -232,6 +289,42 @@ fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
         "updated_at_unix_ms": daemon_session.updated_at_unix_ms,
         "daemon_endpoint": state.config.daemon_endpoint,
         "api_endpoint": state.config.api_endpoint,
+    }))
+}
+
+fn handle_prompt(args: PromptArgs, state: &mut CliState) -> Result<Value> {
+    if args.session_id.trim().is_empty() {
+        bail!("session_id cannot be empty");
+    }
+    if args.text.trim().is_empty() {
+        bail!("text cannot be empty");
+    }
+
+    let prompt = daemon_prompt_session(
+        &state.config.daemon_endpoint,
+        &args.session_id,
+        &args.text,
+        state.config.auth_token.as_deref(),
+    )?;
+    persist_daemon_session(
+        state,
+        &DaemonSessionStatusResponse {
+            session_id: prompt.session_id.clone(),
+            state: prompt.state.clone(),
+            last_event: prompt.last_event.clone(),
+            updated_at_unix_ms: prompt.updated_at_unix_ms,
+        },
+    )?;
+
+    Ok(json!({
+        "ok": true,
+        "action": "prompt",
+        "session_id": prompt.session_id,
+        "turn_id": prompt.turn_id,
+        "state": prompt.state,
+        "last_event": prompt.last_event,
+        "last_sequence": prompt.last_sequence,
+        "updated_at_unix_ms": prompt.updated_at_unix_ms,
     }))
 }
 
@@ -316,33 +409,72 @@ fn handle_status(args: StatusArgs, state: &mut CliState) -> Result<Value> {
 }
 
 fn handle_attach(args: AttachArgs, state: &mut CliState) -> Result<CommandOutput> {
-    if args.session_id.trim().is_empty() {
-        bail!("session_id cannot be empty");
-    }
-    let session_id = args.session_id;
+    let auth_token = state.config.auth_token.clone();
+    let is_interactive_tui = args.tui && io::stdin().is_terminal() && io::stdout().is_terminal();
+    let session_id_was_provided = args.session_id.is_some();
+    let mut created_session = false;
+    let mut session_id = if let Some(session_id) = args.session_id {
+        if session_id.trim().is_empty() {
+            bail!("session_id cannot be empty");
+        }
+        session_id
+    } else if let Some(session_id) = latest_cached_session_id(state) {
+        session_id
+    } else {
+        let daemon_session =
+            daemon_start_session(&state.config.daemon_endpoint, None, auth_token.as_deref())?;
+        created_session = true;
+        let session_id = daemon_session.session_id.clone();
+        persist_daemon_session(state, &daemon_session)?;
+        session_id
+    };
+    let initial_since_sequence = if is_interactive_tui {
+        cached_last_sequence(state, &session_id).filter(|sequence| *sequence > 0)
+    } else {
+        None
+    };
+    let should_skip_initial_backlog = is_interactive_tui
+        && !session_id_was_provided
+        && !created_session
+        && initial_since_sequence.is_none();
 
-    let stream_events = fetch_daemon_stream(
+    let mut stream_not_found = false;
+    let mut stream_events = match fetch_daemon_stream(
         &state.config.daemon_endpoint,
         &session_id,
-        state.config.auth_token.as_deref(),
-    )?;
-    if let Some(latest_state) = stream_events
-        .iter()
-        .rev()
-        .find_map(|event| match &event.event {
-            DaemonStreamEvent::SessionState(payload) => Some(payload.state.clone()),
-            _ => None,
-        })
-    {
-        persist_daemon_session(
-            state,
-            &DaemonSessionStatusResponse {
-                session_id: session_id.clone(),
-                state: latest_state,
-                last_event: "attached".to_string(),
-                updated_at_unix_ms: now_unix_ms(),
-            },
+        auth_token.as_deref(),
+        initial_since_sequence,
+    )? {
+        DaemonStreamFetchResult::Stream(events) => events,
+        DaemonStreamFetchResult::NotFound => {
+            stream_not_found = true;
+            Vec::new()
+        }
+    };
+    if stream_not_found {
+        let daemon_session = daemon_start_session(
+            &state.config.daemon_endpoint,
+            Some(session_id.clone()),
+            auth_token.as_deref(),
         )?;
+        created_session = true;
+        session_id = daemon_session.session_id.clone();
+        persist_daemon_session(state, &daemon_session)?;
+        stream_events = match fetch_daemon_stream(
+            &state.config.daemon_endpoint,
+            &session_id,
+            auth_token.as_deref(),
+            None,
+        )? {
+            DaemonStreamFetchResult::Stream(events) => events,
+            DaemonStreamFetchResult::NotFound => {
+                bail!("daemon stream not found after creating session: {session_id}")
+            }
+        };
+    }
+    persist_latest_session_state_from_stream(state, &session_id, &stream_events)?;
+    if should_skip_initial_backlog {
+        stream_events.clear();
     }
     let received_events = stream_events.len();
     let last_sequence = stream_events
@@ -357,10 +489,14 @@ fn handle_attach(args: AttachArgs, state: &mut CliState) -> Result<CommandOutput
         "stream_events": stream_events,
         "received_events": received_events,
         "last_sequence": last_sequence,
+        "created_session": created_session,
         "daemon_endpoint": state.config.daemon_endpoint,
     });
 
     if args.tui {
+        if is_interactive_tui {
+            return handle_attach_tui_interactive(session_id, stream_events, state);
+        }
         return Ok(CommandOutput::Text(render_attach_tui(
             &session_id,
             &stream_events,
@@ -369,6 +505,750 @@ fn handle_attach(args: AttachArgs, state: &mut CliState) -> Result<CommandOutput
     }
 
     Ok(CommandOutput::Json(json_output))
+}
+
+fn handle_attach_tui_interactive(
+    session_id: String,
+    initial_events: Vec<DaemonStreamEnvelope>,
+    state: &mut CliState,
+) -> Result<CommandOutput> {
+    let mut ui = LiveAttachTui::new(
+        session_id.clone(),
+        state.config.daemon_endpoint.clone(),
+        cached_session_state_label(state, &session_id)
+            .unwrap_or("unknown")
+            .to_string(),
+    );
+    ui.apply_stream_events(&initial_events);
+    ui.status_message = Some(
+        "attached: Enter send | /status /interrupt /resume /refresh | Ctrl-C or /exit detach"
+            .to_string(),
+    );
+
+    enable_raw_mode().context("enable raw mode for attach tui")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+        .context("enter alternate screen for attach tui")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create attach tui terminal")?;
+    terminal.clear().context("clear attach tui terminal")?;
+
+    let loop_result = run_attach_tui_loop(&mut terminal, &mut ui, state);
+
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
+    let _ = terminal.show_cursor();
+
+    loop_result?;
+    Ok(CommandOutput::Text(format!(
+        "session={session_id} detached"
+    )))
+}
+
+struct InFlightPrompt {
+    prompt: String,
+    submitted_at: Instant,
+    handle: thread::JoinHandle<Result<DaemonPromptResponse>>,
+}
+
+struct LiveAttachTui {
+    session_id: String,
+    daemon_endpoint: String,
+    transcript: String,
+    input: String,
+    input_cursor: usize,
+    command_history: Vec<String>,
+    history_index: Option<usize>,
+    latest_state: String,
+    previous_state: Option<String>,
+    received_events: usize,
+    last_sequence: u64,
+    status_message: Option<String>,
+    active_turn_id: Option<String>,
+    pending_prompt: Option<InFlightPrompt>,
+}
+
+impl LiveAttachTui {
+    fn new(session_id: String, daemon_endpoint: String, latest_state: String) -> Self {
+        Self {
+            session_id,
+            daemon_endpoint,
+            transcript: String::new(),
+            input: String::new(),
+            input_cursor: 0,
+            command_history: Vec::new(),
+            history_index: None,
+            latest_state,
+            previous_state: None,
+            received_events: 0,
+            last_sequence: 0,
+            status_message: None,
+            active_turn_id: None,
+            pending_prompt: None,
+        }
+    }
+
+    fn apply_stream_events(&mut self, stream_events: &[DaemonStreamEnvelope]) {
+        for envelope in stream_events {
+            self.received_events += 1;
+            self.last_sequence = envelope.sequence;
+            match &envelope.event {
+                DaemonStreamEvent::SessionState(payload) => {
+                    if self.previous_state.as_deref() != Some(payload.state.as_str()) {
+                        if payload.state == "interrupted" {
+                            self.push_line(&format!(
+                                "[session interrupted] resume with: crabbot codex resume --session-id {}",
+                                self.session_id
+                            ));
+                        } else if self.previous_state.as_deref() == Some("interrupted")
+                            && payload.state == "active"
+                        {
+                            self.push_line("[session resumed] stream is active again");
+                        }
+                    }
+                    self.latest_state = payload.state.clone();
+                    self.previous_state = Some(payload.state.clone());
+                }
+                DaemonStreamEvent::TurnStreamDelta(payload) => {
+                    let is_new_turn =
+                        self.active_turn_id.as_deref() != Some(payload.turn_id.as_str());
+                    if is_new_turn {
+                        self.active_turn_id = Some(payload.turn_id.clone());
+                    }
+                    let delta = if is_new_turn {
+                        payload
+                            .delta
+                            .strip_prefix("Assistant: ")
+                            .unwrap_or(&payload.delta)
+                    } else {
+                        &payload.delta
+                    };
+                    self.transcript.push_str(delta);
+                }
+                DaemonStreamEvent::TurnCompleted(payload) => {
+                    self.active_turn_id = None;
+                    if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
+                        self.transcript.push('\n');
+                    }
+                    let _ = payload;
+                    self.status_message = None;
+                }
+                DaemonStreamEvent::ApprovalRequired(payload) => {
+                    self.push_line(&format!(
+                        "[approval required] id={} action={}",
+                        payload.approval_id, payload.action_kind
+                    ));
+                    self.push_line(&format!("prompt: {}", payload.prompt));
+                    self.push_line(&format!(
+                        "after approval, resume with: crabbot codex resume --session-id {}",
+                        self.session_id
+                    ));
+                }
+                DaemonStreamEvent::Heartbeat(_) => {}
+            }
+        }
+    }
+
+    fn push_line(&mut self, line: &str) {
+        if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
+            self.transcript.push('\n');
+        }
+        self.transcript.push_str(line);
+        self.transcript.push('\n');
+    }
+
+    fn input_insert_str(&mut self, text: &str) {
+        if self.input_cursor == self.input.len() {
+            self.input.push_str(text);
+            self.input_cursor = self.input.len();
+            return;
+        }
+        self.input.insert_str(self.input_cursor, text);
+        self.input_cursor += text.len();
+    }
+
+    fn input_insert_char(&mut self, ch: char) {
+        if self.input_cursor == self.input.len() {
+            self.input.push(ch);
+            self.input_cursor = self.input.len();
+            return;
+        }
+        self.input.insert(self.input_cursor, ch);
+        self.input_cursor += ch.len_utf8();
+    }
+
+    fn input_backspace(&mut self) {
+        if self.input_cursor == 0 {
+            return;
+        }
+        let previous = previous_char_boundary(&self.input, self.input_cursor);
+        self.input.drain(previous..self.input_cursor);
+        self.input_cursor = previous;
+    }
+
+    fn input_delete(&mut self) {
+        if self.input_cursor >= self.input.len() {
+            return;
+        }
+        let next = next_char_boundary(&self.input, self.input_cursor);
+        self.input.drain(self.input_cursor..next);
+    }
+
+    fn move_input_cursor_left(&mut self) {
+        self.input_cursor = previous_char_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_cursor_right(&mut self) {
+        self.input_cursor = next_char_boundary(&self.input, self.input_cursor);
+    }
+
+    fn move_input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    fn move_input_cursor_end(&mut self) {
+        self.input_cursor = self.input.len();
+    }
+
+    fn clear_input(&mut self) {
+        self.input.clear();
+        self.input_cursor = 0;
+    }
+
+    fn replace_input(&mut self, text: String) {
+        self.input = text;
+        self.input_cursor = self.input.len();
+    }
+
+    fn take_input(&mut self) -> String {
+        self.history_index = None;
+        self.input_cursor = 0;
+        std::mem::take(&mut self.input)
+    }
+
+    fn remember_history_entry(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        if self
+            .command_history
+            .last()
+            .is_some_and(|entry| entry == text)
+        {
+            return;
+        }
+        self.command_history.push(text.to_string());
+        self.history_index = None;
+    }
+
+    fn history_prev(&mut self) {
+        if self.command_history.is_empty() {
+            return;
+        }
+        let next_index = match self.history_index {
+            Some(index) if index > 0 => index - 1,
+            Some(index) => index,
+            None => self.command_history.len().saturating_sub(1),
+        };
+        self.history_index = Some(next_index);
+        self.replace_input(self.command_history[next_index].clone());
+    }
+
+    fn history_next(&mut self) {
+        let Some(index) = self.history_index else {
+            return;
+        };
+        if index + 1 >= self.command_history.len() {
+            self.history_index = None;
+            self.clear_input();
+            return;
+        }
+        let next_index = index + 1;
+        self.history_index = Some(next_index);
+        self.replace_input(self.command_history[next_index].clone());
+    }
+
+    fn has_pending_prompt(&self) -> bool {
+        self.pending_prompt.is_some()
+    }
+
+    fn start_prompt_request(
+        &mut self,
+        daemon_endpoint: String,
+        auth_token: Option<String>,
+        prompt: String,
+    ) -> Result<()> {
+        if self.pending_prompt.is_some() {
+            bail!("a prompt is already running");
+        }
+
+        let session_id = self.session_id.clone();
+        let request_prompt = prompt.clone();
+        let handle = thread::spawn(move || {
+            daemon_prompt_session(
+                &daemon_endpoint,
+                &session_id,
+                &request_prompt,
+                auth_token.as_deref(),
+            )
+        });
+
+        self.pending_prompt = Some(InFlightPrompt {
+            prompt,
+            submitted_at: Instant::now(),
+            handle,
+        });
+        self.status_message = Some("waiting for assistant response...".to_string());
+        Ok(())
+    }
+
+    fn take_finished_prompt(&mut self) -> Option<InFlightPrompt> {
+        if self
+            .pending_prompt
+            .as_ref()
+            .is_some_and(|pending| pending.handle.is_finished())
+        {
+            return self.pending_prompt.take();
+        }
+        None
+    }
+
+    fn input_view(&self, width: usize) -> (String, usize) {
+        let prompt_width = "you> ".chars().count();
+        if width == 0 {
+            return (String::new(), 0);
+        }
+        if width <= prompt_width {
+            return (String::new(), width - 1);
+        }
+
+        let input_width = width - prompt_width;
+        let cursor_chars = self.input[..self.input_cursor].chars().count();
+        let offset = if cursor_chars >= input_width {
+            cursor_chars - (input_width - 1)
+        } else {
+            0
+        };
+        let visible = self.input.chars().skip(offset).take(input_width).collect();
+        let cursor_col = (prompt_width + cursor_chars.saturating_sub(offset)).min(width - 1);
+        (visible, cursor_col)
+    }
+
+    fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+        terminal.draw(|frame| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                    Constraint::Length(2),
+                ])
+                .split(frame.area());
+
+            let history = self.transcript.clone();
+            let history_lines = history.lines().count().max(1) as u16;
+            let scroll = history_lines.saturating_sub(chunks[0].height);
+            frame.render_widget(
+                Paragraph::new(history)
+                    .wrap(Wrap { trim: false })
+                    .scroll((scroll, 0)),
+                chunks[0],
+            );
+
+            frame.render_widget(
+                Paragraph::new(self.footer_text(chunks[1].width as usize)),
+                chunks[1],
+            );
+
+            let input_chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(1), Constraint::Length(1)])
+                .split(chunks[2]);
+
+            let (visible_input, cursor_col) = self.input_view(input_chunks[0].width as usize);
+            frame.render_widget(
+                Paragraph::new(format!("you> {visible_input}")),
+                input_chunks[0],
+            );
+            frame.render_widget(
+                Paragraph::new(
+                    "Enter send | \u{2191}/\u{2193} history | \u{2190}/\u{2192} edit | /status /interrupt /resume /refresh | Ctrl-C detach",
+                ),
+                input_chunks[1],
+            );
+
+            let cursor_x = input_chunks[0]
+                .x
+                .saturating_add(cursor_col.try_into().unwrap_or(u16::MAX));
+            frame.set_cursor_position((cursor_x, input_chunks[0].y));
+        })?;
+        Ok(())
+    }
+
+    fn footer_text(&self, width: usize) -> String {
+        let mut footer = build_attach_footer(
+            &self.session_id,
+            &self.latest_state,
+            self.received_events,
+            self.last_sequence,
+            &self.daemon_endpoint,
+            width,
+        );
+
+        if let Some(pending) = &self.pending_prompt {
+            let elapsed = pending.submitted_at.elapsed().as_secs_f32();
+            let pending_status = format!("pending {:.1}s", elapsed);
+            footer = truncate_for_width(&format!("{footer} | {pending_status}"), width);
+        }
+        if let Some(status) = &self.status_message {
+            footer = truncate_for_width(&format!("{footer} | {status}"), width);
+        }
+        footer
+    }
+}
+
+fn previous_char_boundary(text: &str, index: usize) -> usize {
+    if index == 0 {
+        return 0;
+    }
+    text[..index]
+        .char_indices()
+        .last()
+        .map(|(position, _)| position)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    index
+        + text[index..]
+            .chars()
+            .next()
+            .map(|ch| ch.len_utf8())
+            .unwrap_or(0)
+}
+
+fn run_attach_tui_loop(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ui: &mut LiveAttachTui,
+    state: &mut CliState,
+) -> Result<()> {
+    let mut next_poll = Instant::now();
+    let mut needs_redraw = true;
+    loop {
+        match poll_live_tui_prompt_completion(state, ui) {
+            Ok(changed) => {
+                if changed {
+                    needs_redraw = true;
+                }
+            }
+            Err(error) => {
+                ui.status_message = Some(format!("prompt failed: {error}"));
+                needs_redraw = true;
+            }
+        }
+
+        if needs_redraw {
+            ui.draw(terminal)?;
+            needs_redraw = false;
+        }
+
+        let now = Instant::now();
+        if now >= next_poll {
+            match poll_live_tui_stream_updates(state, ui) {
+                Ok(changed) => {
+                    if changed {
+                        needs_redraw = true;
+                    }
+                }
+                Err(error) => {
+                    ui.status_message = Some(format!("stream poll failed: {error}"));
+                    needs_redraw = true;
+                }
+            }
+            next_poll = now + TUI_STREAM_POLL_INTERVAL;
+        }
+
+        if !event::poll(TUI_EVENT_WAIT_STEP).context("poll attach tui events")? {
+            continue;
+        }
+
+        match event::read().context("read attach tui event")? {
+            Event::Key(key) if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) => {
+                let action = handle_live_tui_key_event(key, state, ui);
+                match action {
+                    Ok(LiveTuiAction::Detach) => break,
+                    Ok(LiveTuiAction::Continue) => {
+                        needs_redraw = true;
+                        next_poll = Instant::now();
+                    }
+                    Err(error) => {
+                        ui.status_message = Some(format!("command failed: {error}"));
+                        needs_redraw = true;
+                    }
+                }
+            }
+            Event::Paste(pasted) => {
+                ui.input_insert_str(&pasted);
+                needs_redraw = true;
+            }
+            Event::Resize(_, _) => {
+                needs_redraw = true;
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+enum LiveTuiAction {
+    Continue,
+    Detach,
+}
+
+fn handle_live_tui_key_event(
+    key: crossterm::event::KeyEvent,
+    state: &mut CliState,
+    ui: &mut LiveAttachTui,
+) -> Result<LiveTuiAction> {
+    match key.code {
+        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            return Ok(LiveTuiAction::Detach);
+        }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            ui.clear_input();
+        }
+        KeyCode::Up => ui.history_prev(),
+        KeyCode::Down => ui.history_next(),
+        KeyCode::Left => ui.move_input_cursor_left(),
+        KeyCode::Right => ui.move_input_cursor_right(),
+        KeyCode::Home => ui.move_input_cursor_home(),
+        KeyCode::End => ui.move_input_cursor_end(),
+        KeyCode::Enter => {
+            let input = ui.take_input();
+            return handle_live_tui_submit(state, ui, input);
+        }
+        KeyCode::Backspace => {
+            ui.input_backspace();
+        }
+        KeyCode::Delete => {
+            ui.input_delete();
+        }
+        KeyCode::Tab => ui.input_insert_char('\t'),
+        KeyCode::Char(ch) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                && !key.modifiers.contains(KeyModifiers::ALT)
+            {
+                ui.input_insert_char(ch);
+            }
+        }
+        _ => {}
+    }
+    Ok(LiveTuiAction::Continue)
+}
+
+fn handle_live_tui_submit(
+    state: &mut CliState,
+    ui: &mut LiveAttachTui,
+    input: String,
+) -> Result<LiveTuiAction> {
+    let command = input.trim();
+    if command.is_empty() || command == "/refresh" {
+        let _ = poll_live_tui_stream_updates(state, ui)?;
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    if command == "/exit" || command == "/quit" {
+        return Ok(LiveTuiAction::Detach);
+    }
+
+    if command == "/status" {
+        let status = daemon_get_session_status(
+            &state.config.daemon_endpoint,
+            &ui.session_id,
+            state.config.auth_token.as_deref(),
+        )?;
+        persist_daemon_session(state, &status)?;
+        ui.latest_state = status.state.clone();
+        ui.status_message = Some(format!(
+            "state={} last_event={} updated_at_unix_ms={}",
+            status.state, status.last_event, status.updated_at_unix_ms
+        ));
+        let _ = poll_live_tui_stream_updates(state, ui)?;
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    if command == "/interrupt" {
+        let status = daemon_interrupt_session(
+            &state.config.daemon_endpoint,
+            &ui.session_id,
+            state.config.auth_token.as_deref(),
+        )?;
+        persist_daemon_session(state, &status)?;
+        ui.latest_state = status.state.clone();
+        ui.status_message = Some("session interrupted".to_string());
+        let _ = poll_live_tui_stream_updates(state, ui)?;
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    if command == "/resume" {
+        let status = daemon_resume_session(
+            &state.config.daemon_endpoint,
+            &ui.session_id,
+            state.config.auth_token.as_deref(),
+        )?;
+        persist_daemon_session(state, &status)?;
+        ui.latest_state = status.state.clone();
+        ui.status_message = Some("session resumed".to_string());
+        let _ = poll_live_tui_stream_updates(state, ui)?;
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    if command.starts_with('/') {
+        ui.status_message = Some(format!("unknown command: {command}"));
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    if ui.has_pending_prompt() {
+        ui.status_message =
+            Some("wait for current response before sending another prompt".to_string());
+        ui.replace_input(input);
+        return Ok(LiveTuiAction::Continue);
+    }
+
+    ui.push_line(&format!("you: {command}"));
+    ui.remember_history_entry(command);
+
+    ui.start_prompt_request(
+        state.config.daemon_endpoint.clone(),
+        state.config.auth_token.clone(),
+        command.to_string(),
+    )?;
+    Ok(LiveTuiAction::Continue)
+}
+
+fn poll_live_tui_prompt_completion(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+    let Some(pending) = ui.take_finished_prompt() else {
+        return Ok(false);
+    };
+
+    let prompt_text = pending.prompt;
+    let result = pending
+        .handle
+        .join()
+        .map_err(|_| anyhow!("prompt worker thread panicked"))?;
+    let prompt = result?;
+
+    persist_daemon_session(
+        state,
+        &DaemonSessionStatusResponse {
+            session_id: prompt.session_id.clone(),
+            state: prompt.state.clone(),
+            last_event: prompt.last_event.clone(),
+            updated_at_unix_ms: prompt.updated_at_unix_ms,
+        },
+    )?;
+    ui.latest_state = prompt.state.clone();
+    if prompt.state != "active" {
+        ui.status_message = Some(format!("session state: {}", prompt.state));
+    } else {
+        ui.status_message = Some(format!("response received for: {prompt_text}"));
+    }
+
+    match poll_live_tui_stream_updates(state, ui) {
+        Ok(_) => {}
+        Err(error) => {
+            ui.status_message = Some(format!("stream poll failed after prompt: {error}"));
+        }
+    }
+    Ok(true)
+}
+
+fn poll_live_tui_stream_updates(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+    let stream_events = match fetch_daemon_stream_with_timeout(
+        &state.config.daemon_endpoint,
+        &ui.session_id,
+        state.config.auth_token.as_deref(),
+        Some(ui.last_sequence),
+        TUI_STREAM_REQUEST_TIMEOUT,
+    )? {
+        DaemonStreamFetchResult::Stream(events) => events,
+        DaemonStreamFetchResult::NotFound => {
+            bail!("session stream not found for session: {}", ui.session_id)
+        }
+    };
+
+    if stream_events.is_empty() {
+        return Ok(false);
+    }
+
+    ui.apply_stream_events(&stream_events);
+    persist_latest_session_state_from_stream(state, &ui.session_id, &stream_events)?;
+    if let Some(cached_state) = cached_session_state_label(state, &ui.session_id) {
+        ui.latest_state = cached_state.to_string();
+    }
+    Ok(true)
+}
+
+fn truncate_for_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    if width <= 3 {
+        return ".".repeat(width);
+    }
+    let mut truncated = text.chars().take(width - 3).collect::<String>();
+    truncated.push_str("...");
+    truncated
+}
+
+fn persist_latest_session_state_from_stream(
+    state: &mut CliState,
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+) -> Result<()> {
+    let Some(last_sequence) = stream_events.last().map(|event| event.sequence) else {
+        return Ok(());
+    };
+    let latest_state = stream_events
+        .iter()
+        .rev()
+        .find_map(|event| match &event.event {
+            DaemonStreamEvent::SessionState(payload) => Some(payload.state.clone()),
+            _ => None,
+        });
+
+    if let Some(runtime) = state.sessions.get_mut(session_id) {
+        if let Some(next_state) = latest_state {
+            runtime.state = parse_session_status(&next_state)?;
+            runtime.last_event = "attached".to_string();
+        }
+        runtime.updated_at_unix_ms = now_unix_ms();
+        runtime.last_sequence = runtime.last_sequence.max(last_sequence);
+        return Ok(());
+    }
+
+    if let Some(next_state) = latest_state {
+        state.sessions.insert(
+            session_id.to_string(),
+            SessionRuntimeState {
+                state: parse_session_status(&next_state)?,
+                updated_at_unix_ms: now_unix_ms(),
+                last_event: "attached".to_string(),
+                last_sequence,
+            },
+        );
+    }
+    Ok(())
 }
 
 fn handle_config_show(state: &CliState) -> Value {
@@ -434,22 +1314,32 @@ fn persist_daemon_session(
     daemon_session: &DaemonSessionStatusResponse,
 ) -> Result<()> {
     let state_value = parse_session_status(&daemon_session.state)?;
+    let last_sequence = state
+        .sessions
+        .get(&daemon_session.session_id)
+        .map(|runtime| runtime.last_sequence)
+        .unwrap_or(0);
     state.sessions.insert(
         daemon_session.session_id.clone(),
         SessionRuntimeState {
             state: state_value,
             updated_at_unix_ms: daemon_session.updated_at_unix_ms,
             last_event: daemon_session.last_event.clone(),
+            last_sequence,
         },
     );
     Ok(())
 }
 
-fn http_client() -> Result<Client> {
+fn http_client_with_timeout(timeout: Duration) -> Result<Client> {
     Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(timeout)
         .build()
         .context("build http client")
+}
+
+fn http_client() -> Result<Client> {
+    http_client_with_timeout(Duration::from_secs(5))
 }
 
 fn endpoint_url(base: &str, path: &str) -> String {
@@ -483,6 +1373,123 @@ fn fetch_api_health(api_endpoint: &str, auth_token: Option<&str>) -> Result<Heal
     response
         .json::<HealthResponse>()
         .context("parse api health response")
+}
+
+fn health_http_client() -> Result<Client> {
+    Client::builder()
+        .timeout(Duration::from_millis(250))
+        .build()
+        .context("build health-check http client")
+}
+
+fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
+    let client = match health_http_client() {
+        Ok(client) => client,
+        Err(_) => return false,
+    };
+    let url = endpoint_url(daemon_endpoint, "/health");
+    let response = match apply_auth(client.get(url), auth_token).send() {
+        Ok(response) => response,
+        Err(_) => return false,
+    };
+    if !response.status().is_success() {
+        return false;
+    }
+
+    response
+        .json::<HealthResponse>()
+        .map(|health| health.status == "ok")
+        .unwrap_or(false)
+}
+
+fn ensure_daemon_ready(state: &CliState) -> Result<()> {
+    if daemon_is_healthy(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+    ) {
+        return Ok(());
+    }
+
+    auto_start_daemon_process()?;
+
+    for _ in 0..20 {
+        if daemon_is_healthy(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+        ) {
+            return Ok(());
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+
+    bail!(
+        "daemon is not healthy at {}; run `cargo run -p crabbot_daemon` or set CRABBOT_DAEMON_BIN",
+        state.config.daemon_endpoint
+    )
+}
+
+fn auto_start_daemon_process() -> Result<()> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(explicit) = env::var_os("CRABBOT_DAEMON_BIN") {
+        if !PathBuf::from(&explicit).as_os_str().is_empty() {
+            candidates.push(PathBuf::from(explicit));
+        }
+    }
+
+    if let Ok(current_exe) = env::current_exe() {
+        if let Some(parent) = current_exe.parent() {
+            candidates.push(parent.join("crabbot_daemon"));
+        }
+    }
+    candidates.push(PathBuf::from("crabbot_daemon"));
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for candidate in candidates {
+        match spawn_daemon_process(&candidate) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+    }
+
+    if spawn_daemon_via_cargo().is_ok() {
+        return Ok(());
+    }
+
+    match last_error {
+        Some(error) => Err(error),
+        None => bail!("unable to auto-start daemon"),
+    }
+}
+
+fn spawn_daemon_process(binary: &Path) -> Result<()> {
+    let mut command = Command::new(binary);
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(bind) = env::var_os("CRABBOT_DAEMON_BIND") {
+        command.env("CRABBOT_DAEMON_BIND", bind);
+    }
+
+    command
+        .spawn()
+        .with_context(|| format!("auto-start daemon via {}", binary.display()))?;
+    Ok(())
+}
+
+fn spawn_daemon_via_cargo() -> Result<()> {
+    if !Path::new("Cargo.toml").exists() {
+        bail!("Cargo.toml not found in current working directory");
+    }
+
+    Command::new("cargo")
+        .args(["run", "-p", "crabbot_daemon"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("auto-start daemon via cargo run -p crabbot_daemon")?;
+    Ok(())
 }
 
 fn daemon_start_session(
@@ -539,6 +1546,28 @@ fn daemon_interrupt_session(
         .context("parse daemon interrupt response")
 }
 
+fn daemon_prompt_session(
+    daemon_endpoint: &str,
+    session_id: &str,
+    text: &str,
+    auth_token: Option<&str>,
+) -> Result<DaemonPromptResponse> {
+    let client = http_client()?;
+    let path = format!("/v1/sessions/{session_id}/prompt");
+    let url = endpoint_url(daemon_endpoint, &path);
+    let response = apply_auth(client.post(url), auth_token)
+        .json(&DaemonPromptRequest {
+            prompt: text.to_string(),
+        })
+        .send()
+        .context("request daemon prompt")?
+        .error_for_status()
+        .context("daemon prompt returned error status")?;
+    response
+        .json::<DaemonPromptResponse>()
+        .context("parse daemon prompt response")
+}
+
 fn daemon_get_session_status(
     daemon_endpoint: &str,
     session_id: &str,
@@ -557,28 +1586,75 @@ fn daemon_get_session_status(
         .context("parse daemon status response")
 }
 
+#[derive(Debug)]
+enum DaemonStreamFetchResult {
+    Stream(Vec<DaemonStreamEnvelope>),
+    NotFound,
+}
+
 fn fetch_daemon_stream(
     daemon_endpoint: &str,
     session_id: &str,
     auth_token: Option<&str>,
-) -> Result<Vec<DaemonStreamEnvelope>> {
-    let client = http_client()?;
-    let path = format!("/v1/sessions/{session_id}/stream");
+    since_sequence: Option<u64>,
+) -> Result<DaemonStreamFetchResult> {
+    fetch_daemon_stream_with_timeout(
+        daemon_endpoint,
+        session_id,
+        auth_token,
+        since_sequence,
+        Duration::from_secs(5),
+    )
+}
+
+fn fetch_daemon_stream_with_timeout(
+    daemon_endpoint: &str,
+    session_id: &str,
+    auth_token: Option<&str>,
+    since_sequence: Option<u64>,
+    timeout: Duration,
+) -> Result<DaemonStreamFetchResult> {
+    let client = http_client_with_timeout(timeout)?;
+    let mut path = format!("/v1/sessions/{session_id}/stream");
+    if let Some(since_sequence) = since_sequence {
+        path.push_str(&format!("?since_sequence={since_sequence}"));
+    }
     let url = endpoint_url(daemon_endpoint, &path);
-    let body = apply_auth(client.get(url), auth_token)
+    let response = apply_auth(client.get(url), auth_token)
         .send()
-        .context("request daemon stream")?
+        .context("request daemon stream")?;
+    if response.status() == reqwest::StatusCode::NOT_FOUND {
+        return Ok(DaemonStreamFetchResult::NotFound);
+    }
+    let body = response
         .error_for_status()
         .context("daemon stream returned error status")?
         .text()
         .context("read daemon stream body")?;
 
-    body.lines()
+    let stream_events = body
+        .lines()
         .filter(|line| !line.trim().is_empty())
         .map(|line| {
             serde_json::from_str::<DaemonStreamEnvelope>(line).context("parse daemon stream line")
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok(DaemonStreamFetchResult::Stream(stream_events))
+}
+
+fn latest_cached_session_id(state: &CliState) -> Option<String> {
+    state
+        .sessions
+        .iter()
+        .max_by_key(|(_, value)| value.updated_at_unix_ms)
+        .map(|(key, _)| key.clone())
+}
+
+fn cached_last_sequence(state: &CliState, session_id: &str) -> Option<u64> {
+    state
+        .sessions
+        .get(session_id)
+        .map(|runtime| runtime.last_sequence)
 }
 
 fn render_attach_tui(
@@ -586,22 +1662,40 @@ fn render_attach_tui(
     stream_events: &[DaemonStreamEnvelope],
     daemon_endpoint: &str,
 ) -> String {
-    render_attach_tui_with_columns(
+    render_attach_tui_with_columns_and_fallback(
         session_id,
         stream_events,
         daemon_endpoint,
         terminal_columns(),
+        None,
     )
 }
 
+#[cfg(test)]
 fn render_attach_tui_with_columns(
     session_id: &str,
     stream_events: &[DaemonStreamEnvelope],
     daemon_endpoint: &str,
     columns: usize,
 ) -> String {
+    render_attach_tui_with_columns_and_fallback(
+        session_id,
+        stream_events,
+        daemon_endpoint,
+        columns,
+        None,
+    )
+}
+
+fn render_attach_tui_with_columns_and_fallback(
+    session_id: &str,
+    stream_events: &[DaemonStreamEnvelope],
+    daemon_endpoint: &str,
+    columns: usize,
+    fallback_state: Option<&str>,
+) -> String {
     let mut output = String::new();
-    let mut latest_state = String::from("unknown");
+    let mut latest_state = fallback_state.unwrap_or("unknown").to_string();
     let mut previous_state: Option<String> = None;
 
     for envelope in stream_events {
@@ -675,6 +1769,16 @@ fn render_attach_tui_with_columns(
     output.push('\n');
     output.push_str(&footer);
     output
+}
+
+fn cached_session_state_label<'a>(state: &'a CliState, session_id: &str) -> Option<&'a str> {
+    state
+        .sessions
+        .get(session_id)
+        .map(|runtime| match runtime.state {
+            SessionStatus::Active => "active",
+            SessionStatus::Interrupted => "interrupted",
+        })
 }
 
 fn terminal_columns() -> usize {
@@ -898,14 +2002,14 @@ mod tests {
         let _ = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Config(ConfigCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: None,
                             daemon_endpoint: Some(daemon_endpoint),
                             auth_token: Some(auth_token.to_string()),
                             clear_auth_token: false,
                         }),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -914,9 +2018,9 @@ mod tests {
         let start = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Start(StartArgs {
+                    command: Some(CodexSubcommand::Start(StartArgs {
                         session_id: Some("sess_cli_1".to_string()),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -927,9 +2031,9 @@ mod tests {
         let interrupt = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Interrupt(SessionArgs {
+                    command: Some(CodexSubcommand::Interrupt(SessionArgs {
                         session_id: "sess_cli_1".to_string(),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -939,9 +2043,9 @@ mod tests {
         let resume = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Resume(SessionArgs {
+                    command: Some(CodexSubcommand::Resume(SessionArgs {
                         session_id: "sess_cli_1".to_string(),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -951,10 +2055,10 @@ mod tests {
         let status = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Status(StatusArgs {
+                    command: Some(CodexSubcommand::Status(StatusArgs {
                         session_id: Some("sess_cli_1".to_string()),
                         check_api: false,
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -966,20 +2070,69 @@ mod tests {
     }
 
     #[test]
+    fn prompt_command_posts_text_and_returns_turn_metadata() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_prompt";
+        let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
+            MockExpectation {
+                request_line: "POST /v1/sessions/sess_cli_prompt/prompt HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 202 Accepted".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_cli_prompt","turn_id":"turn_sess_cli_prompt_1","state":"active","last_event":"turn_completed","updated_at_unix_ms":99,"last_sequence":4}"#
+                    .to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+        ]);
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: Some(auth_token.to_string()),
+                            clear_auth_token: false,
+                        }),
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        let prompt = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Prompt(PromptArgs {
+                        session_id: "sess_cli_prompt".to_string(),
+                        text: "ship it".to_string(),
+                    })),
+                }),
+            },
+            &state_path,
+        );
+        assert_eq!(prompt["ok"], true);
+        assert_eq!(prompt["action"], "prompt");
+        assert_eq!(prompt["turn_id"], "turn_sess_cli_prompt_1");
+        assert_eq!(prompt["last_sequence"], 4);
+        daemon_handle.join().expect("join daemon mock thread");
+    }
+
+    #[test]
     fn config_set_and_show_roundtrip() {
         let (_dir, state_path) = temp_state_path();
 
         let set = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Config(ConfigCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: Some("https://api.crabbot.local".to_string()),
                             daemon_endpoint: Some("https://daemon.crabbot.local".to_string()),
                             auth_token: Some("token_123".to_string()),
                             clear_auth_token: false,
                         }),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -990,9 +2143,9 @@ mod tests {
         let show = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Config(ConfigCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
                         command: ConfigSubcommand::Show,
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1056,14 +2209,14 @@ mod tests {
         let _ = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Config(ConfigCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: Some(api_endpoint),
                             daemon_endpoint: Some(daemon_endpoint),
                             auth_token: Some(auth_token.to_string()),
                             clear_auth_token: false,
                         }),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1072,10 +2225,10 @@ mod tests {
         let attach = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Attach(AttachArgs {
-                        session_id: "sess_cli_attach".to_string(),
+                    command: Some(CodexSubcommand::Attach(AttachArgs {
+                        session_id: Some("sess_cli_attach".to_string()),
                         tui: false,
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1083,15 +2236,16 @@ mod tests {
         assert_eq!(attach["ok"], true);
         assert_eq!(attach["received_events"], 3);
         assert_eq!(attach["last_sequence"], 3);
+        assert_eq!(attach["created_session"], false);
         assert_eq!(attach["stream_events"][0]["event"]["type"], "session_state");
 
         let status = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Status(StatusArgs {
+                    command: Some(CodexSubcommand::Status(StatusArgs {
                         session_id: None,
                         check_api: true,
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1106,6 +2260,222 @@ mod tests {
 
         daemon_handle.join().expect("join daemon mock thread");
         api_handle.join().expect("join api mock thread");
+    }
+
+    #[test]
+    fn attach_without_session_id_uses_latest_cached_session() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_attach_latest";
+        let daemon_body = format!(
+            "{}\n",
+            serde_json::to_string(&DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_latest".to_string(),
+                sequence: 7,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            })
+            .expect("serialize daemon event")
+        );
+        let (daemon_endpoint, daemon_handle) = spawn_mock_get_server(
+            "/v1/sessions/sess_latest/stream",
+            Some(auth_token),
+            "application/x-ndjson",
+            daemon_body,
+        );
+
+        save_state(
+            &state_path,
+            &CliState {
+                sessions: BTreeMap::from([
+                    (
+                        "sess_old".to_string(),
+                        SessionRuntimeState {
+                            state: SessionStatus::Active,
+                            updated_at_unix_ms: 10,
+                            last_event: "attached".to_string(),
+                            last_sequence: 0,
+                        },
+                    ),
+                    (
+                        "sess_latest".to_string(),
+                        SessionRuntimeState {
+                            state: SessionStatus::Active,
+                            updated_at_unix_ms: 20,
+                            last_event: "attached".to_string(),
+                            last_sequence: 0,
+                        },
+                    ),
+                ]),
+                config: CliConfig {
+                    api_endpoint: "http://127.0.0.1:8787".to_string(),
+                    daemon_endpoint,
+                    auth_token: Some(auth_token.to_string()),
+                },
+            },
+        )
+        .expect("seed cli state");
+
+        let attach = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Attach(AttachArgs {
+                        session_id: None,
+                        tui: false,
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        assert_eq!(attach["ok"], true);
+        assert_eq!(attach["session_id"], "sess_latest");
+        assert_eq!(attach["created_session"], false);
+        daemon_handle.join().expect("join daemon mock thread");
+    }
+
+    #[test]
+    fn attach_without_session_id_creates_new_session_when_cache_empty() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_attach_create";
+        let daemon_body = format!(
+            "{}\n",
+            serde_json::to_string(&DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_auto_1".to_string(),
+                sequence: 1,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            })
+            .expect("serialize daemon event")
+        );
+        let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
+            MockExpectation {
+                request_line: "POST /v1/sessions/start HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 201 Created".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_auto_1","state":"active","last_event":"started","updated_at_unix_ms":100}"#
+                    .to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "GET /v1/sessions/sess_auto_1/stream HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/x-ndjson".to_string(),
+                body: daemon_body,
+                auth_token: Some(auth_token.to_string()),
+            },
+        ]);
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: Some(auth_token.to_string()),
+                            clear_auth_token: false,
+                        }),
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        let attach = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Attach(AttachArgs {
+                        session_id: None,
+                        tui: false,
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        assert_eq!(attach["ok"], true);
+        assert_eq!(attach["session_id"], "sess_auto_1");
+        assert_eq!(attach["created_session"], true);
+        daemon_handle.join().expect("join daemon mock thread");
+    }
+
+    #[test]
+    fn attach_recreates_missing_session_on_404() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_attach_recreate";
+        let daemon_body = format!(
+            "{}\n",
+            serde_json::to_string(&DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_missing".to_string(),
+                sequence: 1,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            })
+            .expect("serialize daemon event")
+        );
+        let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
+            MockExpectation {
+                request_line: "GET /v1/sessions/sess_missing/stream HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 404 Not Found".to_string(),
+                content_type: "text/plain".to_string(),
+                body: "not found".to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "POST /v1/sessions/start HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 201 Created".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_missing","state":"active","last_event":"started","updated_at_unix_ms":101}"#
+                    .to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "GET /v1/sessions/sess_missing/stream HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/x-ndjson".to_string(),
+                body: daemon_body,
+                auth_token: Some(auth_token.to_string()),
+            },
+        ]);
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: Some(auth_token.to_string()),
+                            clear_auth_token: false,
+                        }),
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        let attach = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Attach(AttachArgs {
+                        session_id: Some("sess_missing".to_string()),
+                        tui: false,
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        assert_eq!(attach["ok"], true);
+        assert_eq!(attach["session_id"], "sess_missing");
+        assert_eq!(attach["created_session"], true);
+        daemon_handle.join().expect("join daemon mock thread");
     }
 
     #[test]
@@ -1166,14 +2536,14 @@ mod tests {
         let _ = run_json(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Config(ConfigCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
                         command: ConfigSubcommand::Set(ConfigSetArgs {
                             api_endpoint: None,
                             daemon_endpoint: Some(daemon_endpoint.clone()),
                             auth_token: Some(auth_token.to_string()),
                             clear_auth_token: false,
                         }),
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1182,10 +2552,10 @@ mod tests {
         let output = run_with_state_path(
             Cli {
                 command: TopLevelCommand::Codex(CodexCommand {
-                    command: CodexSubcommand::Attach(AttachArgs {
-                        session_id: "sess_cli_tui".to_string(),
+                    command: Some(CodexSubcommand::Attach(AttachArgs {
+                        session_id: Some("sess_cli_tui".to_string()),
                         tui: true,
-                    }),
+                    })),
                 }),
             },
             &state_path,
@@ -1197,6 +2567,91 @@ mod tests {
         assert!(output.contains("session=sess_cli_tui state=active events=4 seq=4"));
         assert!(output.contains(&format!("daemon={daemon_endpoint}")));
 
+        daemon_handle.join().expect("join daemon mock thread");
+    }
+
+    #[test]
+    fn codex_default_runs_tui_attach_flow() {
+        let (_dir, state_path) = temp_state_path();
+        let auth_token = "token_cli_default";
+        let daemon_events = vec![
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_default".to_string(),
+                sequence: 1,
+                event: DaemonStreamEvent::SessionState(DaemonSessionState {
+                    state: "active".to_string(),
+                }),
+            },
+            DaemonStreamEnvelope {
+                schema_version: DAEMON_STREAM_SCHEMA_VERSION,
+                session_id: "sess_default".to_string(),
+                sequence: 2,
+                event: DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                    turn_id: "turn_default".to_string(),
+                    delta: "hello default".to_string(),
+                }),
+            },
+        ];
+        let daemon_body = daemon_events
+            .iter()
+            .map(|event| serde_json::to_string(event).expect("serialize daemon event"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+
+        let (daemon_endpoint, daemon_handle) = spawn_mock_sequence_server(vec![
+            MockExpectation {
+                request_line: "GET /health HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"status":"ok","service":"crabbot_daemon","version":"0.1.0"}"#
+                    .to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "POST /v1/sessions/start HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 201 Created".to_string(),
+                content_type: "application/json".to_string(),
+                body: r#"{"session_id":"sess_default","state":"active","last_event":"started","updated_at_unix_ms":220}"#
+                    .to_string(),
+                auth_token: Some(auth_token.to_string()),
+            },
+            MockExpectation {
+                request_line: "GET /v1/sessions/sess_default/stream HTTP/1.1".to_string(),
+                status_line: "HTTP/1.1 200 OK".to_string(),
+                content_type: "application/x-ndjson".to_string(),
+                body: daemon_body,
+                auth_token: Some(auth_token.to_string()),
+            },
+        ]);
+
+        let _ = run_json(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand {
+                    command: Some(CodexSubcommand::Config(ConfigCommand {
+                        command: ConfigSubcommand::Set(ConfigSetArgs {
+                            api_endpoint: None,
+                            daemon_endpoint: Some(daemon_endpoint),
+                            auth_token: Some(auth_token.to_string()),
+                            clear_auth_token: false,
+                        }),
+                    })),
+                }),
+            },
+            &state_path,
+        );
+
+        let output = run_with_state_path(
+            Cli {
+                command: TopLevelCommand::Codex(CodexCommand { command: None }),
+            },
+            &state_path,
+        )
+        .expect("run codex default command");
+
+        assert!(output.contains("hello default"));
+        assert!(output.contains("session=sess_default state=active events=2 seq=2"));
         daemon_handle.join().expect("join daemon mock thread");
     }
 
@@ -1341,5 +2796,55 @@ mod tests {
 
         let expected = include_str!("../tests/golden/attach_tui_output.txt").trim_end_matches('\n');
         assert_eq!(output, expected);
+    }
+
+    #[test]
+    fn live_tui_input_editing_respects_cursor_boundaries() {
+        let mut ui = LiveAttachTui::new(
+            "sess_input".to_string(),
+            "http://127.0.0.1:8788".to_string(),
+            "active".to_string(),
+        );
+
+        ui.input_insert_str("hello");
+        ui.move_input_cursor_left();
+        ui.move_input_cursor_left();
+        ui.input_insert_char('X');
+        assert_eq!(ui.input, "helXlo");
+
+        ui.input_delete();
+        assert_eq!(ui.input, "helXo");
+
+        ui.input_backspace();
+        assert_eq!(ui.input, "helo");
+
+        ui.move_input_cursor_home();
+        ui.input_insert_char('[');
+        ui.move_input_cursor_end();
+        ui.input_insert_char(']');
+        assert_eq!(ui.input, "[helo]");
+    }
+
+    #[test]
+    fn live_tui_history_navigation_replays_previous_entries() {
+        let mut ui = LiveAttachTui::new(
+            "sess_history".to_string(),
+            "http://127.0.0.1:8788".to_string(),
+            "active".to_string(),
+        );
+        ui.remember_history_entry("first");
+        ui.remember_history_entry("second");
+
+        ui.history_prev();
+        assert_eq!(ui.input, "second");
+
+        ui.history_prev();
+        assert_eq!(ui.input, "first");
+
+        ui.history_next();
+        assert_eq!(ui.input, "second");
+
+        ui.history_next();
+        assert_eq!(ui.input, "");
     }
 }

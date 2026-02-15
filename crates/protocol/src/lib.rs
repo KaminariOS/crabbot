@@ -212,6 +212,21 @@ pub struct DaemonStartSessionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonPromptRequest {
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DaemonPromptResponse {
+    pub session_id: String,
+    pub turn_id: String,
+    pub state: String,
+    pub last_event: String,
+    pub updated_at_unix_ms: u64,
+    pub last_sequence: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DaemonSessionStatusResponse {
     pub session_id: String,
     pub state: String,

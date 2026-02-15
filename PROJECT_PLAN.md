@@ -135,6 +135,7 @@ What We Are Building
   - [x] Expand `crates/codex_app_server` with initialize/session/thread lifecycle primitives.
   - [x] Add deterministic mapping for turn start/delta/complete and approval-required runtime events.
   - [x] Implement abort + replay-tested resume behavior for interrupted turns.
+  - [x] Wire `services/daemon` prompt/session lifecycle through `crates/codex_app_server` (session/thread/turn APIs) instead of direct canned turn emission.
 
   Current Sprint (M5 Kickoff)
 
@@ -154,6 +155,12 @@ What We Are Building
   - [x] Make attach footer responsive to terminal width by compacting fields on narrow terminals.
   - [x] Add approval prompt and recoverable resume/interrupt TUI states.
   - [x] Add screenshot/golden regression coverage for CLI TUI output.
+  - [x] Make `crabbot codex` support one-command mode (`crabbot codex`) with daemon auto-start and default TUI attach.
+  - [x] Add prompt-driven daemon turn generation so TUI output is session-real instead of fixed canned output.
+  - [x] Add `crabbot codex prompt --session-id ... --text ...` for explicit turn triggering and integration with TUI attach.
+  - [x] Make `crabbot codex attach --tui` interactive on TTYs with prompt input and `/status` `/interrupt` `/resume` `/refresh` `/exit` controls.
+  - [x] Replace line-print TTY attach with full-screen alternate-screen TUI loop (live polling + pinned footer/input) modeled after Codex terminal behavior.
+  - [x] Reduce TUI transcript noise (drop placeholder text, strip daemon `Assistant:` prefix, move turn-complete details to footer status).
 
   Current Sprint (M7 Kickoff)
 

@@ -8,3 +8,4 @@ Implement the Codex App Server adapter and map runtime events into Crabbot proto
 - [x] Turn start/stream/complete flows are mapped to internal protocol updates.
 - [x] Interrupt/abort/resume semantics are implemented and replay-tested.
 - [x] Approval-required actions are surfaced with deterministic state transitions.
+- [x] `services/daemon` prompt execution is routed through `crabbot_codex_app_server` session/thread/turn lifecycle APIs.
