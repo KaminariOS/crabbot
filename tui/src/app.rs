@@ -19,6 +19,12 @@ mod text_formatting;
 #[path = "version.rs"]
 mod version;
 
+pub(super) use crate::core_compat::AppEvent;
+pub(super) use crate::core_compat::AppEventSender;
+pub(super) use crate::core_compat::AppExitInfo;
+pub(super) use crate::core_compat::ExitMode;
+pub(super) use crate::core_compat::ExitReason;
+pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::UiApprovalRequest;
 pub(super) use crate::core_compat::UiEvent;
 pub(super) use crate::core_compat::interrupt_turn;
@@ -29,12 +35,6 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
-pub(super) use crate::core_compat::AppEvent;
-pub(super) use crate::core_compat::AppEventSender;
-pub(super) use crate::core_compat::AppExitInfo;
-pub(super) use crate::core_compat::ExitMode;
-pub(super) use crate::core_compat::ExitReason;
-pub(super) use crate::core_compat::LiveTuiAction;
 use chatwidget::ChatWidget;
 use chatwidget::LiveAttachTui;
 use slash_commands::find_builtin_command;
@@ -74,8 +74,7 @@ impl App {
         state.last_thread_id = Some(thread_id.clone());
 
         let mut widget = ChatWidget::new(thread_id.clone());
-        widget.ui_mut().status_message =
-            Some("connected to daemon app-server bridge".to_string());
+        widget.ui_mut().status_message = Some("connected to daemon app-server bridge".to_string());
         let _ = widget.poll_stream_updates(&state);
 
         Ok(Self {
@@ -158,10 +157,7 @@ impl App {
     // Event loop — mirrors upstream `App::run()` main loop body
     // -----------------------------------------------------------------------
 
-    fn event_loop(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
+    fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
             self.widget.draw(terminal)?;
             let mut should_redraw = false;
@@ -253,10 +249,7 @@ impl App {
     }
 
     /// Handle a key press event — mirrors upstream `App::handle_key_event`.
-    fn handle_key_event(
-        &mut self,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<LiveTuiAction> {
+    fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<LiveTuiAction> {
         handle_app_server_tui_key_event(key, &mut self.state, self.widget.ui_mut())
     }
 
@@ -273,8 +266,7 @@ impl App {
         match trimmed {
             "/exit" | "/quit" => return Ok(LiveTuiAction::Detach),
             "/status" => {
-                let approval_ids =
-                    ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
+                let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
                 let approvals = if approval_ids.is_empty() {
                     "none".to_string()
                 } else {

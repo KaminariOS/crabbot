@@ -1,4 +1,5 @@
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use serde::Serialize;
 
 pub const WEBSOCKET_SCHEMA_VERSION: u16 = 1;
 

@@ -1,39 +1,62 @@
-use anyhow::{Context, Result, anyhow, bail};
-use crabbot_protocol::{
-    DaemonPromptRequest, DaemonPromptResponse, DaemonRpcNotification, DaemonRpcRequest,
-    DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcStreamEnvelope,
-    DaemonRpcStreamEvent, DaemonSessionStatusResponse, DaemonStartSessionRequest,
-    DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
-};
-use crossterm::{
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use crabbot_protocol::DaemonPromptRequest;
+use crabbot_protocol::DaemonPromptResponse;
+use crabbot_protocol::DaemonRpcNotification;
+use crabbot_protocol::DaemonRpcRequest;
+use crabbot_protocol::DaemonRpcRequestResponse;
+use crabbot_protocol::DaemonRpcRespondRequest;
+use crabbot_protocol::DaemonRpcStreamEnvelope;
+use crabbot_protocol::DaemonRpcStreamEvent;
+use crabbot_protocol::DaemonSessionStatusResponse;
+use crabbot_protocol::DaemonStartSessionRequest;
+use crabbot_protocol::DaemonStreamEnvelope;
+use crabbot_protocol::DaemonStreamEvent;
+use crabbot_protocol::HealthResponse;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::EnableBracketedPaste;
+use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
+use crossterm::event::{self};
+use crossterm::execute;
+use crossterm::terminal::EnterAlternateScreen;
+use crossterm::terminal::LeaveAlternateScreen;
+use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::enable_raw_mode;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::style::Color;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use reqwest::StatusCode;
-use reqwest::blocking::{Client, Response};
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    env,
-    io::{self, IsTerminal},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use reqwest::blocking::Client;
+use reqwest::blocking::Response;
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::env;
+use std::io::IsTerminal;
+use std::io::{self};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 extern crate self as codex_core;
 

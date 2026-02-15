@@ -1,41 +1,67 @@
-use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand};
-use crabbot_protocol::{
-    DaemonPromptRequest, DaemonPromptResponse, DaemonRpcNotification, DaemonRpcRequest,
-    DaemonRpcRequestResponse, DaemonRpcRespondRequest, DaemonRpcServerRequest,
-    DaemonRpcStreamEnvelope, DaemonRpcStreamEvent, DaemonSessionStatusResponse,
-    DaemonStartSessionRequest, DaemonStreamEnvelope, DaemonStreamEvent, HealthResponse,
-};
-use crossterm::{
-    event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
-    },
-    execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
-};
-use ratatui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
-    style::{Color, Style, Stylize},
-    text::{Line, Span},
-    widgets::{Paragraph, Wrap},
-};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
+use anyhow::bail;
+use clap::Args;
+use clap::Parser;
+use clap::Subcommand;
+use crabbot_protocol::DaemonPromptRequest;
+use crabbot_protocol::DaemonPromptResponse;
+use crabbot_protocol::DaemonRpcNotification;
+use crabbot_protocol::DaemonRpcRequest;
+use crabbot_protocol::DaemonRpcRequestResponse;
+use crabbot_protocol::DaemonRpcRespondRequest;
+use crabbot_protocol::DaemonRpcServerRequest;
+use crabbot_protocol::DaemonRpcStreamEnvelope;
+use crabbot_protocol::DaemonRpcStreamEvent;
+use crabbot_protocol::DaemonSessionStatusResponse;
+use crabbot_protocol::DaemonStartSessionRequest;
+use crabbot_protocol::DaemonStreamEnvelope;
+use crabbot_protocol::DaemonStreamEvent;
+use crabbot_protocol::HealthResponse;
+use crossterm::event::DisableBracketedPaste;
+use crossterm::event::EnableBracketedPaste;
+use crossterm::event::Event;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEventKind;
+use crossterm::event::KeyModifiers;
+use crossterm::event::{self};
+use crossterm::execute;
+use crossterm::terminal::EnterAlternateScreen;
+use crossterm::terminal::LeaveAlternateScreen;
+use crossterm::terminal::disable_raw_mode;
+use crossterm::terminal::enable_raw_mode;
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Constraint;
+use ratatui::layout::Direction;
+use ratatui::layout::Layout;
+use ratatui::style::Color;
+use ratatui::style::Style;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::text::Span;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::blocking::Response;
-use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
-use std::{
-    collections::BTreeMap,
-    env, fs,
-    io::{self, IsTerminal},
-    path::{Path, PathBuf},
-    process::{Command, Stdio},
-    thread,
-    time::{Duration, Instant},
-};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
+use std::collections::BTreeMap;
+use std::env;
+use std::fs;
+use std::io::IsTerminal;
+use std::io::{self};
+use std::path::Path;
+use std::path::PathBuf;
+use std::process::Command;
+use std::process::Stdio;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
@@ -1351,15 +1377,16 @@ fn save_state(path: &Path, state: &CliState) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crabbot_protocol::{
-        DAEMON_STREAM_SCHEMA_VERSION, DaemonApprovalRequired, DaemonSessionState,
-        DaemonStreamEvent, DaemonTurnStreamDelta, Heartbeat,
-    };
-    use std::{
-        io::{Read, Write},
-        net::TcpListener,
-        thread::JoinHandle,
-    };
+    use crabbot_protocol::DAEMON_STREAM_SCHEMA_VERSION;
+    use crabbot_protocol::DaemonApprovalRequired;
+    use crabbot_protocol::DaemonSessionState;
+    use crabbot_protocol::DaemonStreamEvent;
+    use crabbot_protocol::DaemonTurnStreamDelta;
+    use crabbot_protocol::Heartbeat;
+    use std::io::Read;
+    use std::io::Write;
+    use std::net::TcpListener;
+    use std::thread::JoinHandle;
     use tempfile::TempDir;
 
     fn temp_state_path() -> (TempDir, PathBuf) {

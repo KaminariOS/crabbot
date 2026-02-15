@@ -1,32 +1,55 @@
-use std::{
-    collections::HashMap,
-    env,
-    sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
+use std::collections::HashMap;
+use std::env;
+use std::sync::Arc;
+use std::time::Duration;
+use std::time::SystemTime;
+use std::time::UNIX_EPOCH;
 
-use axum::{
-    Json, Router,
-    extract::{
-        Path, Query, State,
-        ws::{Message as WsMessage, WebSocket, WebSocketUpgrade},
-    },
-    http::{HeaderMap, StatusCode},
-    response::IntoResponse,
-    routing::{get, post},
-};
-use crabbot_protocol::{
-    ApiEvent, AppendMessageRequest, AppendMessageResponse, CreateSessionRequest,
-    CreateSessionResponse, GetSessionResponse, HealthResponse, ListMessagesResponse,
-    ListSessionsResponse, LoginRequest, LoginResponse, Message, MessageAppended,
-    RealtimeBootstrapResponse, Session, SessionCreated, WEBSOCKET_SCHEMA_VERSION,
-    WebSocketEnvelope,
-};
-use crabbot_storage::{InMemoryRedisPresenceAdapter, PresenceStore};
+use axum::Json;
+use axum::Router;
+use axum::extract::Path;
+use axum::extract::Query;
+use axum::extract::State;
+use axum::extract::ws::Message as WsMessage;
+use axum::extract::ws::WebSocket;
+use axum::extract::ws::WebSocketUpgrade;
+use axum::http::HeaderMap;
+use axum::http::StatusCode;
+use axum::response::IntoResponse;
+use axum::routing::get;
+use axum::routing::post;
+use crabbot_protocol::ApiEvent;
+use crabbot_protocol::AppendMessageRequest;
+use crabbot_protocol::AppendMessageResponse;
+use crabbot_protocol::CreateSessionRequest;
+use crabbot_protocol::CreateSessionResponse;
+use crabbot_protocol::GetSessionResponse;
+use crabbot_protocol::HealthResponse;
+use crabbot_protocol::ListMessagesResponse;
+use crabbot_protocol::ListSessionsResponse;
+use crabbot_protocol::LoginRequest;
+use crabbot_protocol::LoginResponse;
+use crabbot_protocol::Message;
+use crabbot_protocol::MessageAppended;
+use crabbot_protocol::RealtimeBootstrapResponse;
+use crabbot_protocol::Session;
+use crabbot_protocol::SessionCreated;
+use crabbot_protocol::WEBSOCKET_SCHEMA_VERSION;
+use crabbot_protocol::WebSocketEnvelope;
+use crabbot_storage::InMemoryRedisPresenceAdapter;
+use crabbot_storage::PresenceStore;
 use futures_util::StreamExt;
-use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
-use serde::{Deserialize, Serialize};
-use tokio::sync::{RwLock, broadcast};
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::DecodingKey;
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::Header;
+use jsonwebtoken::Validation;
+use jsonwebtoken::decode;
+use jsonwebtoken::encode;
+use serde::Deserialize;
+use serde::Serialize;
+use tokio::sync::RwLock;
+use tokio::sync::broadcast;
 
 const SESSION_TOKEN_TTL: Duration = Duration::from_secs(60 * 60);
 const REALTIME_CHANNEL_CAPACITY: usize = 256;
@@ -769,17 +792,18 @@ async fn send_envelope(socket: &mut WebSocket, envelope: &WebSocketEnvelope) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{
-        body::Body,
-        http::{Request, StatusCode},
-    };
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::http::StatusCode;
     use http_body_util::BodyExt;
     use serde::de::DeserializeOwned;
     use tokio::task::JoinHandle;
-    use tokio::time::{sleep, timeout};
-    use tokio_tungstenite::{
-        MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message as TungsteniteMessage,
-    };
+    use tokio::time::sleep;
+    use tokio::time::timeout;
+    use tokio_tungstenite::MaybeTlsStream;
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::connect_async;
+    use tokio_tungstenite::tungstenite::Message as TungsteniteMessage;
     use tower::ServiceExt;
 
     type ClientWsStream = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
