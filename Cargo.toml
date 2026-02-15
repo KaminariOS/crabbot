@@ -24,3 +24,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "net",
 tracing = "0.1"
 thiserror = "2"
 url = "2"
+crossterm = "0.28.1"
+
+[patch.crates-io]
+crossterm = { git = "https://github.com/nornagon/crossterm", branch = "nornagon/color-query" }

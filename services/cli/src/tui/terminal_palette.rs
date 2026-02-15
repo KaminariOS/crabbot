@@ -1,4 +1,4 @@
-use crate::color::perceptual_distance;
+use super::color::perceptual_distance;
 use ratatui::style::Color;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
