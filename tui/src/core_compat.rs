@@ -3,6 +3,7 @@
 //! This module keeps transport/event translation isolated from UI files so the
 //! UI can be moved closer to upstream structure without pulling in `codex-core`.
 use super::*;
+use crabbot_protocol::DaemonRpcServerRequest;
 
 #[derive(Debug, Clone)]
 pub(crate) struct UiApprovalRequest {
@@ -44,10 +45,16 @@ pub(crate) fn map_daemon_stream_events(stream_events: &[DaemonStreamEnvelope]) -
                     delta: payload.delta.clone(),
                 });
             }
-            DaemonStreamEvent::TurnCompleted(_) => {
+            DaemonStreamEvent::TurnCompleted(payload) => {
                 events.push(UiEvent::TurnCompleted {
                     status: Some("completed".to_string()),
                 });
+                if !payload.output_summary.trim().is_empty() {
+                    events.push(UiEvent::TranscriptLine(format!(
+                        "[turn complete] {}",
+                        payload.output_summary
+                    )));
+                }
             }
             DaemonStreamEvent::ApprovalRequired(payload) => {
                 events.push(UiEvent::TranscriptLine(format!(
@@ -58,6 +65,9 @@ pub(crate) fn map_daemon_stream_events(stream_events: &[DaemonStreamEnvelope]) -
                     "prompt: {}",
                     payload.prompt
                 )));
+                events.push(UiEvent::TranscriptLine(
+                    "after approval, resume with: /resume".to_string(),
+                ));
             }
             DaemonStreamEvent::Heartbeat(_) => {}
         }
@@ -73,6 +83,7 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
                 events.extend(map_rpc_notification(notification));
             }
             DaemonRpcStreamEvent::ServerRequest(request) => {
+                let summary = summarize_server_request(request);
                 events.push(UiEvent::ApprovalRequired(UiApprovalRequest {
                     key: request_id_key_for_cli(&request.request_id),
                     request_id: request.request_id.clone(),
@@ -83,6 +94,7 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
                         .and_then(Value::as_str)
                         .map(ToString::to_string),
                 }));
+                events.push(UiEvent::TranscriptLine(summary));
             }
             DaemonRpcStreamEvent::DecodeError(error) => {
                 events.push(UiEvent::TranscriptLine(format!(
@@ -148,6 +160,41 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 ))]
             })
             .unwrap_or_default(),
+        "item/commandExecution/begin" => notification
+            .params
+            .get("command")
+            .and_then(Value::as_array)
+            .map(|parts| {
+                let joined = parts
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                vec![UiEvent::TranscriptLine(format!("[exec start] {joined}"))]
+            })
+            .unwrap_or_else(|| vec![UiEvent::StatusMessage("running command...".to_string())]),
+        "item/commandExecution/end" => {
+            let exit_code = notification
+                .params
+                .get("exitCode")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            vec![UiEvent::TranscriptLine(format!(
+                "[exec done] exit_code={exit_code}"
+            ))]
+        }
+        "item/fileChange/begin" => vec![UiEvent::StatusMessage("applying patch...".to_string())],
+        "item/fileChange/end" => vec![UiEvent::StatusMessage("patch applied".to_string())],
+        "item/mcpToolCall/begin" => {
+            let label = notification
+                .params
+                .get("toolName")
+                .or_else(|| notification.params.get("tool"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            vec![UiEvent::TranscriptLine(format!("[mcp call] {label}"))]
+        }
+        "item/mcpToolCall/end" => vec![UiEvent::StatusMessage("mcp call completed".to_string())],
         "item/completed" => notification
             .params
             .get("item")
@@ -178,6 +225,12 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .map(ToString::to_string);
             vec![UiEvent::TurnCompleted { status }]
         }
+        "turn/aborted" => vec![UiEvent::TurnCompleted {
+            status: Some("aborted".to_string()),
+        }],
+        "turn/failed" => vec![UiEvent::TurnCompleted {
+            status: Some("failed".to_string()),
+        }],
         "turn/diff/updated" => vec![UiEvent::StatusMessage("diff updated".to_string())],
         "thread/tokenUsage/updated" => {
             vec![UiEvent::StatusMessage("token usage updated".to_string())]
@@ -191,6 +244,40 @@ fn delta_from_params(params: &Value) -> Option<&str> {
         .get("delta")
         .or_else(|| params.get("outputDelta"))
         .and_then(Value::as_str)
+}
+
+fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {
+    let key = request_id_key_for_cli(&request.request_id);
+    match request.method.as_str() {
+        "item/commandExecution/requestApproval" => {
+            let command = request
+                .params
+                .get("command")
+                .and_then(Value::as_array)
+                .map(|parts: &Vec<Value>| {
+                    parts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .filter(|value: &String| !value.is_empty())
+                .unwrap_or_else(|| "command".to_string());
+            format!("[approval required] request_id={key} command={command}")
+        }
+        "item/fileChange/requestApproval" => {
+            let reason = request
+                .params
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("file change");
+            format!("[approval required] request_id={key} file_change={reason}")
+        }
+        _ => format!(
+            "[approval required] request_id={key} method={}",
+            request.method
+        ),
+    }
 }
 
 pub(crate) fn start_thread(state: &CliState) -> Result<String> {
