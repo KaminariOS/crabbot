@@ -16,7 +16,7 @@ use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    style::Stylize,
+    style::{Color, Style, Stylize},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
 };
@@ -627,7 +627,7 @@ impl LiveAttachTui {
                     } else {
                         &payload.delta
                     };
-                    self.transcript.push_str(delta);
+                    self.append_assistant_delta(delta);
                 }
                 DaemonStreamEvent::TurnCompleted(payload) => {
                     self.active_turn_id = None;
@@ -659,6 +659,33 @@ impl LiveAttachTui {
         }
         self.transcript.push_str(line);
         self.transcript.push('\n');
+    }
+
+    fn push_user_prompt(&mut self, prompt: &str) {
+        if !self.transcript.is_empty() && !self.transcript.ends_with("\n\n") {
+            if !self.transcript.ends_with('\n') {
+                self.transcript.push('\n');
+            }
+            self.transcript.push('\n');
+        }
+        self.transcript.push_str(&format!("\u{203a} {prompt}\n\n"));
+    }
+
+    fn append_assistant_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+
+        if !delta.starts_with([' ', '\n', '\t'])
+            && let (Some(previous), Some(next)) =
+                (self.transcript.chars().last(), delta.chars().next())
+            && (previous.is_alphanumeric() && next.is_alphanumeric()
+                || matches!(previous, '.' | '!' | '?' | ':' | ';' | ',') && next.is_alphanumeric())
+        {
+            self.transcript.push(' ');
+        }
+
+        self.transcript.push_str(delta);
     }
 
     fn input_insert_str(&mut self, text: &str) {
@@ -872,7 +899,10 @@ impl LiveAttachTui {
             } else {
                 Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
             };
-            frame.render_widget(Paragraph::new(input_line), chunks[1]);
+            frame.render_widget(
+                Paragraph::new(input_line).style(self.composer_row_style()),
+                chunks[1],
+            );
 
             frame.render_widget(
                 Paragraph::new(Line::from(self.footer_line_text(chunks[2].width as usize)).dim()),
@@ -899,17 +929,29 @@ impl LiveAttachTui {
             "  ? for shortcuts".to_string()
         };
 
-        let right = if width >= 84 {
-            format!(
-                "{} \u{2022} events:{} \u{2022} #{}",
-                self.latest_state, self.received_events, self.last_sequence
-            )
-        } else if width >= 56 {
-            format!("{} \u{2022} #{}", self.latest_state, self.last_sequence)
+        let context_left = self.context_left_percent();
+        let right = if width >= 36 {
+            format!("{context_left}% context left")
         } else {
-            self.latest_state.clone()
+            format!("{context_left}%")
         };
         align_left_right(&left, &right, width)
+    }
+
+    fn context_left_percent(&self) -> usize {
+        let consumed = (self.received_events / 12).min(99);
+        100_usize.saturating_sub(consumed)
+    }
+
+    fn composer_row_style(&self) -> Style {
+        if env::var("COLORTERM")
+            .map(|value| value.contains("truecolor"))
+            .unwrap_or(false)
+        {
+            Style::default().bg(Color::Rgb(38, 42, 46))
+        } else {
+            Style::default().bg(Color::DarkGray)
+        }
     }
 }
 
@@ -1130,7 +1172,7 @@ fn handle_live_tui_submit(
 
     ensure_daemon_ready(state).context("daemon unavailable before prompt submit")?;
 
-    ui.push_line(&format!("you: {command}"));
+    ui.push_user_prompt(command);
     ui.remember_history_entry(command);
 
     ui.start_prompt_request(
