@@ -29,117 +29,370 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
+pub(super) use crate::core_compat::AppEvent;
+pub(super) use crate::core_compat::AppEventSender;
+pub(super) use crate::core_compat::AppExitInfo;
+pub(super) use crate::core_compat::ExitMode;
+pub(super) use crate::core_compat::ExitReason;
+pub(super) use crate::core_compat::LiveTuiAction;
 use chatwidget::ChatWidget;
 use chatwidget::LiveAttachTui;
 use slash_commands::find_builtin_command;
 use text_formatting::proper_join;
 use version::CODEX_CLI_VERSION;
 
-#[derive(Debug)]
-enum AppEvent {
-    Key(crossterm::event::KeyEvent),
-    Paste(String),
-    Resize,
-    Tick,
+// ---------------------------------------------------------------------------
+// App struct — mirrors upstream `app::App` but backed by app-server transport
+// ---------------------------------------------------------------------------
+
+/// Top-level application state for the TUI.
+///
+/// Mirrors upstream `App` from `app.rs` in structure: owns the `ChatWidget`,
+/// tracks the active thread, and drives the terminal event loop. All backend
+/// calls go through `core_compat` instead of `codex-core`.
+pub(crate) struct App {
+    /// The active chat widget.
+    widget: ChatWidget,
+    /// Shared CLI state (daemon endpoint, sessions, auth).
+    state: CliState,
+    /// ID of the active app-server thread.
+    thread_id: String,
 }
+
+impl App {
+    /// Create a new `App` for an interactive TUI session.
+    ///
+    /// Mirrors upstream `App::run()` initialization: ensures the daemon is
+    /// ready, starts or reuses a thread, and creates the initial `ChatWidget`.
+    pub(crate) fn new(args: TuiArgs, mut state: CliState) -> Result<Self> {
+        ensure_daemon_ready(&state)?;
+        let thread_id = args
+            .thread_id
+            .or_else(|| state.last_thread_id.clone())
+            .map(Ok)
+            .unwrap_or_else(|| start_thread(&state))?;
+        state.last_thread_id = Some(thread_id.clone());
+
+        let mut widget = ChatWidget::new(thread_id.clone());
+        widget.ui_mut().status_message =
+            Some("connected to daemon app-server bridge".to_string());
+        let _ = widget.poll_stream_updates(&state);
+
+        Ok(Self {
+            widget,
+            state,
+            thread_id,
+        })
+    }
+
+    /// Create an `App` that attaches to an existing daemon session.
+    pub(crate) fn attach(
+        session_id: String,
+        initial_events: Vec<DaemonStreamEnvelope>,
+        mut state: CliState,
+    ) -> Result<Self> {
+        let mut widget = ChatWidget::new(session_id.clone());
+        {
+            let ui = widget.ui_mut();
+            ui.latest_state = cached_session_state_label(&state, &session_id)
+                .unwrap_or("unknown")
+                .to_string();
+            ui.apply_stream_events(&initial_events);
+            ui.status_message = Some("attached to daemon app-server bridge".to_string());
+        }
+        state.last_thread_id = Some(session_id.clone());
+
+        Ok(Self {
+            widget,
+            state,
+            thread_id: session_id,
+        })
+    }
+
+    /// Run the interactive TUI event loop.
+    ///
+    /// This mirrors upstream `App::run()` — sets up the terminal, enters the
+    /// main loop, then restores the terminal on exit.
+    pub(crate) fn run(&mut self) -> Result<AppExitInfo> {
+        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+            return Ok(AppExitInfo {
+                thread_id: Some(self.thread_id.clone()),
+                exit_reason: ExitReason::UserRequested,
+            });
+        }
+
+        enable_raw_mode().context("enable raw mode for app-server tui")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
+            .context("enter alternate screen for app-server tui")?;
+        let backend = CrosstermBackend::new(stdout);
+        let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
+        terminal.clear().context("clear app-server tui terminal")?;
+
+        let loop_result = self.event_loop(&mut terminal);
+
+        let _ = disable_raw_mode();
+        let _ = execute!(
+            terminal.backend_mut(),
+            DisableBracketedPaste,
+            LeaveAlternateScreen
+        );
+        let _ = terminal.show_cursor();
+
+        loop_result?;
+        self.state.last_thread_id = Some(self.widget.session_id().to_string());
+
+        Ok(AppExitInfo {
+            thread_id: Some(self.widget.session_id().to_string()),
+            exit_reason: ExitReason::UserRequested,
+        })
+    }
+
+    /// Consume the `App`, returning the final `CliState` so the caller can
+    /// persist it.
+    pub(crate) fn into_state(self) -> CliState {
+        self.state
+    }
+
+    // -----------------------------------------------------------------------
+    // Event loop — mirrors upstream `App::run()` main loop body
+    // -----------------------------------------------------------------------
+
+    fn event_loop(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
+        loop {
+            self.widget.draw(terminal)?;
+            let mut should_redraw = false;
+
+            // Poll terminal for input events.
+            if event::poll(TUI_EVENT_WAIT_STEP).context("poll tui input event")? {
+                let app_event = match event::read().context("read tui input event")? {
+                    Event::Key(key_event) => {
+                        if key_event.kind != KeyEventKind::Press {
+                            continue;
+                        }
+                        AppEvent::Key(key_event)
+                    }
+                    Event::Paste(pasted) => AppEvent::Paste(pasted),
+                    Event::Resize(_, _) => AppEvent::Resize,
+                    _ => continue,
+                };
+
+                match self.handle_event(app_event)? {
+                    LiveTuiAction::Continue => {}
+                    LiveTuiAction::Detach => return Ok(()),
+                }
+                should_redraw = true;
+            }
+
+            // Tick: poll stream for daemon events.
+            match self.handle_event(AppEvent::Tick)? {
+                LiveTuiAction::Continue => {}
+                LiveTuiAction::Detach => return Ok(()),
+            }
+
+            if self.widget.poll_stream_updates(&self.state)? {
+                should_redraw = true;
+            }
+
+            if !should_redraw {
+                thread::sleep(TUI_STREAM_POLL_INTERVAL);
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Event handling — mirrors upstream `App::handle_event()`
+    // -----------------------------------------------------------------------
+
+    /// Process a single `AppEvent` and return the action the loop should take.
+    ///
+    /// This is the central dispatch point, mirroring upstream's enormous
+    /// `handle_event`. Currently handles the essential events; additional
+    /// upstream event types will be added incrementally.
+    fn handle_event(&mut self, event: AppEvent) -> Result<LiveTuiAction> {
+        match event {
+            AppEvent::Key(key_event) => self.handle_key_event(key_event),
+            AppEvent::Paste(pasted) => {
+                self.widget.ui_mut().input_insert_str(&pasted);
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::Resize => Ok(LiveTuiAction::Continue),
+            AppEvent::Tick => Ok(LiveTuiAction::Continue),
+            AppEvent::SubmitInput(text) => self.handle_submit(&text),
+            AppEvent::NewSession => {
+                let thread_id = start_thread(&self.state)?;
+                let ui = self.widget.ui_mut();
+                ui.session_id = thread_id.clone();
+                ui.active_turn_id = None;
+                ui.pending_approvals.clear();
+                ui.push_line(&format!("[thread switched] {thread_id}"));
+                ui.status_message = Some("started new thread".to_string());
+                self.state.last_thread_id = Some(thread_id.clone());
+                self.thread_id = thread_id;
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::Interrupt => {
+                let ui = self.widget.ui_mut();
+                if let Some(turn_id) = ui.active_turn_id.clone() {
+                    interrupt_turn(&self.state, &ui.session_id, &turn_id)?;
+                    ui.status_message = Some("interrupt requested".to_string());
+                } else {
+                    ui.status_message = Some("no running turn".to_string());
+                }
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::Exit(_mode) => Ok(LiveTuiAction::Detach),
+            AppEvent::StreamUpdate(envelopes) => {
+                self.widget.ui_mut().apply_rpc_stream_events(&envelopes);
+                Ok(LiveTuiAction::Continue)
+            }
+        }
+    }
+
+    /// Handle a key press event — mirrors upstream `App::handle_key_event`.
+    fn handle_key_event(
+        &mut self,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<LiveTuiAction> {
+        handle_app_server_tui_key_event(key, &mut self.state, self.widget.ui_mut())
+    }
+
+    /// Handle submitted user input (from Enter key or programmatic submit).
+    fn handle_submit(&mut self, input: &str) -> Result<LiveTuiAction> {
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Ok(LiveTuiAction::Continue);
+        }
+        let ui = self.widget.ui_mut();
+        ui.hide_shortcuts_overlay();
+        ui.remember_history_entry(trimmed);
+
+        match trimmed {
+            "/exit" | "/quit" => return Ok(LiveTuiAction::Detach),
+            "/status" => {
+                let approval_ids =
+                    ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
+                let approvals = if approval_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    proper_join(&approval_ids)
+                };
+                ui.status_message = Some(format!(
+                    "thread={} approvals={} seq={} v={}",
+                    ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
+                ));
+                return Ok(LiveTuiAction::Continue);
+            }
+            "/refresh" => {
+                ui.status_message = Some("refreshing stream...".to_string());
+                return Ok(LiveTuiAction::Continue);
+            }
+            "/new" => {
+                // Delegate to the NewSession AppEvent path.
+                return self.handle_event(AppEvent::NewSession);
+            }
+            "/interrupt" => {
+                return self.handle_event(AppEvent::Interrupt);
+            }
+            "/resume" => {
+                if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
+                    ui.session_id = thread_id.clone();
+                    self.state.last_thread_id = Some(thread_id);
+                    ui.status_message = Some("thread resumed".to_string());
+                } else {
+                    ui.status_message = Some("resume returned no thread id".to_string());
+                }
+                return Ok(LiveTuiAction::Continue);
+            }
+            _ => {}
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("/approve") {
+            return handle_app_server_approval_decision(
+                &mut self.state,
+                self.widget.ui_mut(),
+                rest.trim(),
+                true,
+            )
+            .map(|_| LiveTuiAction::Continue);
+        }
+        if let Some(rest) = trimmed.strip_prefix("/deny") {
+            return handle_app_server_approval_decision(
+                &mut self.state,
+                self.widget.ui_mut(),
+                rest.trim(),
+                false,
+            )
+            .map(|_| LiveTuiAction::Continue);
+        }
+
+        if let Some(command) = trimmed
+            .strip_prefix('/')
+            .and_then(|value| value.split_whitespace().next())
+            && find_builtin_command(command, true, true, true, true).is_some()
+        {
+            let ui = self.widget.ui_mut();
+            ui.status_message = Some(format!(
+                "slash command /{command} is not implemented in crabbot app-server tui yet"
+            ));
+            return Ok(LiveTuiAction::Continue);
+        }
+
+        let ui = self.widget.ui_mut();
+        ui.push_user_prompt(trimmed);
+        if let Some(turn_id) = start_turn(&self.state, &ui.session_id, trimmed)? {
+            ui.active_turn_id = Some(turn_id);
+        }
+        ui.status_message = Some("waiting for response...".to_string());
+        Ok(LiveTuiAction::Continue)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Public entry points — backward compatible with existing callers
+// ---------------------------------------------------------------------------
 
 pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
-    ensure_daemon_ready(state)?;
-    let mut thread_id = args.thread_id.or_else(|| state.last_thread_id.clone());
-    if thread_id.is_none() {
-        thread_id = Some(start_thread(state)?);
-    }
-    let Some(thread_id) = thread_id else {
-        bail!("failed to initialize app-server thread");
-    };
-    state.last_thread_id = Some(thread_id.clone());
+    let mut app = App::new(args, state.clone())?;
 
-    if io::stdin().is_terminal() && io::stdout().is_terminal() {
-        return handle_tui_interactive(thread_id, state);
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        *state = app.into_state();
+        return Ok(CommandOutput::Json(json!({
+            "ok": true,
+            "action": "tui",
+            "thread_id": state.last_thread_id,
+            "daemon_endpoint": state.config.daemon_endpoint,
+        })));
     }
 
-    Ok(CommandOutput::Json(json!({
-        "ok": true,
-        "action": "tui",
-        "thread_id": thread_id,
-        "daemon_endpoint": state.config.daemon_endpoint,
-    })))
-}
-
-fn handle_tui_interactive(thread_id: String, state: &mut CliState) -> Result<CommandOutput> {
-    let mut widget = ChatWidget::new(thread_id.clone());
-    widget.ui_mut().status_message = Some("connected to daemon app-server bridge".to_string());
-    let _ = widget.poll_stream_updates(state);
-
-    enable_raw_mode().context("enable raw mode for app-server tui")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter alternate screen for app-server tui")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
-    terminal.clear().context("clear app-server tui terminal")?;
-
-    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
-
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
-
-    loop_result?;
-    state.last_thread_id = Some(widget.session_id().to_string());
+    let exit_info = app.run()?;
+    *state = app.into_state();
     Ok(CommandOutput::Text(format!(
         "thread={} detached",
-        widget.session_id()
+        exit_info.thread_id.as_deref().unwrap_or("unknown")
     )))
 }
 
-fn run_app_server_tui_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    widget: &mut ChatWidget,
+pub fn handle_attach_tui_interactive(
+    session_id: String,
+    initial_events: Vec<DaemonStreamEnvelope>,
     state: &mut CliState,
-) -> Result<()> {
-    loop {
-        widget.draw(terminal)?;
-        let mut should_redraw = false;
-
-        if event::poll(TUI_EVENT_WAIT_STEP).context("poll app-server tui input event")? {
-            match event::read().context("read app-server tui input event")? {
-                Event::Key(key_event) => {
-                    if key_event.kind != KeyEventKind::Press {
-                        continue;
-                    }
-                    match widget.on_event(AppEvent::Key(key_event), state)? {
-                        LiveTuiAction::Continue => {}
-                        LiveTuiAction::Detach => return Ok(()),
-                    }
-                    should_redraw = true;
-                }
-                Event::Paste(pasted) => {
-                    let _ = widget.on_event(AppEvent::Paste(pasted), state)?;
-                    should_redraw = true;
-                }
-                Event::Resize(_, _) => {
-                    let _ = widget.on_event(AppEvent::Resize, state)?;
-                    should_redraw = true;
-                }
-                _ => {}
-            }
-        }
-
-        let _ = widget.on_event(AppEvent::Tick, state)?;
-        if widget.poll_stream_updates(state)? {
-            should_redraw = true;
-        }
-
-        if !should_redraw {
-            thread::sleep(TUI_STREAM_POLL_INTERVAL);
-        }
-    }
+) -> Result<CommandOutput> {
+    let mut app = App::attach(session_id, initial_events, state.clone())?;
+    let exit_info = app.run()?;
+    *state = app.into_state();
+    Ok(CommandOutput::Text(format!(
+        "session={} detached",
+        exit_info.thread_id.as_deref().unwrap_or("unknown")
+    )))
 }
+
+// ---------------------------------------------------------------------------
+// Key event handling
+// ---------------------------------------------------------------------------
 
 fn handle_app_server_tui_key_event(
     key: crossterm::event::KeyEvent,
@@ -224,6 +477,8 @@ fn handle_app_server_tui_key_event(
     Ok(LiveTuiAction::Continue)
 }
 
+/// Legacy submit handler — keeps the inline submit flow for the key event path.
+/// The `App::handle_submit` method is the canonical path going forward.
 fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
     let input = ui.take_input();
     let trimmed = input.trim();
@@ -345,51 +600,9 @@ fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) 
     Ok(true)
 }
 
-pub fn handle_attach_tui_interactive(
-    session_id: String,
-    initial_events: Vec<DaemonStreamEnvelope>,
-    state: &mut CliState,
-) -> Result<CommandOutput> {
-    let mut widget = ChatWidget::new(session_id.clone());
-    {
-        let ui = widget.ui_mut();
-        ui.latest_state = cached_session_state_label(state, &session_id)
-            .unwrap_or("unknown")
-            .to_string();
-        ui.apply_stream_events(&initial_events);
-        ui.status_message = Some("attached to daemon app-server bridge".to_string());
-    }
-
-    enable_raw_mode().context("enable raw mode for attach tui")?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-        .context("enter alternate screen for attach tui")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("create attach tui terminal")?;
-    terminal.clear().context("clear attach tui terminal")?;
-
-    let loop_result = run_app_server_tui_loop(&mut terminal, &mut widget, state);
-
-    let _ = disable_raw_mode();
-    let _ = execute!(
-        terminal.backend_mut(),
-        DisableBracketedPaste,
-        LeaveAlternateScreen
-    );
-    let _ = terminal.show_cursor();
-
-    loop_result?;
-    state.last_thread_id = Some(widget.session_id().to_string());
-    Ok(CommandOutput::Text(format!(
-        "session={} detached",
-        widget.session_id()
-    )))
-}
-
-enum LiveTuiAction {
-    Continue,
-    Detach,
-}
+// ---------------------------------------------------------------------------
+// Utility functions
+// ---------------------------------------------------------------------------
 
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {

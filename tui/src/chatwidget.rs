@@ -764,6 +764,7 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
 }
 
 use super::AppEvent;
+use super::LiveTuiAction;
 
 pub(super) struct ChatWidget {
     ui: LiveAttachTui,
@@ -805,7 +806,10 @@ impl ChatWidget {
                 self.ui.input_insert_str(&pasted);
                 Ok(LiveTuiAction::Continue)
             }
+            // Terminal events that don't require special handling.
             AppEvent::Resize | AppEvent::Tick => Ok(LiveTuiAction::Continue),
+            // App-level events are handled by the App struct, not the widget.
+            _ => Ok(LiveTuiAction::Continue),
         }
     }
 }

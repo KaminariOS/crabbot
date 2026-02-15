@@ -2,8 +2,15 @@
 //!
 //! This module keeps transport/event translation isolated from UI files so the
 //! UI can be moved closer to upstream structure without pulling in `codex-core`.
+//!
+//! ## Architecture
+//! Upstream codex-tui depends on `codex-core` for event types, config, auth, and
+//! protocol handling. Crabbot instead talks to an app-server daemon over HTTP.
+//! This module provides the same *structural types* the rest of the TUI expects
+//! (events, exit info, config shims) without pulling in `codex-core`.
 use super::*;
 use crabbot_protocol::DaemonRpcServerRequest;
+use std::sync::mpsc;
 
 pub mod config {
     pub mod types {
@@ -389,4 +396,97 @@ pub(crate) fn stream_events(
         state.config.auth_token.as_deref(),
         Some(since_sequence),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Application-level event types — mirrors upstream `app_event.rs`
+// ---------------------------------------------------------------------------
+
+/// Application-level events used to coordinate UI actions.
+///
+/// This mirrors the upstream `AppEvent` from `app_event.rs` but is adapted for
+/// app-server transport. Upstream variants that depend on `codex-core` protocol
+/// types are replaced with app-server equivalents.
+#[derive(Debug)]
+pub(crate) enum AppEvent {
+    // -- Terminal input events (same as upstream) --
+    Key(crossterm::event::KeyEvent),
+    Paste(String),
+    Resize,
+    Tick,
+
+    // -- App-server specific events --
+    /// Incoming stream events from the app-server daemon.
+    StreamUpdate(Vec<DaemonRpcStreamEnvelope>),
+
+    /// User submitted input from the composer.
+    SubmitInput(String),
+
+    /// Request to start a new session / thread.
+    NewSession,
+
+    /// Request to interrupt the active turn.
+    Interrupt,
+
+    /// Request to exit the application.
+    Exit(ExitMode),
+}
+
+/// The exit strategy requested by the UI layer.
+///
+/// Mirrors upstream `ExitMode` from `app_event.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExitMode {
+    /// Shut down cleanly and exit.
+    ShutdownFirst,
+    /// Exit immediately without cleanup.
+    Immediate,
+}
+
+/// Reason the app exited, for reporting to the calling process.
+///
+/// Mirrors upstream `ExitReason`.
+#[derive(Debug, Clone)]
+pub(crate) enum ExitReason {
+    UserRequested,
+    Fatal(String),
+}
+
+/// Information returned when the app exits.
+///
+/// Mirrors upstream `AppExitInfo`.
+#[derive(Debug)]
+pub(crate) struct AppExitInfo {
+    pub(crate) thread_id: Option<String>,
+    pub(crate) exit_reason: ExitReason,
+}
+
+/// What the TUI event loop should do after processing an event.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum LiveTuiAction {
+    Continue,
+    Detach,
+}
+
+/// Sender half for `AppEvent`s. Cloneable so widgets can fire events without
+/// direct access to the `App` struct.
+///
+/// Mirrors upstream `AppEventSender` from `app_event_sender.rs`.
+#[derive(Clone, Debug)]
+pub(crate) struct AppEventSender {
+    tx: mpsc::Sender<AppEvent>,
+}
+
+impl AppEventSender {
+    pub(crate) fn new(tx: mpsc::Sender<AppEvent>) -> Self {
+        Self { tx }
+    }
+
+    /// Send an event. Errors are logged and swallowed so callers don't need to
+    /// handle a disconnected channel (which only happens during shutdown).
+    pub(crate) fn send(&self, event: AppEvent) {
+        if let Err(e) = self.tx.send(event) {
+            tracing::error!("failed to send AppEvent: {e}");
+        }
+    }
 }
