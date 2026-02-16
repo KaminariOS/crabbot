@@ -34,6 +34,10 @@ unicode-width = "0.2"
 derive_more = { version = "2", features = ["is_variant"] }
 tracing.workspace = true
 rand = "0.9"
+pulldown-cmark = "0.10"
+itertools = "0.14.0"
+tree-sitter-highlight = "0.25"
+tree-sitter-bash = "0.25"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

@@ -145,6 +145,9 @@ mod frames;
 mod insert_history;
 mod key_hint;
 pub mod live_wrap;
+mod markdown;
+mod markdown_render;
+mod markdown_stream;
 mod mention_codec;
 mod notifications;
 mod shimmer;
@@ -156,33 +159,7 @@ pub mod tui;
 mod version;
 mod wrapping;
 
-mod render {
-    pub mod line_utils {
-        use ratatui::text::Line;
-        use ratatui::text::Span;
-
-        pub fn line_to_static(line: &Line<'_>) -> Line<'static> {
-            Line {
-                style: line.style,
-                alignment: line.alignment,
-                spans: line
-                    .spans
-                    .iter()
-                    .map(|s| Span {
-                        style: s.style,
-                        content: std::borrow::Cow::Owned(s.content.to_string()),
-                    })
-                    .collect(),
-            }
-        }
-
-        pub fn push_owned_lines<'a>(src: &[Line<'a>], out: &mut Vec<Line<'static>>) {
-            for line in src {
-                out.push(line_to_static(line));
-            }
-        }
-    }
-}
+mod render;
 
 pub use app::handle_attach_tui_interactive;
 pub use app::handle_tui;
