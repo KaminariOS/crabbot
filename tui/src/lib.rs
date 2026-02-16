@@ -64,6 +64,213 @@ pub mod config {
     pub mod types {
         pub use crate::core_compat::config::types::NotificationMethod;
     }
+
+    /// Stub for `codex_core::config::Config` – only the fields that TUI modules
+    /// actually access are included.
+    #[derive(Debug, Clone)]
+    pub struct Config {
+        pub cwd: std::path::PathBuf,
+        pub model: String,
+        pub model_provider_id: String,
+        pub model_provider: ConfigModelProvider,
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ConfigModelProvider {
+        pub name: String,
+    }
+
+    /// Stub for `codex_core::config::log_dir`.
+    pub fn log_dir(_config: &Config) -> Result<std::path::PathBuf, std::io::Error> {
+        let mut dir = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+        dir.push("crabbot");
+        dir.push("logs");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+}
+
+pub mod protocol {
+    use serde::Deserialize;
+    use serde::Serialize;
+    use std::path::PathBuf;
+
+    /// File change description for diff rendering.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum FileChange {
+        Add {
+            content: String,
+        },
+        Delete {
+            content: String,
+        },
+        Update {
+            unified_diff: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            move_path: Option<PathBuf>,
+        },
+    }
+
+    /// Sandbox execution policy.
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "kebab-case")]
+    pub enum SandboxPolicy {
+        #[serde(rename = "danger-full-access")]
+        DangerFullAccess,
+        #[serde(rename = "read-only")]
+        ReadOnly {
+            #[serde(default)]
+            access: ReadOnlyAccess,
+        },
+        #[serde(rename = "external-sandbox")]
+        ExternalSandbox {
+            #[serde(default)]
+            network_access: NetworkAccess,
+        },
+        #[serde(rename = "workspace-write")]
+        WorkspaceWrite {
+            #[serde(default)]
+            writable_roots: Vec<PathBuf>,
+            #[serde(default)]
+            read_only_access: ReadOnlyAccess,
+            #[serde(default)]
+            network_access: bool,
+            #[serde(default)]
+            exclude_tmpdir_env_var: bool,
+            #[serde(default)]
+            exclude_slash_tmp: bool,
+        },
+    }
+
+    impl SandboxPolicy {
+        pub fn new_read_only_policy() -> Self {
+            SandboxPolicy::ReadOnly {
+                access: ReadOnlyAccess::FullAccess,
+            }
+        }
+
+        pub fn new_workspace_write_policy() -> Self {
+            SandboxPolicy::WorkspaceWrite {
+                writable_roots: vec![],
+                read_only_access: ReadOnlyAccess::FullAccess,
+                network_access: false,
+                exclude_tmpdir_env_var: false,
+                exclude_slash_tmp: false,
+            }
+        }
+    }
+
+    impl std::fmt::Display for SandboxPolicy {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                SandboxPolicy::DangerFullAccess => write!(f, "danger-full-access"),
+                SandboxPolicy::ReadOnly { .. } => write!(f, "read-only"),
+                SandboxPolicy::ExternalSandbox { .. } => write!(f, "external-sandbox"),
+                SandboxPolicy::WorkspaceWrite { .. } => write!(f, "workspace-write"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ReadOnlyAccess {
+        Restricted,
+        #[default]
+        FullAccess,
+    }
+
+    impl ReadOnlyAccess {
+        pub fn has_full_disk_read_access(&self) -> bool {
+            matches!(self, ReadOnlyAccess::FullAccess)
+        }
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum NetworkAccess {
+        #[default]
+        Restricted,
+        Enabled,
+    }
+
+    impl NetworkAccess {
+        pub fn is_enabled(self) -> bool {
+            matches!(self, NetworkAccess::Enabled)
+        }
+    }
+
+    impl std::fmt::Display for NetworkAccess {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                NetworkAccess::Restricted => write!(f, "restricted"),
+                NetworkAccess::Enabled => write!(f, "enabled"),
+            }
+        }
+    }
+
+    /// Review decision for command/patch approvals.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ReviewDecision {
+        Approve,
+        Deny,
+        Explain,
+    }
+
+    /// Source of an exec command.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ExecCommandSource {
+        Agent,
+        User,
+    }
+
+    /// Stub for `codex_core::protocol::Op` – submission operation.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    pub enum Op {
+        Interrupt,
+        UserInput { items: Vec<serde_json::Value> },
+        Shutdown,
+    }
+}
+
+pub mod git_info {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    /// Walk up directory hierarchy looking for `.git` — matches upstream behavior.
+    pub fn get_git_repo_root(base_dir: &Path) -> Option<PathBuf> {
+        let mut dir = base_dir.to_path_buf();
+        loop {
+            if dir.join(".git").exists() {
+                return Some(dir);
+            }
+            if !dir.pop() {
+                break;
+            }
+        }
+        None
+    }
+}
+
+pub mod parse_command {
+    /// Extract shell name and script from a command like `["bash", "-lc", "echo hello"]`.
+    pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
+        if command.len() >= 3 {
+            let shell = command[0].as_str();
+            let basename = shell.rsplit('/').next().unwrap_or(shell);
+            let flag = command[1].as_str();
+            if matches!(basename, "bash" | "zsh" | "sh" | "fish" | "dash")
+                && matches!(flag, "-c" | "-lc" | "-ic")
+            {
+                return Some((basename, command[2].as_str()));
+            }
+        }
+        None
+    }
 }
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -133,15 +340,16 @@ struct ConfigSetArgs {
     clear_auth_token: bool,
 }
 
+mod additional_dirs;
 mod app;
-#[path = "bottom_pane/slash_commands.rs"]
-mod slash_commands;
 mod ascii_animation;
 mod chatwidget;
 mod color;
 mod core_compat;
 mod custom_terminal;
 mod cwd_prompt;
+mod diff_render;
+mod exec_command;
 mod external_editor;
 mod frames;
 mod get_git_diff;
@@ -158,6 +366,8 @@ mod render;
 mod selection_list;
 mod shimmer;
 mod slash_command;
+#[path = "bottom_pane/slash_commands.rs"]
+mod slash_commands;
 mod style;
 mod terminal_palette;
 mod text_formatting;

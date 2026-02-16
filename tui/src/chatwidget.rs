@@ -772,7 +772,6 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .unwrap_or(0)
 }
 
-
 pub(crate) struct ChatWidget {
     ui: LiveAttachTui,
 }

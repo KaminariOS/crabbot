@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::chatwidget::ChatWidget;
+use crate::chatwidget::LiveAttachTui;
 pub(super) use crate::core_compat::AppEvent;
 pub(super) use crate::core_compat::AppEventSender;
 pub(super) use crate::core_compat::AppExitInfo;
@@ -17,8 +19,6 @@ pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
 use crate::slash_commands::find_builtin_command;
-use crate::chatwidget::ChatWidget;
-use crate::chatwidget::LiveAttachTui;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
 
@@ -564,7 +564,10 @@ fn handle_app_server_approval_decision(
     Ok(())
 }
 
-pub(crate) fn poll_app_server_tui_stream_updates(state: &CliState, ui: &mut LiveAttachTui) -> Result<bool> {
+pub(crate) fn poll_app_server_tui_stream_updates(
+    state: &CliState,
+    ui: &mut LiveAttachTui,
+) -> Result<bool> {
     let events = stream_events(state, ui.last_sequence)?;
     if events.is_empty() {
         return Ok(false);
