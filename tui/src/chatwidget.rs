@@ -122,6 +122,11 @@ pub(crate) struct LiveAttachTui {
     history_scroll_offset: u16,
 }
 
+pub(crate) struct ReviewCommitPickerEntry {
+    pub(crate) sha: String,
+    pub(crate) subject: String,
+}
+
 impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
         let (ui_event_tx_raw, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
@@ -1013,6 +1018,122 @@ impl LiveAttachTui {
             }),
         );
         self.bottom_pane.show_view(Box::new(view));
+    }
+
+    pub(crate) fn open_review_popup(&mut self) {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let items = vec![
+            crate::bottom_pane::SelectionItem {
+                name: "Review against a base branch".to_string(),
+                description: Some("(PR Style)".to_string()),
+                actions: vec![Box::new({
+                    let cwd = cwd.clone();
+                    move |sender| {
+                        sender.send(UiAppEvent::OpenReviewBranchPicker(cwd.clone()));
+                    }
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Review uncommitted changes".to_string(),
+                actions: vec![Box::new(move |sender| {
+                    sender.send(UiAppEvent::StartReviewUncommitted);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Review a commit".to_string(),
+                actions: vec![Box::new({
+                    let cwd = cwd.clone();
+                    move |sender| {
+                        sender.send(UiAppEvent::OpenReviewCommitPicker(cwd.clone()));
+                    }
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Custom review instructions".to_string(),
+                actions: vec![Box::new(move |sender| {
+                    sender.send(UiAppEvent::OpenReviewCustomPrompt);
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+        ];
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a review preset".to_string()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn show_review_branch_picker(
+        &mut self,
+        current_branch: String,
+        branches: Vec<String>,
+    ) {
+        let items = branches
+            .into_iter()
+            .map(|branch| {
+                let search_value = branch.clone();
+                crate::bottom_pane::SelectionItem {
+                    name: format!("{current_branch} -> {branch}"),
+                    actions: vec![Box::new(move |sender| {
+                        sender.send(UiAppEvent::StartReviewBaseBranch {
+                            branch: branch.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    search_value: Some(search_value),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a base branch".to_string()),
+                items,
+                is_searchable: true,
+                search_placeholder: Some("Type to search branches".to_string()),
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn show_review_commit_picker(&mut self, entries: Vec<ReviewCommitPickerEntry>) {
+        let items = entries
+            .into_iter()
+            .map(|entry| {
+                let subject = entry.subject.clone();
+                let sha = entry.sha.clone();
+                let search_value = format!("{subject} {sha}");
+                crate::bottom_pane::SelectionItem {
+                    name: subject.clone(),
+                    actions: vec![Box::new(move |sender| {
+                        sender.send(UiAppEvent::StartReviewCommit {
+                            sha: sha.clone(),
+                            title: Some(subject.clone()),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    search_value: Some(search_value),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a commit to review".to_string()),
+                items,
+                is_searchable: true,
+                search_placeholder: Some("Type to search commits".to_string()),
+                ..Default::default()
+            });
     }
 
     pub(crate) fn set_status_message(&mut self, message: Option<String>) {

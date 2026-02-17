@@ -702,7 +702,7 @@ impl App {
             }
             SlashCommand::Review => {
                 if arg.trim().is_empty() {
-                    self.open_review_popup();
+                    self.widget.ui_mut().open_review_popup();
                 } else {
                     self.start_review_custom(arg.trim())?;
                 }
@@ -1217,58 +1217,6 @@ impl App {
         Ok(())
     }
 
-    fn open_review_popup(&mut self) {
-        let items = vec![
-            crate::bottom_pane::SelectionItem {
-                name: "Review against a base branch".to_string(),
-                description: Some("(PR Style)".to_string()),
-                actions: vec![Box::new({
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-                    move |sender| {
-                        sender.send(WidgetAppEvent::OpenReviewBranchPicker(cwd.clone()));
-                    }
-                })],
-                dismiss_on_select: false,
-                ..Default::default()
-            },
-            crate::bottom_pane::SelectionItem {
-                name: "Review uncommitted changes".to_string(),
-                actions: vec![Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::StartReviewUncommitted);
-                })],
-                dismiss_on_select: true,
-                ..Default::default()
-            },
-            crate::bottom_pane::SelectionItem {
-                name: "Review a commit".to_string(),
-                actions: vec![Box::new({
-                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-                    move |sender| {
-                        sender.send(WidgetAppEvent::OpenReviewCommitPicker(cwd.clone()));
-                    }
-                })],
-                dismiss_on_select: false,
-                ..Default::default()
-            },
-            crate::bottom_pane::SelectionItem {
-                name: "Custom review instructions".to_string(),
-                actions: vec![Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::OpenReviewCustomPrompt);
-                })],
-                dismiss_on_select: false,
-                ..Default::default()
-            },
-        ];
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                title: Some("Select a review preset".to_string()),
-                items,
-                ..Default::default()
-            });
-    }
-
     fn open_review_branch_picker(&mut self, cwd: &std::path::Path) {
         let current_branch =
             git_current_branch_name(cwd).unwrap_or_else(|| "(detached HEAD)".into());
@@ -1280,33 +1228,9 @@ impl App {
             return;
         }
 
-        let items = branches
-            .into_iter()
-            .map(|branch| {
-                let search_value = branch.clone();
-                crate::bottom_pane::SelectionItem {
-                    name: format!("{current_branch} -> {branch}"),
-                    actions: vec![Box::new(move |sender| {
-                        sender.send(WidgetAppEvent::StartReviewBaseBranch {
-                            branch: branch.clone(),
-                        });
-                    })],
-                    dismiss_on_select: true,
-                    search_value: Some(search_value),
-                    ..Default::default()
-                }
-            })
-            .collect::<Vec<_>>();
-
         self.widget
             .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                title: Some("Select a base branch".to_string()),
-                items,
-                is_searchable: true,
-                search_placeholder: Some("Type to search branches".to_string()),
-                ..Default::default()
-            });
+            .show_review_branch_picker(current_branch, branches);
     }
 
     fn open_review_commit_picker(&mut self, cwd: &std::path::Path) {
@@ -1318,36 +1242,15 @@ impl App {
             return;
         }
 
-        let items = commits
-            .into_iter()
-            .map(|entry| {
-                let subject = entry.subject.clone();
-                let sha = entry.sha.clone();
-                let search_value = format!("{} {}", subject, sha);
-                crate::bottom_pane::SelectionItem {
-                    name: subject.clone(),
-                    actions: vec![Box::new(move |sender| {
-                        sender.send(WidgetAppEvent::StartReviewCommit {
-                            sha: sha.clone(),
-                            title: Some(subject.clone()),
-                        });
-                    })],
-                    dismiss_on_select: true,
-                    search_value: Some(search_value),
-                    ..Default::default()
-                }
-            })
-            .collect::<Vec<_>>();
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                title: Some("Select a commit to review".to_string()),
-                items,
-                is_searchable: true,
-                search_placeholder: Some("Type to search commits".to_string()),
-                ..Default::default()
-            });
+        self.widget.ui_mut().show_review_commit_picker(
+            commits
+                .into_iter()
+                .map(|entry| crate::chatwidget::ReviewCommitPickerEntry {
+                    sha: entry.sha,
+                    subject: entry.subject,
+                })
+                .collect(),
+        );
     }
 
     fn start_review_uncommitted(&mut self) -> Result<()> {
