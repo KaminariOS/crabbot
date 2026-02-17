@@ -398,13 +398,6 @@ impl LiveAttachTui {
 
     pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
-            // Force a stable baseline palette similar to upstream:
-            // black app background with high-contrast foreground text.
-            frame.render_widget(
-                Paragraph::new("").style(Style::default().bg(Color::Black).fg(Color::White)),
-                frame.area(),
-            );
-
             let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
             let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
             let slash_picker_lines = self.slash_picker_lines(frame.area().width as usize);
@@ -425,12 +418,7 @@ impl LiveAttachTui {
             let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
                 Paragraph::new(history)
-                    .style(
-                        Style::default()
-                            .bg(Color::Black)
-                            .fg(self.readable_fg_color())
-                            .bold(),
-                    )
+                    .style(Style::default().bold())
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
                 chunks[0],
@@ -471,7 +459,7 @@ impl LiveAttachTui {
                 Paragraph::new(Line::from(
                     self.footer_line_text(chunks[footer_chunk_index].width as usize),
                 ))
-                .style(Style::default().fg(self.readable_fg_color())),
+                .style(Style::default()),
                 chunks[footer_chunk_index],
             );
 
@@ -559,17 +547,7 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn composer_row_style(&self) -> Style {
-        // Keep composer panel explicitly grey like upstream.
-        Style::default()
-            .bg(Color::DarkGray)
-            .fg(self.readable_fg_color())
-            .bold()
-    }
-
-    fn readable_fg_color(&self) -> Color {
-        // Explicit ANSI bright white avoids terminals that map default white
-        // to a dim/near-background color in alternate screen mode.
-        Color::Indexed(15)
+        Style::default().bold()
     }
 
     pub(crate) fn special_token_style(&self, token: char) -> Option<Style> {
