@@ -37,6 +37,8 @@ use crate::*;
 use codex_file_search::FileMatch;
 use codex_utils_fuzzy_match::fuzzy_match;
 use crossterm::event::KeyEvent;
+use crossterm::event::MouseEvent;
+use crossterm::event::MouseEventKind;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
@@ -66,6 +68,7 @@ pub(crate) struct LiveAttachTui {
     shortcuts_overlay_visible: bool,
     kill_buffer: String,
     bottom_pane: BottomPane,
+    history_scroll_offset: u16,
 }
 
 impl LiveAttachTui {
@@ -103,6 +106,7 @@ impl LiveAttachTui {
             shortcuts_overlay_visible: false,
             kill_buffer: String::new(),
             bottom_pane,
+            history_scroll_offset: 0,
         }
     }
 
@@ -877,7 +881,9 @@ impl LiveAttachTui {
 
             let history_lines_vec = self.history_view_lines(chunks[0].width);
             let history_lines = history_lines_vec.len().max(1) as u16;
-            let scroll = history_lines.saturating_sub(chunks[0].height);
+            let max_scroll = history_lines.saturating_sub(chunks[0].height);
+            self.history_scroll_offset = self.history_scroll_offset.min(max_scroll);
+            let scroll = max_scroll.saturating_sub(self.history_scroll_offset);
             frame.render_widget(
                 Paragraph::new(history_lines_vec)
                     .style(Style::default())
@@ -898,6 +904,28 @@ impl LiveAttachTui {
             }
         })?;
         Ok(())
+    }
+
+    pub(crate) fn scroll_history_page_up(&mut self) {
+        let step = 10u16;
+        self.history_scroll_offset = self.history_scroll_offset.saturating_add(step);
+    }
+
+    pub(crate) fn scroll_history_page_down(&mut self) {
+        let step = 10u16;
+        self.history_scroll_offset = self.history_scroll_offset.saturating_sub(step);
+    }
+
+    pub(crate) fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
+        match mouse_event.kind {
+            MouseEventKind::ScrollUp => {
+                self.history_scroll_offset = self.history_scroll_offset.saturating_add(3);
+            }
+            MouseEventKind::ScrollDown => {
+                self.history_scroll_offset = self.history_scroll_offset.saturating_sub(3);
+            }
+            _ => {}
+        }
     }
 
     pub(crate) fn handle_bottom_pane_key_event(&mut self, key: KeyEvent) -> InputResult {

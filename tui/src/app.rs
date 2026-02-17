@@ -239,6 +239,7 @@ impl App {
                         }
                         AppEvent::Key(key_event)
                     }
+                    Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
                     Event::Paste(pasted) => AppEvent::Paste(pasted),
                     Event::Resize(_, _) => AppEvent::Resize,
                     _ => continue,
@@ -327,6 +328,10 @@ impl App {
     fn handle_event(&mut self, event: AppEvent) -> Result<LiveTuiAction> {
         match event {
             AppEvent::Key(key_event) => self.handle_key_event(key_event),
+            AppEvent::Mouse(mouse_event) => {
+                self.widget.ui_mut().handle_mouse_event(mouse_event);
+                Ok(LiveTuiAction::Continue)
+            }
             AppEvent::Paste(pasted) => {
                 // Mirror upstream textarea behavior: normalize CR to LF for pasted text.
                 let pasted = pasted.replace('\r', "\n");
@@ -431,6 +436,14 @@ impl App {
             Option<String>,
             Vec<codex_protocol::user_input::TextElement>,
         )> = None;
+        if key.code == KeyCode::PageUp {
+            self.widget.ui_mut().scroll_history_page_up();
+            return Ok(LiveTuiAction::Continue);
+        }
+        if key.code == KeyCode::PageDown {
+            self.widget.ui_mut().scroll_history_page_down();
+            return Ok(LiveTuiAction::Continue);
+        }
         let pending_widget_events = {
             let ui = self.widget.ui_mut();
             if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {

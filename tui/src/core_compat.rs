@@ -919,6 +919,7 @@ pub(crate) fn decode_app_server_wire_line(
 pub(crate) enum AppEvent {
     // -- Terminal input events (same as upstream) --
     Key(crossterm::event::KeyEvent),
+    Mouse(crossterm::event::MouseEvent),
     Paste(String),
     Resize,
     Tick,
