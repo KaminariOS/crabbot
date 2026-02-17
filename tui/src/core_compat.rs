@@ -135,12 +135,38 @@ pub(crate) enum UiEvent {
     UndoCompleted {
         message: Option<String>,
     },
+    PlanUpdated(codex_protocol::plan_tool::UpdatePlanArgs),
+    PatchApplyBegin {
+        changes: std::collections::HashMap<std::path::PathBuf, codex_core::protocol::FileChange>,
+    },
+    PatchApplyEnd {
+        success: bool,
+        stderr: String,
+    },
+    ViewImageToolCall {
+        path: std::path::PathBuf,
+    },
+    GetHistoryEntryResponse {
+        offset: usize,
+        log_id: u64,
+        entry_text: Option<String>,
+    },
     DeprecationNotice {
         message: String,
     },
     BackgroundEvent {
         message: String,
     },
+    ReviewModeEntered,
+    ReviewModeExited,
+    UserMessage {
+        text: String,
+        text_elements: Vec<codex_protocol::user_input::TextElement>,
+    },
+    CustomPromptsListed(Vec<codex_protocol::custom_prompts::CustomPrompt>),
+    SkillsListed(Vec<codex_core::skills::model::SkillMetadata>),
+    SkillsUpdateAvailable,
+    ShutdownComplete,
     TranscriptLine(String),
     StatusMessage(String),
     ApprovalRequired(UiApprovalRequest),
@@ -446,8 +472,30 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 ),
             }]
         }
-        "item/fileChange/begin" => Vec::new(),
-        "item/fileChange/end" => Vec::new(),
+        "item/fileChange/begin" => parse_file_changes(
+            notification
+                .params
+                .get("changes")
+                .or_else(|| notification.params.get("fileChanges"))
+                .or_else(|| notification.params.get("diff")),
+        )
+        .map(|changes| vec![UiEvent::PatchApplyBegin { changes }])
+        .unwrap_or_else(|| vec![UiEvent::TranscriptLine("[patch applying]".to_string())]),
+        "item/fileChange/end" => {
+            let success = notification
+                .params
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            let stderr = notification
+                .params
+                .get("stderr")
+                .or_else(|| notification.params.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            vec![UiEvent::PatchApplyEnd { success, stderr }]
+        }
         "item/mcpToolCall/begin" => {
             let call_id =
                 item_id_from_params(&notification.params).unwrap_or_else(|| "mcp".to_string());
@@ -535,6 +583,24 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 }]
             })
             .unwrap_or_else(|| map_item_completed_notification(&notification.params)),
+        "item/viewImageToolCall" | "item/view_image_tool_call" | "item/viewImage/toolCall" => {
+            notification
+                .params
+                .get("path")
+                .or_else(|| notification.params.get("imagePath"))
+                .and_then(Value::as_str)
+                .map(|path| {
+                    vec![UiEvent::ViewImageToolCall {
+                        path: std::path::PathBuf::from(path),
+                    }]
+                })
+                .unwrap_or_default()
+        }
+        "history/entry/response" | "history/entryResponse" | "getHistoryEntry/response" => {
+            parse_history_entry_response(&notification.params)
+                .map(|event| vec![event])
+                .unwrap_or_default()
+        }
         "turn/completed" => {
             let status = notification
                 .params
@@ -1013,11 +1079,57 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 .to_string();
             vec![UiEvent::TerminalInteraction { process_id, stdin }]
         }
-        "entered_review_mode" => vec![UiEvent::TranscriptLine("[entered review mode]".to_string())],
-        "exited_review_mode" => vec![UiEvent::TranscriptLine("[exited review mode]".to_string())],
+        "entered_review_mode" => vec![UiEvent::ReviewModeEntered],
+        "exited_review_mode" => vec![UiEvent::ReviewModeExited],
         "undo_started" => vec![UiEvent::UndoStarted { message: None }],
         "undo_completed" => vec![UiEvent::UndoCompleted { message: None }],
+        "plan_update" => parse_plan_update(msg)
+            .map(UiEvent::PlanUpdated)
+            .map(|event| vec![event])
+            .unwrap_or_default(),
+        "patch_apply_begin" => parse_file_changes(msg.get("changes"))
+            .map(|changes| vec![UiEvent::PatchApplyBegin { changes }])
+            .unwrap_or_default(),
+        "patch_apply_end" => vec![UiEvent::PatchApplyEnd {
+            success: msg.get("success").and_then(Value::as_bool).unwrap_or(true),
+            stderr: msg
+                .get("stderr")
+                .or_else(|| msg.get("error"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+        }],
+        "view_image_tool_call" => msg
+            .get("path")
+            .and_then(Value::as_str)
+            .map(|path| {
+                vec![UiEvent::ViewImageToolCall {
+                    path: std::path::PathBuf::from(path),
+                }]
+            })
+            .unwrap_or_default(),
+        "get_history_entry_response" => parse_history_entry_response(msg)
+            .map(|event| vec![event])
+            .unwrap_or_default(),
         "context_compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "list_custom_prompts_response" => parse_custom_prompts_list(msg)
+            .map(UiEvent::CustomPromptsListed)
+            .map(|event| vec![event])
+            .unwrap_or_default(),
+        "list_skills_response" => parse_skills_list(msg)
+            .map(UiEvent::SkillsListed)
+            .map(|event| vec![event])
+            .unwrap_or_default(),
+        "skills_update_available" => vec![UiEvent::SkillsUpdateAvailable],
+        "shutdown_complete" => vec![UiEvent::ShutdownComplete],
+        "user_message" => parse_user_message_event(msg)
+            .map(|(text, text_elements)| {
+                vec![UiEvent::UserMessage {
+                    text,
+                    text_elements,
+                }]
+            })
+            .unwrap_or_default(),
         "deprecation_notice" => msg
             .get("message")
             .and_then(Value::as_str)
@@ -1141,6 +1253,74 @@ fn parse_token_usage_breakdown(value: &Value) -> codex_core::protocol::TokenUsag
 
 fn parse_runtime_metrics_summary(value: &Value) -> Option<codex_otel::RuntimeMetricsSummary> {
     serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_custom_prompts_list(
+    value: &Value,
+) -> Option<Vec<codex_protocol::custom_prompts::CustomPrompt>> {
+    let prompts = value
+        .get("prompts")
+        .or_else(|| value.get("custom_prompts"))
+        .or_else(|| value.get("customPrompts"))?;
+    serde_json::from_value(prompts.clone()).ok()
+}
+
+fn parse_skills_list(value: &Value) -> Option<Vec<codex_core::skills::model::SkillMetadata>> {
+    let skills = value.get("skills")?;
+    serde_json::from_value(skills.clone()).ok()
+}
+
+fn parse_user_message_event(
+    value: &Value,
+) -> Option<(String, Vec<codex_protocol::user_input::TextElement>)> {
+    let text = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)?
+        .to_string();
+    let text_elements = value
+        .get("text_elements")
+        .or_else(|| value.get("textElements"))
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+    Some((text, text_elements))
+}
+
+fn parse_plan_update(value: &Value) -> Option<codex_protocol::plan_tool::UpdatePlanArgs> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_file_changes(
+    value: Option<&Value>,
+) -> Option<std::collections::HashMap<std::path::PathBuf, codex_core::protocol::FileChange>> {
+    let value = value?;
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn parse_history_entry_response(value: &Value) -> Option<UiEvent> {
+    let offset = value
+        .get("offset")
+        .or_else(|| value.get("entryOffset"))
+        .and_then(Value::as_u64)? as usize;
+    let log_id = value
+        .get("logId")
+        .or_else(|| value.get("log_id"))
+        .and_then(Value::as_u64)?;
+    let entry_text = value
+        .get("entry")
+        .and_then(|entry| {
+            entry
+                .get("text")
+                .or_else(|| entry.get("message"))
+                .and_then(Value::as_str)
+        })
+        .map(ToString::to_string);
+    Some(UiEvent::GetHistoryEntryResponse {
+        offset,
+        log_id,
+        entry_text,
+    })
 }
 
 fn map_codex_token_count_notification(msg: &Value) -> Vec<UiEvent> {

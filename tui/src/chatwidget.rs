@@ -22,8 +22,11 @@ use crate::history_cell::new_active_mcp_tool_call;
 use crate::history_cell::new_active_web_search_call;
 use crate::history_cell::new_error_event;
 use crate::history_cell::new_info_event;
+use crate::history_cell::new_patch_apply_failure;
+use crate::history_cell::new_patch_event;
 use crate::history_cell::new_unified_exec_interaction;
 use crate::history_cell::new_user_prompt;
+use crate::history_cell::new_view_image_tool_call;
 use crate::history_cell::new_web_search_call;
 use crate::key_hint;
 use crate::mention_codec;
@@ -582,6 +585,33 @@ impl LiveAttachTui {
                     self.push_line("[undo completed]");
                 }
             }
+            UiEvent::PlanUpdated(update) => {
+                self.add_boxed_history(Box::new(crate::history_cell::new_plan_update(update)));
+            }
+            UiEvent::PatchApplyBegin { changes } => {
+                self.flush_assistant_message();
+                self.add_boxed_history(Box::new(new_patch_event(changes, &self.status_line_cwd())));
+            }
+            UiEvent::PatchApplyEnd { success, stderr } => {
+                if !success {
+                    self.add_boxed_history(Box::new(new_patch_apply_failure(stderr)));
+                }
+                self.had_work_activity = true;
+            }
+            UiEvent::ViewImageToolCall { path } => {
+                self.add_history_cell(Box::new(new_view_image_tool_call(
+                    path,
+                    &self.status_line_cwd(),
+                )));
+            }
+            UiEvent::GetHistoryEntryResponse {
+                offset,
+                log_id,
+                entry_text,
+            } => {
+                self.bottom_pane
+                    .on_history_entry_response(log_id, offset, entry_text);
+            }
             UiEvent::DeprecationNotice { message } => {
                 self.add_boxed_history(Box::new(new_info_event(
                     "[deprecation notice]".to_string(),
@@ -593,6 +623,41 @@ impl LiveAttachTui {
                     "[background event]".to_string(),
                     Some(message),
                 )));
+            }
+            UiEvent::ReviewModeEntered => {
+                self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
+                    "Entered review mode".to_string(),
+                )));
+            }
+            UiEvent::ReviewModeExited => {
+                self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
+                    "Exited review mode".to_string(),
+                )));
+            }
+            UiEvent::UserMessage {
+                text,
+                text_elements,
+            } => {
+                if from_replay {
+                    self.push_user_prompt(&text, text_elements);
+                }
+            }
+            UiEvent::CustomPromptsListed(prompts) => {
+                self.bottom_pane.set_custom_prompts(prompts);
+            }
+            UiEvent::SkillsListed(skills) => {
+                self.set_skills(Some(skills));
+            }
+            UiEvent::SkillsUpdateAvailable => {
+                self.bottom_pane_event_tx.send(UiAppEvent::CodexOp(
+                    codex_core::protocol::Op::ListSkills {
+                        cwds: Vec::new(),
+                        force_reload: true,
+                    },
+                ));
+            }
+            UiEvent::ShutdownComplete => {
+                self.status_message = Some("shutdown complete".to_string());
             }
             UiEvent::TranscriptLine(line) => {
                 self.push_line(&line);
