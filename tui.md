@@ -2,6 +2,69 @@
 
 Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, with exactly one architectural difference: backend transport uses app-server (`core_compat.rs`) instead of `codex-core`.
 
+## Finish Plan (From Current State)
+
+Current baseline:
+- Real upstream `bottom_pane` is wired and `cargo check -p crabbot_tui` passes.
+- Temporary compatibility stubs still exist (`history_cell_stub`, `exec_cell_stub`, `status_stub`, `status_indicator_widget_stub`, `skills_helpers_stub`) and must be removed.
+
+Execution order to finish full port:
+
+1. **History/Cell parity first**
+- Replace `history_cell_stub` with real upstream `history_cell`.
+- Keep only transport-facing protocol differences in `core_compat`/`lib` compatibility types.
+- Exit criteria:
+  - `mod history_cell` points to real module.
+  - No `history_cell_stub` references in build graph.
+  - `cargo check -p crabbot_tui` passes.
+
+2. **Exec + status surface parity**
+- Replace `exec_cell_stub`, `status_stub`, and `status_indicator_widget_stub` with real upstream modules.
+- Port missing type/API shims in `lib.rs` so upstream modules compile unchanged.
+- Exit criteria:
+  - Real `exec_cell`, `status`, `status_indicator_widget` are active.
+  - Footer/status rendering paths come from upstream modules.
+  - `cargo check -p crabbot_tui` passes.
+
+3. **Skill/helpers parity**
+- Replace `skills_helpers_stub` with real upstream `skills_helpers`.
+- Align `SkillMetadata` compatibility shape to upstream expectations used by picker/rendering.
+- Exit criteria:
+  - Real `skills_helpers` active.
+  - Skill list/filter UI behavior matches upstream.
+
+4. **ChatWidget full upstream structure**
+- Port `chatwidget.rs` structure to upstream flow (state shape, render orchestration, bottom pane coordination).
+- Remove custom preamble/render patches not present upstream.
+- Keep only event translation boundary at app-server seam.
+- Exit criteria:
+  - Visual behavior for composer/footer/status/overlay matches upstream.
+  - No custom rendering hacks outside upstream code paths.
+
+5. **App loop full upstream structure**
+- Port `app.rs` event routing/order/mode transitions to upstream layout.
+- Route backend operations strictly through `core_compat.rs`.
+- Exit criteria:
+  - Key handling, overlays, and run loop scheduling match upstream behavior.
+  - Attach/new/resume/interrupt flow works with app-server transport.
+
+6. **Compatibility shim reduction**
+- Remove obsolete stubbed types/functions from `lib.rs` once real upstream modules compile.
+- Keep only required compatibility shims for app-server seam and crates intentionally not imported.
+- Exit criteria:
+  - `lib.rs` shim surface minimized and documented.
+
+7. **Strict diff cleanup + validation**
+- Re-run diff audit and reduce drift.
+- Required validation set:
+  - `cargo check -p crabbot_tui`
+  - `cargo run -p crabbot_cli -- codex --help`
+  - Manual `cargo run -p crabbot_cli -- codex` visual parity checks
+  - `attach/resume/new/interrupt` lifecycle checks
+- Exit criteria:
+  - Final diff list is intentional and transport-seam-scoped.
+  - UI is visually/functionally parity-aligned with upstream.
+
 ## Phase 0: Baseline and Guardrails
 
 - [x] Pull latest upstream reference (`~/repos/codex`).

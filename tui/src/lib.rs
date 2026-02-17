@@ -223,12 +223,16 @@ pub mod protocol {
     }
 
     /// Review decision for command/patch approvals.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum ReviewDecision {
-        Approve,
-        Deny,
-        Explain,
+        Approved,
+        ApprovedExecpolicyAmendment {
+            proposed_execpolicy_amendment: ExecPolicyAmendment,
+        },
+        ApprovedForSession,
+        Denied,
+        Abort,
     }
 
     /// Source of an exec command.
@@ -242,9 +246,10 @@ pub mod protocol {
         UnifiedExecInteraction,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
     pub enum SkillScope {
+        #[default]
         User,
         Repo,
         System,
@@ -257,9 +262,38 @@ pub mod protocol {
     #[allow(dead_code)]
     pub enum Op {
         Interrupt,
-        UserInput { items: Vec<serde_json::Value> },
-        GetHistoryEntryRequest { offset: i32, log_id: Option<String> },
-        ListSkills { query: Option<String> },
+        UserInput {
+            items: Vec<serde_json::Value>,
+        },
+        ExecApproval {
+            id: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            turn_id: Option<String>,
+            decision: ReviewDecision,
+        },
+        PatchApproval {
+            id: String,
+            decision: ReviewDecision,
+        },
+        ResolveElicitation {
+            server_name: String,
+            request_id: RequestId,
+            decision: ElicitationAction,
+        },
+        UserInputAnswer {
+            id: String,
+            response: crate::request_user_input::RequestUserInputResponse,
+        },
+        GetHistoryEntryRequest {
+            offset: usize,
+            log_id: u64,
+        },
+        ListSkills {
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            cwds: Vec<std::path::PathBuf>,
+            #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+            force_reload: bool,
+        },
         Shutdown,
     }
 
@@ -315,6 +349,7 @@ pub mod protocol {
     pub enum SessionSource {
         Local,
         Remote,
+        Cli,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -322,6 +357,7 @@ pub mod protocol {
     pub enum ElicitationAction {
         Accept,
         Decline,
+        Cancel,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -343,6 +379,10 @@ pub mod protocol {
         pub session_id: String,
         #[serde(default)]
         pub model: Option<String>,
+        #[serde(default)]
+        pub model_reasoning_effort: Option<String>,
+        #[serde(default)]
+        pub model_reasoning_summary: Option<String>,
     }
 
     /// MCP request identifier.
@@ -376,7 +416,7 @@ pub mod protocol {
     }
 
     /// Exec policy amendment.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
     pub struct ExecPolicyAmendment {
         pub command: Vec<String>,
     }
@@ -516,18 +556,23 @@ pub mod skills {
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         pub struct SkillInterface {
             #[serde(default)]
+            pub display_name: Option<String>,
+            #[serde(default)]
             pub short_description: Option<String>,
         }
 
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         pub struct SkillMetadata {
             pub name: String,
-            #[serde(default)]
-            pub description: Option<String>,
+            pub description: String,
             #[serde(default)]
             pub short_description: Option<String>,
             #[serde(default)]
             pub interface: Option<SkillInterface>,
+            #[serde(default)]
+            pub path: std::path::PathBuf,
+            #[serde(default)]
+            pub scope: crate::protocol::SkillScope,
         }
     }
 }
@@ -551,6 +596,8 @@ mod codex_chatgpt_stub {
             pub install_url: Option<String>,
             #[serde(default)]
             pub is_accessible: bool,
+            #[serde(default)]
+            pub is_enabled: bool,
         }
 
         pub fn connector_display_label(connector: &AppInfo) -> String {
@@ -798,6 +845,8 @@ mod codex_protocol_stub {
         pub struct CustomPrompt {
             pub name: String,
             pub content: String,
+            #[serde(default)]
+            pub description: Option<String>,
         }
     }
 
@@ -805,23 +854,62 @@ mod codex_protocol_stub {
         use serde::Deserialize;
         use serde::Serialize;
 
-        #[derive(Debug, Clone, Serialize, Deserialize)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         pub struct ByteRange {
             pub start: usize,
             pub end: usize,
         }
 
-        #[derive(Debug, Clone, Serialize, Deserialize)]
+        impl From<std::ops::Range<usize>> for ByteRange {
+            fn from(range: std::ops::Range<usize>) -> Self {
+                Self {
+                    start: range.start,
+                    end: range.end,
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         pub struct TextElement {
-            pub kind: String,
-            pub range: ByteRange,
+            pub byte_range: ByteRange,
+            #[serde(default)]
+            placeholder: Option<String>,
+        }
+
+        impl TextElement {
+            pub fn new(byte_range: ByteRange, placeholder: Option<String>) -> Self {
+                Self {
+                    byte_range,
+                    placeholder,
+                }
+            }
+
+            pub fn map_range<F>(&self, map: F) -> Self
+            where
+                F: FnOnce(ByteRange) -> ByteRange,
+            {
+                Self {
+                    byte_range: map(self.byte_range.clone()),
+                    placeholder: self.placeholder.clone(),
+                }
+            }
+
+            pub fn set_placeholder(&mut self, placeholder: Option<String>) {
+                self.placeholder = placeholder;
+            }
+
+            pub fn placeholder<'a>(&'a self, text: &'a str) -> Option<&'a str> {
+                self.placeholder
+                    .as_deref()
+                    .or_else(|| text.get(self.byte_range.start..self.byte_range.end))
+            }
         }
     }
 
     pub mod request_user_input {
         use serde::Deserialize;
         use serde::Serialize;
-        use std::collections::BTreeMap;
+        use std::collections::HashMap;
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct RequestUserInputQuestionOption {
@@ -846,8 +934,6 @@ mod codex_protocol_stub {
         pub struct RequestUserInputAnswer {
             #[serde(default)]
             pub answers: Vec<String>,
-            #[serde(default)]
-            pub value: String,
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -867,13 +953,13 @@ mod codex_protocol_stub {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct RequestUserInputResponse {
             #[serde(default)]
-            pub answers: BTreeMap<String, RequestUserInputAnswer>,
+            pub answers: HashMap<String, RequestUserInputAnswer>,
         }
     }
 
     pub mod models {
-        pub fn local_image_label_text() -> &'static str {
-            "local image"
+        pub fn local_image_label_text(index: usize) -> String {
+            format!("[Image #{index}]")
         }
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -886,7 +972,23 @@ mod codex_protocol_stub {
 pub use codex_protocol_stub::*;
 
 #[derive(Debug, Clone, Default)]
-pub struct CodexLogSnapshot;
+pub struct CodexLogSnapshot {
+    pub thread_id: String,
+}
+
+impl CodexLogSnapshot {
+    #[allow(clippy::too_many_arguments)]
+    pub fn upload_feedback(
+        &self,
+        _classification: &str,
+        _reason: Option<&str>,
+        _include_logs: bool,
+        _rollout_path: Option<&std::path::Path>,
+        _source: Option<crate::protocol::SessionSource>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 pub fn summarize_sandbox_policy(policy: &protocol::SandboxPolicy) -> String {
     policy.to_string()
@@ -1012,15 +1114,17 @@ mod app;
 mod app_event;
 mod app_event_sender;
 mod ascii_animation;
-#[path = "bottom_pane_stub.rs"]
 mod bottom_pane;
 mod chatwidget;
 mod cli;
+mod clipboard_paste;
 mod color;
 mod core_compat;
 mod custom_terminal;
 mod cwd_prompt;
 mod diff_render;
+#[path = "exec_cell_stub.rs"]
+mod exec_cell;
 mod exec_command;
 mod external_editor;
 mod file_search;
@@ -1041,14 +1145,22 @@ mod render;
 mod selection_list;
 mod session_log;
 mod shimmer;
+#[path = "skills_helpers_stub.rs"]
+mod skills_helpers;
 mod slash_command;
 #[path = "bottom_pane/slash_commands.rs"]
 mod slash_commands;
+#[path = "status_stub.rs"]
+mod status;
+#[path = "status_indicator_widget_stub.rs"]
+mod status_indicator_widget;
 mod style;
 mod terminal_palette;
 mod text_formatting;
+mod tooltips;
 pub mod tui;
 mod ui_consts;
+mod update_action;
 mod version;
 mod wrapping;
 
