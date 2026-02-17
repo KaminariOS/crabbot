@@ -538,6 +538,7 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("[info] /debug-config is not yet ported in app-server tui"),
+            SlashCommand::Fork => self.app_event_tx.send(AppEvent::NewSession),
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
             }
@@ -547,6 +548,64 @@ impl App {
             SlashCommand::Diff => {
                 let diff_text = run_diff_now();
                 self.widget.ui_mut().push_line(&diff_text);
+            }
+            SlashCommand::Skills => match fetch_skills_for_cwd(&self.state) {
+                Ok(skills) if skills.is_empty() => {
+                    self.widget.ui_mut().push_line("No skills available.");
+                }
+                Ok(skills) => {
+                    self.widget.ui_mut().push_line("Skills:");
+                    for skill in skills {
+                        self.widget.ui_mut().push_line(&format!(
+                            "- {}{}",
+                            skill.name,
+                            if skill.description.is_empty() {
+                                String::new()
+                            } else {
+                                format!(": {}", skill.description)
+                            }
+                        ));
+                    }
+                }
+                Err(err) => self
+                    .widget
+                    .ui_mut()
+                    .push_line(&format!("Failed to load skills: {err}")),
+            },
+            SlashCommand::Apps => match fetch_connectors(&self.state) {
+                Ok(snapshot) if snapshot.connectors.is_empty() => {
+                    self.widget.ui_mut().push_line("No apps available.");
+                }
+                Ok(snapshot) => {
+                    self.widget.ui_mut().push_line("Apps:");
+                    for app in snapshot.connectors {
+                        self.widget.ui_mut().push_line(&format!(
+                            "- {} ({}){}",
+                            app.name,
+                            app.id,
+                            if app.is_enabled { "" } else { " [disabled]" }
+                        ));
+                    }
+                }
+                Err(err) => self
+                    .widget
+                    .ui_mut()
+                    .push_line(&format!("Failed to load apps: {err}")),
+            },
+            SlashCommand::Ps => {
+                self.widget.ui_mut().add_history_cell(Box::new(
+                    crate::history_cell::new_unified_exec_processes_output(Vec::new()),
+                ));
+            }
+            SlashCommand::Clean => {
+                self.widget
+                    .ui_mut()
+                    .push_line("Stopping all background terminals.");
+            }
+            SlashCommand::Mcp => {
+                self.widget
+                    .ui_mut()
+                    .add_history_cell(Box::new(crate::history_cell::empty_mcp_output()));
             }
             _ => {
                 let _ = arg;
