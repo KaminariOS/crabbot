@@ -102,6 +102,7 @@ fn pad_line_to_width(mut line: Line<'static>, width: u16) -> Line<'static> {
 pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     history_cells: Vec<Box<dyn HistoryCell>>,
+    active_cell: Option<Box<dyn HistoryCell>>,
     history_cells_flushed_to_scrollback: usize,
     adaptive_chunking: AdaptiveChunkingPolicy,
     assistant_stream: StreamController,
@@ -166,6 +167,7 @@ impl LiveAttachTui {
         Self {
             session_id,
             history_cells: Vec::new(),
+            active_cell: None,
             history_cells_flushed_to_scrollback: 0,
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             assistant_stream: StreamController::new(None),
@@ -308,6 +310,7 @@ impl LiveAttachTui {
             }
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
+                self.flush_active_cell();
                 self.active_turn_id = None;
                 self.agent_turn_running = false;
                 self.update_task_running_state();
@@ -479,6 +482,7 @@ impl LiveAttachTui {
 
     pub(crate) fn push_line(&mut self, line: &str) {
         self.flush_assistant_message();
+        self.flush_active_cell();
         let trimmed = line.trim_start();
         if trimmed.starts_with("[error") || trimmed.starts_with("error:") {
             self.history_cells
@@ -499,6 +503,7 @@ impl LiveAttachTui {
         text_elements: Vec<codex_protocol::user_input::TextElement>,
     ) {
         self.assistant_stream = StreamController::new(None);
+        self.flush_active_cell();
         let decoded = mention_codec::decode_history_mentions(prompt);
         let display_prompt = decoded.text;
         self.history_cells.push(Box::new(new_user_prompt(
@@ -530,8 +535,10 @@ impl LiveAttachTui {
         source: codex_core::protocol::ExecCommandSource,
     ) {
         self.flush_assistant_message();
-        if let Some(last) = self.history_cells.last_mut()
-            && let Some(exec_cell) = last.as_any_mut().downcast_mut::<ExecCell>()
+        if let Some(exec_cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
             && let Some(updated) = exec_cell.with_added_call(
                 call_id.clone(),
                 command.clone(),
@@ -544,7 +551,8 @@ impl LiveAttachTui {
             return;
         }
 
-        self.history_cells.push(Box::new(new_active_exec_command(
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(new_active_exec_command(
             call_id, command, parsed, source, None, true,
         )));
     }
@@ -553,13 +561,13 @@ impl LiveAttachTui {
         if delta.is_empty() {
             return;
         }
-        for cell in self.history_cells.iter_mut().rev() {
-            let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() else {
-                continue;
-            };
-            if exec_cell.append_output(call_id, delta) {
-                return;
-            }
+        if let Some(exec_cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
+            && exec_cell.append_output(call_id, delta)
+        {
+            return;
         }
 
         self.push_line(delta);
@@ -572,25 +580,24 @@ impl LiveAttachTui {
         aggregated_output: String,
         duration: Duration,
     ) {
-        for cell in self.history_cells.iter_mut().rev() {
-            let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() else {
-                continue;
+        if let Some(exec_cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
+            && exec_cell.iter_calls().any(|call| call.call_id == call_id)
+        {
+            let output_text = if aggregated_output.is_empty() {
+                exec_cell
+                    .calls
+                    .iter()
+                    .rev()
+                    .find(|call| call.call_id == call_id)
+                    .and_then(|call| call.output.as_ref())
+                    .map(|output| output.aggregated_output.clone())
+                    .unwrap_or_default()
+            } else {
+                aggregated_output
             };
-            if !exec_cell.iter_calls().any(|call| call.call_id == call_id) {
-                continue;
-            }
-
-            let mut output_text = exec_cell
-                .calls
-                .iter()
-                .rev()
-                .find(|call| call.call_id == call_id)
-                .and_then(|call| call.output.as_ref())
-                .map(|output| output.aggregated_output.clone())
-                .unwrap_or_default();
-            if !aggregated_output.is_empty() {
-                output_text = aggregated_output;
-            }
 
             exec_cell.complete_call(
                 call_id,
@@ -601,13 +608,32 @@ impl LiveAttachTui {
                 },
                 duration,
             );
+            if exec_cell.should_flush() {
+                self.flush_active_cell();
+            }
             return;
         }
 
-        self.history_cells.push(Box::new(new_info_event(
-            format!("[exec done] {call_id}"),
+        self.flush_active_cell();
+        let mut cell = new_active_exec_command(
+            call_id.to_string(),
+            Vec::new(),
+            Vec::new(),
+            codex_core::protocol::ExecCommandSource::Agent,
             None,
-        )));
+            true,
+        );
+        cell.complete_call(
+            call_id,
+            CommandOutput {
+                exit_code,
+                aggregated_output: aggregated_output.clone(),
+                formatted_output: aggregated_output,
+            },
+            duration,
+        );
+        self.active_cell = Some(Box::new(cell));
+        self.flush_active_cell();
     }
 
     fn on_mcp_tool_call_begin(
@@ -616,7 +642,8 @@ impl LiveAttachTui {
         invocation: codex_core::protocol::McpInvocation,
     ) {
         self.flush_assistant_message();
-        self.history_cells.push(Box::new(new_active_mcp_tool_call(
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(new_active_mcp_tool_call(
             call_id, invocation, true,
         )));
     }
@@ -627,19 +654,21 @@ impl LiveAttachTui {
         duration: Duration,
         result: Result<codex_protocol::mcp::CallToolResult, String>,
     ) {
-        for cell in self.history_cells.iter_mut().rev() {
-            let Some(mcp_cell) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() else {
-                continue;
-            };
-            if mcp_cell.call_id() != call_id {
-                continue;
-            }
-            if let Some(image_cell) = mcp_cell.complete(duration, result) {
-                self.history_cells.push(image_cell);
+        if let Some(mcp_cell) = self
+            .active_cell
+            .as_mut()
+            .and_then(|cell| cell.as_any_mut().downcast_mut::<McpToolCallCell>())
+            && mcp_cell.call_id() == call_id
+        {
+            let image_cell = mcp_cell.complete(duration, result);
+            self.flush_active_cell();
+            if let Some(extra) = image_cell {
+                self.add_boxed_history(extra);
             }
             return;
         }
 
+        self.flush_active_cell();
         self.history_cells.push(Box::new(new_info_event(
             format!("[mcp done] {call_id}"),
             None,
@@ -648,8 +677,8 @@ impl LiveAttachTui {
 
     fn on_web_search_begin(&mut self, call_id: String, query: String) {
         self.flush_assistant_message();
-        self.history_cells
-            .push(Box::new(new_active_web_search_call(call_id, query, true)));
+        self.flush_active_cell();
+        self.active_cell = Some(Box::new(new_active_web_search_call(call_id, query, true)));
     }
 
     fn on_web_search_end(
@@ -658,18 +687,14 @@ impl LiveAttachTui {
         query: String,
         action: codex_protocol::models::WebSearchAction,
     ) {
-        for cell in self.history_cells.iter_mut().rev() {
-            let Some(web_cell) = cell
-                .as_any_mut()
+        if let Some(web_cell) = self.active_cell.as_mut().and_then(|cell| {
+            cell.as_any_mut()
                 .downcast_mut::<crate::history_cell::WebSearchCell>()
-            else {
-                continue;
-            };
-            if web_cell.call_id() != call_id {
-                continue;
-            }
+        }) && web_cell.call_id() == call_id
+        {
             web_cell.update(action.clone(), query.clone());
             web_cell.complete();
+            self.flush_active_cell();
             return;
         }
         self.history_cells.push(Box::new(new_web_search_call(
@@ -1736,12 +1761,24 @@ impl LiveAttachTui {
 
     pub(crate) fn add_history_cell(&mut self, cell: Box<dyn HistoryCell>) {
         self.flush_assistant_message();
+        self.flush_active_cell();
         self.history_cells.push(cell);
+    }
+
+    fn add_boxed_history(&mut self, cell: Box<dyn HistoryCell>) {
+        self.history_cells.push(cell);
+    }
+
+    fn flush_active_cell(&mut self) {
+        if let Some(cell) = self.active_cell.take() {
+            self.add_boxed_history(cell);
+        }
     }
 
     pub(crate) fn reset_for_thread_switch(&mut self, thread_id: String) {
         self.session_id = thread_id;
         self.history_cells.clear();
+        self.active_cell = None;
         self.history_cells_flushed_to_scrollback = 0;
         self.assistant_stream = StreamController::new(None);
         self.adaptive_chunking.reset();
@@ -1906,6 +1943,9 @@ impl LiveAttachTui {
             .iter()
             .skip(self.history_cells_flushed_to_scrollback)
         {
+            lines.extend(cell.display_lines(width));
+        }
+        if let Some(cell) = self.active_cell.as_ref() {
             lines.extend(cell.display_lines(width));
         }
         if lines.is_empty() {
