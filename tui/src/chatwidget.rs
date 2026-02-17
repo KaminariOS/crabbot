@@ -48,6 +48,7 @@ pub(crate) struct LiveAttachTui {
     pub(crate) active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
     pub(crate) pending_approvals: BTreeMap<String, UiApprovalRequest>,
+    bottom_pane_event_rx: tokio::sync::mpsc::UnboundedReceiver<UiAppEvent>,
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
     kill_buffer: String,
@@ -56,7 +57,7 @@ pub(crate) struct LiveAttachTui {
 
 impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
-        let (ui_event_tx, _ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
+        let (ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
         let bottom_pane = BottomPane::new(BottomPaneParams {
             app_event_tx: UiAppEventSender::new(ui_event_tx),
             frame_requester: crate::tui::FrameRequester::no_op(),
@@ -83,6 +84,7 @@ impl LiveAttachTui {
             active_turn_id: None,
             pending_prompt: None,
             pending_approvals: BTreeMap::new(),
+            bottom_pane_event_rx: ui_event_rx,
             slash_picker_index: 0,
             shortcuts_overlay_visible: false,
             kill_buffer: String::new(),
@@ -686,6 +688,14 @@ impl LiveAttachTui {
 
     pub(crate) fn handle_bottom_pane_key_event(&mut self, key: KeyEvent) -> InputResult {
         self.bottom_pane.handle_key_event(key)
+    }
+
+    pub(crate) fn drain_bottom_pane_events(&mut self) -> Vec<UiAppEvent> {
+        let mut events = Vec::new();
+        while let Ok(event) = self.bottom_pane_event_rx.try_recv() {
+            events.push(event);
+        }
+        events
     }
 
     pub(crate) fn handle_bottom_pane_paste(&mut self, text: String) {

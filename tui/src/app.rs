@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::app_event::AppEvent as WidgetAppEvent;
 use crate::bottom_pane::InputResult;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::LiveAttachTui;
@@ -359,56 +360,61 @@ impl App {
     /// Handle a key press event — mirrors upstream `App::handle_key_event`.
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<LiveTuiAction> {
         let mut queued_submit: Option<String> = None;
-        let ui = self.widget.ui_mut();
-        if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
-            ui.hide_shortcuts_overlay();
-            return Ok(LiveTuiAction::Continue);
-        }
-        if key.code == KeyCode::Esc
-            && ui.bottom_pane_is_task_running()
-            && ui.bottom_pane_no_modal_or_popup_active()
-        {
-            self.app_event_tx.send(AppEvent::Interrupt);
-            return Ok(LiveTuiAction::Continue);
-        }
-        match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+        let pending_widget_events = {
+            let ui = self.widget.ui_mut();
+            if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
+                ui.hide_shortcuts_overlay();
                 return Ok(LiveTuiAction::Continue);
             }
-            KeyCode::Char('?') => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                    && ui.bottom_pane_composer_text().trim().is_empty()
-                {
-                    ui.toggle_shortcuts_overlay();
-                } else {
-                    match ui.handle_bottom_pane_key_event(key) {
-                        InputResult::Submitted { text, .. } | InputResult::Queued { text, .. } => {
-                            queued_submit = Some(text);
+            match key.code {
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                    return Ok(LiveTuiAction::Continue);
+                }
+                KeyCode::Char('?') => {
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT)
+                        && ui.bottom_pane_composer_text().trim().is_empty()
+                    {
+                        ui.toggle_shortcuts_overlay();
+                    } else {
+                        match ui.handle_bottom_pane_key_event(key) {
+                            InputResult::Submitted { text, .. }
+                            | InputResult::Queued { text, .. } => {
+                                queued_submit = Some(text);
+                            }
+                            InputResult::Command(cmd) => {
+                                queued_submit = Some(format!("/{}", cmd.command()));
+                            }
+                            InputResult::CommandWithArgs(cmd, args, _) => {
+                                queued_submit = Some(format!("/{} {}", cmd.command(), args));
+                            }
+                            InputResult::None => {}
                         }
-                        InputResult::Command(cmd) => {
-                            queued_submit = Some(format!("/{}", cmd.command()));
-                        }
-                        InputResult::CommandWithArgs(cmd, args, _) => {
-                            queued_submit = Some(format!("/{} {}", cmd.command(), args));
-                        }
-                        InputResult::None => {}
                     }
                 }
+                _ => match ui.handle_bottom_pane_key_event(key) {
+                    InputResult::Submitted { text, .. } | InputResult::Queued { text, .. } => {
+                        queued_submit = Some(text);
+                    }
+                    InputResult::Command(cmd) => {
+                        queued_submit = Some(format!("/{}", cmd.command()));
+                    }
+                    InputResult::CommandWithArgs(cmd, args, _) => {
+                        queued_submit = Some(format!("/{} {}", cmd.command(), args));
+                    }
+                    InputResult::None => {}
+                },
             }
-            _ => match ui.handle_bottom_pane_key_event(key) {
-                InputResult::Submitted { text, .. } | InputResult::Queued { text, .. } => {
-                    queued_submit = Some(text);
-                }
-                InputResult::Command(cmd) => {
-                    queued_submit = Some(format!("/{}", cmd.command()));
-                }
-                InputResult::CommandWithArgs(cmd, args, _) => {
-                    queued_submit = Some(format!("/{} {}", cmd.command(), args));
-                }
-                InputResult::None => {}
-            },
+            ui.drain_bottom_pane_events()
+        };
+        for event in pending_widget_events {
+            if matches!(
+                event,
+                WidgetAppEvent::CodexOp(codex_core::protocol::Op::Interrupt)
+            ) {
+                self.app_event_tx.send(AppEvent::Interrupt);
+            }
         }
         if let Some(input) = queued_submit {
             self.app_event_tx.send(AppEvent::SubmitInput(input));
