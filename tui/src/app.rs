@@ -3,6 +3,7 @@ use super::*;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::LiveAttachTui;
 pub(super) use crate::core_compat::AppEvent;
+pub(super) use crate::core_compat::AppEventSender;
 pub(super) use crate::core_compat::AppExitInfo;
 pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
@@ -33,6 +34,10 @@ pub(crate) struct App {
     state: CliState,
     /// ID of the active app-server thread.
     thread_id: String,
+    /// Internal app event sender (upstream-style dispatch seam).
+    app_event_tx: AppEventSender,
+    /// Internal app event receiver.
+    app_event_rx: std::sync::mpsc::Receiver<AppEvent>,
 }
 
 impl App {
@@ -49,11 +54,14 @@ impl App {
         let mut widget = ChatWidget::new(thread_id.clone());
         widget.ui_mut().status_message = Some(status_message);
         let _ = widget.poll_stream_updates(&state);
+        let (tx, rx) = std::sync::mpsc::channel();
 
         Ok(Self {
             widget,
             state,
             thread_id,
+            app_event_tx: AppEventSender::new(tx),
+            app_event_rx: rx,
         })
     }
 
@@ -73,11 +81,14 @@ impl App {
             ui.status_message = Some("attached to app-server websocket".to_string());
         }
         state.last_thread_id = Some(session_id.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
 
         Ok(Self {
             widget,
             state,
             thread_id: session_id,
+            app_event_tx: AppEventSender::new(tx),
+            app_event_rx: rx,
         })
     }
 
@@ -157,6 +168,14 @@ impl App {
                 should_redraw = true;
             }
 
+            while let Ok(app_event) = self.app_event_rx.try_recv() {
+                match self.handle_event(app_event)? {
+                    LiveTuiAction::Continue => {}
+                    LiveTuiAction::Detach => return Ok(()),
+                }
+                should_redraw = true;
+            }
+
             // Tick: poll stream for app-server events.
             match self.handle_event(AppEvent::Tick)? {
                 LiveTuiAction::Continue => {}
@@ -224,7 +243,85 @@ impl App {
 
     /// Handle a key press event — mirrors upstream `App::handle_key_event`.
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<LiveTuiAction> {
-        handle_app_server_tui_key_event(key, &mut self.state, self.widget.ui_mut())
+        let mut queued_submit: Option<String> = None;
+        let ui = self.widget.ui_mut();
+        match key.code {
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                return Ok(LiveTuiAction::Detach);
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                ui.clear_input();
+            }
+            KeyCode::Up => {
+                if ui.slash_picker_is_active() {
+                    ui.slash_picker_move_up();
+                } else {
+                    ui.history_prev();
+                }
+            }
+            KeyCode::Down => {
+                if ui.slash_picker_is_active() {
+                    ui.slash_picker_move_down();
+                } else {
+                    ui.history_next();
+                }
+            }
+            KeyCode::Left => ui.move_input_cursor_left(),
+            KeyCode::Right => ui.move_input_cursor_right(),
+            KeyCode::Home => ui.move_input_cursor_home(),
+            KeyCode::End => ui.move_input_cursor_end(),
+            KeyCode::Esc => {
+                ui.hide_shortcuts_overlay();
+            }
+            KeyCode::Enter => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    ui.input_insert_char('\n');
+                    return Ok(LiveTuiAction::Continue);
+                }
+                if ui.should_apply_slash_picker_on_enter() {
+                    let _ = ui.apply_selected_slash_entry();
+                    return Ok(LiveTuiAction::Continue);
+                }
+                queued_submit = Some(ui.take_input());
+            }
+            KeyCode::Backspace => {
+                ui.input_backspace();
+            }
+            KeyCode::Delete => {
+                ui.input_delete();
+            }
+            KeyCode::Tab => {
+                if ui.slash_picker_is_active() {
+                    let _ = ui.apply_selected_slash_entry();
+                } else {
+                    ui.input_insert_char('\t');
+                }
+            }
+            KeyCode::Char('?') => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && ui.input.trim().is_empty()
+                {
+                    ui.toggle_shortcuts_overlay();
+                } else if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    ui.input_insert_char('?');
+                }
+            }
+            KeyCode::Char(ch) => {
+                if !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                {
+                    ui.input_insert_char(ch);
+                }
+            }
+            _ => {}
+        }
+        if let Some(input) = queued_submit {
+            self.app_event_tx.send(AppEvent::SubmitInput(input));
+        }
+        Ok(LiveTuiAction::Continue)
     }
 
     /// Handle submitted user input (from Enter key or programmatic submit).
@@ -396,183 +493,6 @@ pub fn handle_attach_tui_interactive(
         "session={} detached",
         exit_info.thread_id.as_deref().unwrap_or("unknown")
     )))
-}
-
-// ---------------------------------------------------------------------------
-// Key event handling
-// ---------------------------------------------------------------------------
-
-pub(crate) fn handle_app_server_tui_key_event(
-    key: crossterm::event::KeyEvent,
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-) -> Result<LiveTuiAction> {
-    match key.code {
-        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            return Ok(LiveTuiAction::Detach);
-        }
-        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            ui.clear_input();
-        }
-        KeyCode::Up => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_up();
-            } else {
-                ui.history_prev();
-            }
-        }
-        KeyCode::Down => {
-            if ui.slash_picker_is_active() {
-                ui.slash_picker_move_down();
-            } else {
-                ui.history_next();
-            }
-        }
-        KeyCode::Left => ui.move_input_cursor_left(),
-        KeyCode::Right => ui.move_input_cursor_right(),
-        KeyCode::Home => ui.move_input_cursor_home(),
-        KeyCode::End => ui.move_input_cursor_end(),
-        KeyCode::Esc => {
-            ui.hide_shortcuts_overlay();
-        }
-        KeyCode::Enter => {
-            if key.modifiers.contains(KeyModifiers::SHIFT) {
-                ui.input_insert_char('\n');
-                return Ok(LiveTuiAction::Continue);
-            }
-            if ui.should_apply_slash_picker_on_enter() {
-                let _ = ui.apply_selected_slash_entry();
-                return Ok(LiveTuiAction::Continue);
-            }
-            if handle_app_server_tui_submit(state, ui)? {
-                return Ok(LiveTuiAction::Detach);
-            }
-        }
-        KeyCode::Backspace => {
-            ui.input_backspace();
-        }
-        KeyCode::Delete => {
-            ui.input_delete();
-        }
-        KeyCode::Tab => {
-            if ui.slash_picker_is_active() {
-                let _ = ui.apply_selected_slash_entry();
-            } else {
-                ui.input_insert_char('\t');
-            }
-        }
-        KeyCode::Char('?') => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-                && ui.input.trim().is_empty()
-            {
-                ui.toggle_shortcuts_overlay();
-            } else if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                ui.input_insert_char('?');
-            }
-        }
-        KeyCode::Char(ch) => {
-            if !key.modifiers.contains(KeyModifiers::CONTROL)
-                && !key.modifiers.contains(KeyModifiers::ALT)
-            {
-                ui.input_insert_char(ch);
-            }
-        }
-        _ => {}
-    }
-    Ok(LiveTuiAction::Continue)
-}
-
-/// Legacy submit handler — keeps the inline submit flow for the key event path.
-/// The `App::handle_submit` method is the canonical path going forward.
-fn handle_app_server_tui_submit(state: &mut CliState, ui: &mut LiveAttachTui) -> Result<bool> {
-    let input = ui.take_input();
-    let trimmed = input.trim();
-    if trimmed.is_empty() {
-        return Ok(false);
-    }
-    ui.hide_shortcuts_overlay();
-    ui.remember_history_entry(trimmed);
-
-    match trimmed {
-        "/exit" | "/quit" => return Ok(true),
-        "/status" => {
-            let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
-            let approvals = if approval_ids.is_empty() {
-                "none".to_string()
-            } else {
-                proper_join(&approval_ids)
-            };
-            ui.status_message = Some(format!(
-                "thread={} approvals={} seq={} v={}",
-                ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
-            ));
-            return Ok(false);
-        }
-        "/refresh" => {
-            ui.status_message = Some("refreshing stream...".to_string());
-            return Ok(false);
-        }
-        "/new" => {
-            let thread_id = start_thread(state)?;
-            ui.session_id = thread_id.clone();
-            ui.active_turn_id = None;
-            ui.pending_approvals.clear();
-            ui.push_line(&format!("[thread switched] {thread_id}"));
-            ui.status_message = Some("started new thread".to_string());
-            state.last_thread_id = Some(thread_id);
-            return Ok(false);
-        }
-        _ => {}
-    }
-
-    if trimmed == "/interrupt" {
-        if let Some(turn_id) = ui.active_turn_id.clone() {
-            interrupt_turn(state, &ui.session_id, &turn_id)?;
-            ui.status_message = Some("interrupt requested".to_string());
-        } else {
-            ui.status_message = Some("no running turn".to_string());
-        }
-        return Ok(false);
-    }
-
-    if trimmed == "/resume" {
-        if let Some(thread_id) = resume_thread(state, &ui.session_id)? {
-            ui.session_id = thread_id.clone();
-            state.last_thread_id = Some(thread_id);
-            ui.status_message = Some("thread resumed".to_string());
-        } else {
-            ui.status_message = Some("resume returned no thread id".to_string());
-        }
-        return Ok(false);
-    }
-
-    if let Some(rest) = trimmed.strip_prefix("/approve") {
-        return handle_app_server_approval_decision(state, ui, rest.trim(), true).map(|_| false);
-    }
-    if let Some(rest) = trimmed.strip_prefix("/deny") {
-        return handle_app_server_approval_decision(state, ui, rest.trim(), false).map(|_| false);
-    }
-
-    if let Some(command) = trimmed
-        .strip_prefix('/')
-        .and_then(|value| value.split_whitespace().next())
-        && find_builtin_command(command, true, true, true, true).is_some()
-    {
-        ui.status_message = Some(format!(
-            "slash command /{command} is not implemented in crabbot app-server tui yet"
-        ));
-        return Ok(false);
-    }
-
-    ui.push_user_prompt(trimmed);
-    if let Some(turn_id) = start_turn(state, &ui.session_id, trimmed)? {
-        ui.active_turn_id = Some(turn_id);
-    }
-    ui.status_message = Some("waiting for response...".to_string());
-    Ok(false)
 }
 
 fn handle_app_server_approval_decision(

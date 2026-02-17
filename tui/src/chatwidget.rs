@@ -1,8 +1,5 @@
 use crate::app::align_left_right;
-use crate::app::handle_app_server_tui_key_event;
 use crate::app::poll_app_server_tui_stream_updates;
-use crate::core_compat::AppEvent;
-use crate::core_compat::LiveTuiAction;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
@@ -827,26 +824,6 @@ impl ChatWidget {
 
     pub(crate) fn poll_stream_updates(&mut self, state: &CliState) -> Result<bool> {
         poll_app_server_tui_stream_updates(state, &mut self.ui)
-    }
-
-    pub(crate) fn on_event(
-        &mut self,
-        event: AppEvent,
-        state: &mut CliState,
-    ) -> Result<LiveTuiAction> {
-        match event {
-            AppEvent::Key(key_event) => {
-                handle_app_server_tui_key_event(key_event, state, &mut self.ui)
-            }
-            AppEvent::Paste(pasted) => {
-                self.ui.input_insert_str(&pasted);
-                Ok(LiveTuiAction::Continue)
-            }
-            // Terminal events that don't require special handling.
-            AppEvent::Resize | AppEvent::Tick => Ok(LiveTuiAction::Continue),
-            // App-level events are handled by the App struct, not the widget.
-            _ => Ok(LiveTuiAction::Continue),
-        }
     }
 }
 

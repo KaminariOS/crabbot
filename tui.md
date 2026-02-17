@@ -95,7 +95,10 @@ Execution order to finish full port:
 
 ## Phase 2: App Layer Port (`app.rs`)
 
-- [ ] Port upstream `app.rs` structure in place (same file name/path).
+- [ ] Port upstream `app.rs` structure in place (same file name/path). (in progress)
+- [x] Added upstream-style internal `AppEvent` dispatch queue in `App` (`AppEventSender` + receiver drain in main loop).
+- [x] Centralized Enter submit path through `AppEvent::SubmitInput` -> `App::handle_submit` for app-runner flow.
+- [x] Removed duplicate legacy key/submit path from `app.rs`; app runtime now has a single active submit/action route.
 - [ ] Remove `codex-core` calls from `app.rs`; route backend operations through `core_compat.rs`.
 - [ ] Preserve upstream app event handling order and redraw scheduling.
 - [ ] Preserve upstream overlays/pickers mode transitions.
@@ -154,6 +157,9 @@ Execution order to finish full port:
 ## Transitional Notes (Current)
 
 - `tui/src/app.rs` now hosts the active app-server runtime loop (previous temporary shim removed).
+- `tui/src/app.rs` now uses an internal event queue similar to upstream app-event dispatch and drains queued events each loop iteration.
+- App submit handling in the app runtime is now single-path (`Enter` queues `SubmitInput`, handled by `App::handle_submit`) to reduce duplicated behavior drift.
+- Removed now-unused alternate `ChatWidget::on_event` bridge that relied on deleted legacy key/submit helpers.
 - `tui/src/tui.rs` and `tui/src/notifications/mod.rs` now match upstream exactly.
 - `tui/src/insert_history.rs` now matches upstream exactly.
 - `lib.rs` now provides an expanded compatibility surface so upstream `history_cell` / `exec_cell` / `status` compile while transport remains app-server driven.
