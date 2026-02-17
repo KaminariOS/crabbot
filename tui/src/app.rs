@@ -21,6 +21,10 @@ pub(super) use crate::core_compat::stream_events;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
+use crossterm::style::Color as CrosstermColor;
+use crossterm::style::ResetColor;
+use crossterm::style::SetBackgroundColor;
+use crossterm::style::SetForegroundColor;
 
 // ---------------------------------------------------------------------------
 // App struct — mirrors upstream `app::App` but backed by app-server transport
@@ -103,8 +107,14 @@ impl App {
 
         enable_raw_mode().context("enable raw mode for app-server tui")?;
         let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-            .context("enter alternate screen for app-server tui")?;
+        execute!(
+            stdout,
+            EnterAlternateScreen,
+            EnableBracketedPaste,
+            SetForegroundColor(CrosstermColor::White),
+            SetBackgroundColor(CrosstermColor::Black)
+        )
+        .context("enter alternate screen for app-server tui")?;
         let backend = CrosstermBackend::new(stdout);
         let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
         terminal.clear().context("clear app-server tui terminal")?;
@@ -115,6 +125,7 @@ impl App {
         let _ = execute!(
             terminal.backend_mut(),
             DisableBracketedPaste,
+            ResetColor,
             LeaveAlternateScreen
         );
         let _ = terminal.show_cursor();

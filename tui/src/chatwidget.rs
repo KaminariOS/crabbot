@@ -11,7 +11,6 @@ use crate::key_hint;
 use crate::mention_codec;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
-use crate::style;
 use crate::text_formatting;
 use crate::*;
 use codex_utils_fuzzy_match::fuzzy_match;
@@ -403,6 +402,13 @@ impl LiveAttachTui {
 
     pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         terminal.draw(|frame| {
+            // Force a stable baseline palette similar to upstream:
+            // black app background with high-contrast foreground text.
+            frame.render_widget(
+                Paragraph::new("").style(Style::default().bg(Color::Black).fg(Color::White)),
+                frame.area(),
+            );
+
             let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
             let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
             let slash_picker_lines = self.slash_picker_lines(frame.area().width as usize);
@@ -541,24 +547,11 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn composer_row_style(&self) -> Style {
-        let fg = self.readable_fg_color();
-        let themed = style::user_message_style();
-        if themed.bg.is_some() {
-            themed.fg(fg)
-        } else if env::var("COLORTERM")
-            .map(|value| value.contains("truecolor"))
-            .unwrap_or(false)
-        {
-            Style::default().bg(Color::Rgb(38, 42, 46)).fg(fg)
-        } else {
-            Style::default().bg(Color::DarkGray).fg(fg)
-        }
+        // Keep composer panel explicitly grey like upstream.
+        Style::default().bg(Color::DarkGray).fg(Color::White)
     }
 
     fn readable_fg_color(&self) -> Color {
-        // Some terminals report incorrect default palette values in alternate
-        // screen, which can produce black-on-black text. Prefer a stable,
-        // high-contrast foreground for now.
         Color::White
     }
 
