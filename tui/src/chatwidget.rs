@@ -193,6 +193,7 @@ impl LiveAttachTui {
                 }
             }
         }
+        self.sync_bottom_pane_status();
     }
 
     pub(crate) fn push_line(&mut self, line: &str) {
@@ -557,15 +558,21 @@ impl LiveAttachTui {
             handle,
         });
         self.status_message = Some("waiting for assistant response...".to_string());
+        self.bottom_pane.set_task_running(true);
+        self.bottom_pane.set_interrupt_hint_visible(true);
+        self.sync_bottom_pane_status();
         Ok(())
     }
 
     pub(crate) fn take_finished_prompt(&mut self) -> Option<InFlightPrompt> {
-        if self
+        let done = self
             .pending_prompt
             .as_ref()
-            .is_some_and(|pending| pending.handle.is_finished())
-        {
+            .is_some_and(|pending| pending.handle.is_finished());
+        if done {
+            self.bottom_pane.set_task_running(false);
+            self.bottom_pane.set_interrupt_hint_visible(false);
+            self.sync_bottom_pane_status();
             return self.pending_prompt.take();
         }
         None
@@ -640,6 +647,16 @@ impl LiveAttachTui {
 
     pub(crate) fn bottom_pane_composer_text(&self) -> String {
         self.bottom_pane.composer_text()
+    }
+
+    fn sync_bottom_pane_status(&mut self) {
+        if let Some(msg) = &self.status_message {
+            self.bottom_pane
+                .update_status("session".to_string(), Some(msg.clone()));
+            self.bottom_pane.ensure_status_indicator();
+        } else {
+            self.bottom_pane.hide_status_indicator();
+        }
     }
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
