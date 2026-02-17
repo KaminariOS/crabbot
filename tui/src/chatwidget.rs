@@ -1136,6 +1136,45 @@ impl LiveAttachTui {
             });
     }
 
+    pub(crate) fn open_feedback_selection(&mut self) {
+        let params =
+            crate::bottom_pane::feedback_selection_params(self.bottom_pane_event_tx.clone());
+        self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn open_feedback_consent(
+        &mut self,
+        category: crate::app_event::FeedbackCategory,
+        rollout_path: Option<std::path::PathBuf>,
+    ) {
+        let params = crate::bottom_pane::feedback_upload_consent_params(
+            self.bottom_pane_event_tx.clone(),
+            category,
+            rollout_path,
+        );
+        self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn open_feedback_note(
+        &mut self,
+        category: crate::app_event::FeedbackCategory,
+        include_logs: bool,
+        rollout_path: Option<std::path::PathBuf>,
+    ) {
+        let snapshot = codex_feedback::CodexLogSnapshot {
+            thread_id: self.session_id.clone(),
+        };
+        let view = crate::bottom_pane::FeedbackNoteView::new(
+            category,
+            snapshot,
+            rollout_path,
+            self.bottom_pane_event_tx.clone(),
+            include_logs,
+            crate::bottom_pane::FeedbackAudience::External,
+        );
+        self.bottom_pane.show_view(Box::new(view));
+    }
+
     pub(crate) fn set_status_message(&mut self, message: Option<String>) {
         self.status_message = message;
         self.sync_bottom_pane_status();

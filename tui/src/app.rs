@@ -602,6 +602,32 @@ impl App {
                 WidgetAppEvent::UpdateSandboxPolicy(policy) => {
                     self.apply_sandbox_policy_selection(policy)?;
                 }
+                WidgetAppEvent::UpdatePersonality(personality) => {
+                    self.apply_personality_selection(personality)?;
+                }
+                WidgetAppEvent::OpenFeedbackConsent { category } => {
+                    let thread_id = self.widget.ui_mut().session_id.clone();
+                    let rollout_path = fetch_rollout_path(&self.state, &thread_id)
+                        .ok()
+                        .flatten()
+                        .map(std::path::PathBuf::from);
+                    self.widget
+                        .ui_mut()
+                        .open_feedback_consent(category, rollout_path);
+                }
+                WidgetAppEvent::OpenFeedbackNote {
+                    category,
+                    include_logs,
+                } => {
+                    let thread_id = self.widget.ui_mut().session_id.clone();
+                    let rollout_path = fetch_rollout_path(&self.state, &thread_id)
+                        .ok()
+                        .flatten()
+                        .map(std::path::PathBuf::from);
+                    self.widget
+                        .ui_mut()
+                        .open_feedback_note(category, include_logs, rollout_path);
+                }
                 WidgetAppEvent::StatusLineSetup { .. } => {
                     self.widget
                         .ui_mut()
@@ -830,10 +856,7 @@ impl App {
                         .push_line(&format!("Failed to read rollout path: {err}")),
                 }
             }
-            SlashCommand::Feedback => self
-                .widget
-                .ui_mut()
-                .push_line("Feedback flow is not available in app-server TUI yet."),
+            SlashCommand::Feedback => self.widget.ui_mut().open_feedback_selection(),
             SlashCommand::Compact => self.start_compaction()?,
             SlashCommand::Plan | SlashCommand::Collab => self
                 .widget
@@ -844,10 +867,7 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("Experimental feature picker is not available in app-server TUI yet."),
-            SlashCommand::Personality => self
-                .widget
-                .ui_mut()
-                .push_line("Personality picker is not available in app-server TUI yet."),
+            SlashCommand::Personality => self.open_personality_picker(),
             SlashCommand::TestApproval => self
                 .widget
                 .ui_mut()
@@ -886,6 +906,35 @@ impl App {
             }
         }
         Ok(())
+    }
+
+    fn open_personality_picker(&mut self) {
+        use codex_protocol::config_types::Personality;
+
+        let items = [Personality::Friendly, Personality::Pragmatic]
+            .into_iter()
+            .map(|personality| {
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::UpdatePersonality(personality));
+                });
+                crate::bottom_pane::SelectionItem {
+                    name: personality_label(personality).to_string(),
+                    description: Some(personality_description(personality).to_string()),
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select Personality".to_string()),
+                subtitle: Some("Choose a communication style for Codex.".to_string()),
+                items,
+                ..Default::default()
+            });
     }
 
     /// Handle submitted user input (from Enter key or programmatic submit).
@@ -1240,6 +1289,27 @@ impl App {
         self.widget
             .ui_mut()
             .set_status_message(Some(format!("model updated to {model}")));
+        Ok(())
+    }
+
+    fn apply_personality_selection(
+        &mut self,
+        personality: codex_protocol::config_types::Personality,
+    ) -> Result<()> {
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": "personality",
+                "value": personality_config_value(personality),
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        self.widget.ui_mut().set_status_message(Some(format!(
+            "personality set to {}",
+            personality_label(personality)
+        )));
         Ok(())
     }
 
@@ -1780,6 +1850,34 @@ fn parse_reasoning_effort(
             Some(codex_protocol::openai_models::ReasoningEffort::XHigh)
         }
         _ => None,
+    }
+}
+
+fn personality_label(personality: codex_protocol::config_types::Personality) -> &'static str {
+    match personality {
+        codex_protocol::config_types::Personality::None => "None",
+        codex_protocol::config_types::Personality::Friendly => "Friendly",
+        codex_protocol::config_types::Personality::Pragmatic => "Pragmatic",
+    }
+}
+
+fn personality_description(personality: codex_protocol::config_types::Personality) -> &'static str {
+    match personality {
+        codex_protocol::config_types::Personality::None => "No personality instructions.",
+        codex_protocol::config_types::Personality::Friendly => "Warm, collaborative, and helpful.",
+        codex_protocol::config_types::Personality::Pragmatic => {
+            "Concise, task-focused, and direct."
+        }
+    }
+}
+
+fn personality_config_value(
+    personality: codex_protocol::config_types::Personality,
+) -> &'static str {
+    match personality {
+        codex_protocol::config_types::Personality::None => "none",
+        codex_protocol::config_types::Personality::Friendly => "friendly",
+        codex_protocol::config_types::Personality::Pragmatic => "pragmatic",
     }
 }
 
