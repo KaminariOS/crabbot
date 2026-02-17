@@ -71,7 +71,7 @@ impl App {
         state.last_thread_id = Some(thread_id.clone());
 
         let mut widget = ChatWidget::new(thread_id.clone());
-        widget.ui_mut().status_message = Some(status_message);
+        widget.ui_mut().set_status_message(Some(status_message));
         match stream_events(&state, widget.ui_mut().last_sequence) {
             Ok(events) => {
                 if !events.is_empty() {
@@ -79,8 +79,10 @@ impl App {
                 }
             }
             Err(err) => {
-                widget.ui_mut().status_message =
-                    Some(format!("connected; initial stream sync failed: {}", err));
+                widget.ui_mut().set_status_message(Some(format!(
+                    "connected; initial stream sync failed: {}",
+                    err
+                )));
             }
         }
         let (tx, rx) = std::sync::mpsc::channel();
@@ -123,7 +125,7 @@ impl App {
                 .unwrap_or("unknown")
                 .to_string();
             ui.apply_stream_events(&initial_events);
-            ui.status_message = Some("attached to app-server websocket".to_string());
+            ui.set_status_message(Some("attached to app-server websocket".to_string()));
         }
         state.last_thread_id = Some(session_id.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -291,7 +293,7 @@ impl App {
         if announce_switch && changed {
             ui.push_line(&format!("[thread switched] {thread_id}"));
         }
-        ui.status_message = Some(status_message.to_string());
+        ui.set_status_message(Some(status_message.to_string()));
         self.state.last_thread_id = Some(thread_id.clone());
         self.thread_id = thread_id;
     }
@@ -324,8 +326,9 @@ impl App {
                         }
                     }
                     Err(err) => {
-                        self.widget.ui_mut().status_message =
-                            Some(format!("stream poll failed: {err}"));
+                        self.widget
+                            .ui_mut()
+                            .set_status_message(Some(format!("stream poll failed: {err}")));
                     }
                 }
                 Ok(LiveTuiAction::Continue)
@@ -351,7 +354,7 @@ impl App {
                 )? {
                     ui.active_turn_id = Some(turn_id);
                 }
-                ui.status_message = Some("waiting for response...".to_string());
+                ui.set_status_message(Some("waiting for response...".to_string()));
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::NewSession => {
@@ -363,9 +366,9 @@ impl App {
                 let ui = self.widget.ui_mut();
                 if let Some(turn_id) = ui.active_turn_id.clone() {
                     interrupt_turn(&self.state, &ui.session_id, &turn_id)?;
-                    ui.status_message = Some("interrupt requested".to_string());
+                    ui.set_status_message(Some("interrupt requested".to_string()));
                 } else {
-                    ui.status_message = Some("no running turn".to_string());
+                    ui.set_status_message(Some("no running turn".to_string()));
                 }
                 Ok(LiveTuiAction::Continue)
             }
@@ -377,14 +380,18 @@ impl App {
                 } else {
                     proper_join(&approval_ids)
                 };
-                ui.status_message = Some(format!(
+                let summary = format!(
                     "thread={} approvals={} seq={} v={}",
                     ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
-                ));
+                );
+                ui.push_line(&summary);
+                ui.set_status_message(Some(summary));
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::RefreshStream => {
-                self.widget.ui_mut().status_message = Some("refreshing stream...".to_string());
+                self.widget
+                    .ui_mut()
+                    .set_status_message(Some("refreshing stream...".to_string()));
                 self.app_event_tx.send(AppEvent::Tick);
                 Ok(LiveTuiAction::Continue)
             }
@@ -393,7 +400,7 @@ impl App {
                 if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
                     self.switch_to_thread(thread_id, "thread resumed", false);
                 } else {
-                    ui.status_message = Some("resume returned no thread id".to_string());
+                    ui.set_status_message(Some("resume returned no thread id".to_string()));
                 }
                 Ok(LiveTuiAction::Continue)
             }
@@ -644,8 +651,9 @@ impl App {
 
     fn run_user_shell_command(&mut self, command: &str) {
         if command.is_empty() {
-            self.widget.ui_mut().status_message =
-                Some("prefix with ! to run a local shell command".to_string());
+            self.widget.ui_mut().set_status_message(Some(
+                "prefix with ! to run a local shell command".to_string(),
+            ));
             return;
         }
         let started = Instant::now();
@@ -795,11 +803,11 @@ fn handle_app_server_approval_decision(
         bail!("pending approval id not found: {approval_key}");
     };
     respond_to_approval(state, request.request_id, &request.method, approve)?;
-    ui.status_message = Some(format!(
+    ui.set_status_message(Some(format!(
         "{} request {}",
         if approve { "approved" } else { "denied" },
         approval_key
-    ));
+    )));
     Ok(())
 }
 

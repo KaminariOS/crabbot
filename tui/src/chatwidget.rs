@@ -936,6 +936,11 @@ impl LiveAttachTui {
         self.bottom_pane.insert_str(text);
     }
 
+    pub(crate) fn set_status_message(&mut self, message: Option<String>) {
+        self.status_message = message;
+        self.sync_bottom_pane_status();
+    }
+
     pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.bottom_pane.take_recent_submission_mention_bindings()
     }
