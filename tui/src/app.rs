@@ -1090,6 +1090,9 @@ mod tests {
     use crate::bottom_pane::MentionBinding;
     use crate::chatwidget::ChatWidget;
     use crate::file_search::FileSearchManager;
+    use crossterm::event::KeyCode;
+    use crossterm::event::KeyEvent;
+    use crossterm::event::KeyModifiers;
 
     fn make_test_app() -> App {
         let widget = ChatWidget::new("sess_test".to_string());
@@ -1116,6 +1119,24 @@ mod tests {
         let action = app
             .handle_submit("/status", Vec::new(), Vec::<MentionBinding>::new())
             .expect("status submit should not fail");
+        assert!(matches!(action, LiveTuiAction::Continue));
+        let status = app
+            .widget
+            .ui_mut()
+            .status_message
+            .clone()
+            .expect("status message should be set");
+        assert!(status.contains("thread=sess_test"), "status={status}");
+    }
+
+    #[test]
+    fn handle_key_event_status_command_dispatches_from_composer() {
+        let mut app = make_test_app();
+        app.widget.ui_mut().bottom_pane_insert_str("/status");
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
+        let action = app
+            .handle_key_event(enter)
+            .expect("handle key event should succeed");
         assert!(matches!(action, LiveTuiAction::Continue));
         let status = app
             .widget
