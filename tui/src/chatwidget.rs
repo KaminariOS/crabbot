@@ -16,9 +16,11 @@ use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
 use crate::history_cell::new_active_mcp_tool_call;
+use crate::history_cell::new_active_web_search_call;
 use crate::history_cell::new_error_event;
 use crate::history_cell::new_info_event;
 use crate::history_cell::new_user_prompt;
+use crate::history_cell::new_web_search_call;
 use crate::key_hint;
 use crate::mention_codec;
 use crate::render::renderable::Renderable;
@@ -228,6 +230,14 @@ impl LiveAttachTui {
                 duration,
                 result,
             } => self.on_mcp_tool_call_end(&call_id, duration, result),
+            UiEvent::WebSearchBegin { call_id, query } => {
+                self.on_web_search_begin(call_id, query);
+            }
+            UiEvent::WebSearchEnd {
+                call_id,
+                query,
+                action,
+            } => self.on_web_search_end(&call_id, query, action),
             UiEvent::TranscriptLine(line) => {
                 self.push_line(&line);
             }
@@ -417,6 +427,39 @@ impl LiveAttachTui {
         self.history_cells.push(Box::new(new_info_event(
             format!("[mcp done] {call_id}"),
             None,
+        )));
+    }
+
+    fn on_web_search_begin(&mut self, call_id: String, query: String) {
+        self.flush_assistant_message();
+        self.history_cells
+            .push(Box::new(new_active_web_search_call(call_id, query, true)));
+    }
+
+    fn on_web_search_end(
+        &mut self,
+        call_id: &str,
+        query: String,
+        action: codex_protocol::models::WebSearchAction,
+    ) {
+        for cell in self.history_cells.iter_mut().rev() {
+            let Some(web_cell) = cell
+                .as_any_mut()
+                .downcast_mut::<crate::history_cell::WebSearchCell>()
+            else {
+                continue;
+            };
+            if web_cell.call_id() != call_id {
+                continue;
+            }
+            web_cell.update(action.clone(), query.clone());
+            web_cell.complete();
+            return;
+        }
+        self.history_cells.push(Box::new(new_web_search_call(
+            call_id.to_string(),
+            query,
+            action,
         )));
     }
 

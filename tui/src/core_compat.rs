@@ -81,6 +81,15 @@ pub(crate) enum UiEvent {
         duration: Duration,
         result: Result<codex_protocol::mcp::CallToolResult, String>,
     },
+    WebSearchBegin {
+        call_id: String,
+        query: String,
+    },
+    WebSearchEnd {
+        call_id: String,
+        query: String,
+        action: codex_protocol::models::WebSearchAction,
+    },
     TranscriptLine(String),
     StatusMessage(String),
     ApprovalRequired(UiApprovalRequest),
@@ -495,6 +504,11 @@ fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
             }]
         }
         "web_search" | "webSearch" => {
+            let call_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("web-search")
+                .to_string();
             let query = item
                 .get("query")
                 .and_then(Value::as_str)
@@ -503,7 +517,7 @@ fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
             if query.is_empty() {
                 Vec::new()
             } else {
-                vec![UiEvent::TranscriptLine(format!("[web search] {query}"))]
+                vec![UiEvent::WebSearchBegin { call_id, query }]
             }
         }
         _ => Vec::new(),
@@ -580,6 +594,26 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
                 call_id: call_id.to_string(),
                 duration: duration_ms_to_duration(duration_ms),
                 result,
+            }]
+        }
+        "web_search" | "webSearch" => {
+            let Some(call_id) = item.get("id").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let query = item
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let action = if item.get("action").is_some() {
+                codex_protocol::models::WebSearchAction::Cached
+            } else {
+                codex_protocol::models::WebSearchAction::Requested
+            };
+            vec![UiEvent::WebSearchEnd {
+                call_id: call_id.to_string(),
+                query,
+                action,
             }]
         }
         _ => Vec::new(),
