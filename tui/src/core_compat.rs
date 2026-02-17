@@ -445,13 +445,38 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             vec![UiEvent::TurnCompleted { status }]
         }
         "thread/compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "thread/rolledBack" | "thread/rolled_back" => notification
+            .params
+            .get("rollback")
+            .and_then(|rollback| {
+                rollback
+                    .get("numTurns")
+                    .or_else(|| rollback.get("num_turns"))
+            })
+            .and_then(Value::as_u64)
+            .map(|num_turns| {
+                vec![UiEvent::TranscriptLine(format!(
+                    "[thread rolled back] {num_turns} turns"
+                ))]
+            })
+            .unwrap_or_else(|| vec![UiEvent::TranscriptLine("[thread rolled back]".to_string())]),
         "turn/aborted" => vec![UiEvent::TurnCompleted {
             status: Some("aborted".to_string()),
         }],
         "turn/failed" => vec![UiEvent::TurnCompleted {
             status: Some("failed".to_string()),
         }],
-        "turn/diff/updated" => Vec::new(),
+        "turn/diff/updated" => notification
+            .params
+            .get("unifiedDiff")
+            .or_else(|| notification.params.get("unified_diff"))
+            .and_then(Value::as_str)
+            .map(|diff| {
+                vec![UiEvent::TranscriptLine(format!(
+                    "[turn diff updated]\n{diff}"
+                ))]
+            })
+            .unwrap_or_default(),
         "thread/tokenUsage/updated" => parse_token_usage_updated(&notification.params)
             .map(|(token_info, total_usage)| {
                 vec![UiEvent::TokenUsageUpdated {
@@ -675,16 +700,136 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
     let Some(event) = params.get("event").or_else(|| params.get("payload")) else {
         return Vec::new();
     };
-    let msg_type = event
-        .get("msg")
-        .and_then(|msg| msg.get("type"))
+    let msg = event.get("msg").unwrap_or(event);
+    let msg_type = msg
+        .get("type")
         .or_else(|| event.get("type"))
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if msg_type.starts_with("collab_") || msg_type.starts_with("collab") {
-        return vec![UiEvent::CollabEvent(format!("[collab] {msg_type}"))];
+
+    match msg_type {
+        "session_configured" => {
+            let model = msg
+                .get("model")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown-model");
+            vec![UiEvent::StatusMessage(format!(
+                "session configured ({model})"
+            ))]
+        }
+        "thread_name_updated" => msg
+            .get("thread_name")
+            .or_else(|| msg.get("threadName"))
+            .and_then(Value::as_str)
+            .map(|name| vec![UiEvent::ThreadRenamed(name.to_string())])
+            .unwrap_or_default(),
+        "warning" => msg
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| vec![UiEvent::TranscriptLine(format!("[warning] {message}"))])
+            .unwrap_or_default(),
+        "error" => {
+            let message = msg
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown error")
+                .to_string();
+            vec![
+                UiEvent::TranscriptLine(format!("[error] {message}")),
+                UiEvent::TurnCompleted {
+                    status: Some("failed".to_string()),
+                },
+            ]
+        }
+        "stream_error" => {
+            let message = msg
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("stream error")
+                .to_string();
+            vec![UiEvent::TranscriptLine(format!("[stream error] {message}"))]
+        }
+        "turn_started" => msg
+            .get("turn_id")
+            .or_else(|| msg.get("turnId"))
+            .and_then(Value::as_str)
+            .map(|turn_id| vec![UiEvent::TurnStarted(turn_id.to_string())])
+            .unwrap_or_default(),
+        "turn_complete" | "task_complete" => vec![UiEvent::TurnCompleted {
+            status: Some("completed".to_string()),
+        }],
+        "turn_aborted" => vec![UiEvent::TurnCompleted {
+            status: Some("aborted".to_string()),
+        }],
+        "agent_message" => msg
+            .get("message")
+            .or_else(|| msg.get("text"))
+            .and_then(Value::as_str)
+            .map(|text| {
+                vec![UiEvent::AssistantDelta {
+                    turn_id: None,
+                    delta: text.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "agent_message_delta" | "plan_delta" | "agent_reasoning_delta" => msg
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|delta| {
+                vec![UiEvent::AssistantDelta {
+                    turn_id: None,
+                    delta: delta.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "entered_review_mode" => vec![UiEvent::TranscriptLine("[entered review mode]".to_string())],
+        "exited_review_mode" => vec![UiEvent::TranscriptLine("[exited review mode]".to_string())],
+        "undo_started" => vec![UiEvent::TranscriptLine("[undo started]".to_string())],
+        "undo_completed" => vec![UiEvent::TranscriptLine("[undo completed]".to_string())],
+        "context_compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "mcp_startup_update" => {
+            let server = msg
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let status = msg
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("starting")
+                .to_string();
+            vec![UiEvent::McpStartupUpdate { server, status }]
+        }
+        "mcp_startup_complete" => {
+            let failed = msg
+                .get("failed")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("server").and_then(Value::as_str))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let cancelled = msg
+                .get("cancelled")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            vec![UiEvent::McpStartupComplete { failed, cancelled }]
+        }
+        other if other.starts_with("collab_") || other.starts_with("collab") => {
+            vec![UiEvent::CollabEvent(format!("[collab] {other}"))]
+        }
+        _ => Vec::new(),
     }
-    Vec::new()
 }
 
 fn parse_token_usage_updated(
