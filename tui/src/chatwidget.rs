@@ -113,6 +113,7 @@ pub(crate) struct LiveAttachTui {
     pub(crate) active_turn_id: Option<String>,
     pending_prompt: Option<InFlightPrompt>,
     pub(crate) pending_approvals: BTreeMap<String, UiApprovalRequest>,
+    bottom_pane_event_tx: UiAppEventSender,
     bottom_pane_event_rx: tokio::sync::mpsc::UnboundedReceiver<UiAppEvent>,
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
@@ -123,9 +124,10 @@ pub(crate) struct LiveAttachTui {
 
 impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
-        let (ui_event_tx, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
+        let (ui_event_tx_raw, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
+        let ui_event_tx = UiAppEventSender::new(ui_event_tx_raw);
         let bottom_pane = BottomPane::new(BottomPaneParams {
-            app_event_tx: UiAppEventSender::new(ui_event_tx),
+            app_event_tx: ui_event_tx.clone(),
             frame_requester: crate::tui::FrameRequester::no_op(),
             has_input_focus: true,
             enhanced_keys_supported: true,
@@ -152,6 +154,7 @@ impl LiveAttachTui {
             active_turn_id: None,
             pending_prompt: None,
             pending_approvals: BTreeMap::new(),
+            bottom_pane_event_tx: ui_event_tx,
             bottom_pane_event_rx: ui_event_rx,
             slash_picker_index: 0,
             shortcuts_overlay_visible: false,
@@ -993,6 +996,23 @@ impl LiveAttachTui {
 
     pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn show_review_custom_prompt(&mut self) {
+        let tx = self.bottom_pane_event_tx.clone();
+        let view = crate::bottom_pane::custom_prompt_view::CustomPromptView::new(
+            "Custom review instructions".to_string(),
+            "Type instructions and press Enter".to_string(),
+            None,
+            Box::new(move |prompt: String| {
+                let trimmed = prompt.trim().to_string();
+                if trimmed.is_empty() {
+                    return;
+                }
+                tx.send(UiAppEvent::StartReviewCustomInstructions(trimmed));
+            }),
+        );
+        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn set_status_message(&mut self, message: Option<String>) {

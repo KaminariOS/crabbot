@@ -314,6 +314,23 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
+    /// Start a review on uncommitted changes.
+    StartReviewUncommitted,
+
+    /// Start a review against a selected base branch.
+    StartReviewBaseBranch {
+        branch: String,
+    },
+
+    /// Start a review for a selected commit.
+    StartReviewCommit {
+        sha: String,
+        title: Option<String>,
+    },
+
+    /// Start a custom-instructions review.
+    StartReviewCustomInstructions(String),
+
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

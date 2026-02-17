@@ -552,6 +552,27 @@ impl App {
                 WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
                     self.open_permissions_picker()?;
                 }
+                WidgetAppEvent::OpenReviewBranchPicker(cwd) => {
+                    self.open_review_branch_picker(&cwd);
+                }
+                WidgetAppEvent::OpenReviewCommitPicker(cwd) => {
+                    self.open_review_commit_picker(&cwd);
+                }
+                WidgetAppEvent::OpenReviewCustomPrompt => {
+                    self.widget.ui_mut().show_review_custom_prompt();
+                }
+                WidgetAppEvent::StartReviewUncommitted => {
+                    self.start_review_uncommitted()?;
+                }
+                WidgetAppEvent::StartReviewBaseBranch { branch } => {
+                    self.start_review_base_branch(&branch)?;
+                }
+                WidgetAppEvent::StartReviewCommit { sha, title } => {
+                    self.start_review_commit(&sha, title.as_deref())?;
+                }
+                WidgetAppEvent::StartReviewCustomInstructions(instructions) => {
+                    self.start_review_custom(&instructions)?;
+                }
                 WidgetAppEvent::ForkCurrentSession => {
                     let active_thread_id = self.widget.ui_mut().session_id.clone();
                     if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
@@ -625,7 +646,7 @@ impl App {
         &mut self,
         cmd: SlashCommand,
         args: Option<String>,
-        text_elements: Vec<codex_protocol::user_input::TextElement>,
+        _text_elements: Vec<codex_protocol::user_input::TextElement>,
     ) -> Result<()> {
         if !cmd.available_during_task() && self.widget.ui_mut().bottom_pane_is_task_running() {
             self.widget
@@ -681,15 +702,9 @@ impl App {
             }
             SlashCommand::Review => {
                 if arg.trim().is_empty() {
-                    self.widget
-                        .ui_mut()
-                        .push_line("[info] /review popup is not yet ported in app-server tui");
+                    self.open_review_popup();
                 } else {
-                    self.app_event_tx.send(AppEvent::StartTurn {
-                        text: format!("/review {}", arg.trim()),
-                        text_elements,
-                        mention_bindings: Vec::new(),
-                    });
+                    self.start_review_custom(arg.trim())?;
                 }
             }
             SlashCommand::Rename => {
@@ -821,14 +836,42 @@ impl App {
                         .push_line(&format!("Failed to read rollout path: {err}")),
                 }
             }
-            _ => {
-                let _ = arg;
-                let _ = text_elements;
-                self.widget.ui_mut().push_line(&format!(
-                    "[info] /{} is not yet ported in app-server tui",
-                    cmd.command()
-                ));
-            }
+            SlashCommand::Feedback => self
+                .widget
+                .ui_mut()
+                .push_line("Feedback flow is not available in app-server TUI yet."),
+            SlashCommand::Compact => self
+                .widget
+                .ui_mut()
+                .push_line("/compact is not available in app-server TUI yet."),
+            SlashCommand::Plan | SlashCommand::Collab => self
+                .widget
+                .ui_mut()
+                .push_line("Collaboration modes are not available in app-server TUI yet."),
+            SlashCommand::Agent => self
+                .widget
+                .ui_mut()
+                .push_line("Agent thread picker is not available in app-server TUI yet."),
+            SlashCommand::Experimental => self
+                .widget
+                .ui_mut()
+                .push_line("Experimental feature picker is not available in app-server TUI yet."),
+            SlashCommand::Personality => self
+                .widget
+                .ui_mut()
+                .push_line("Personality picker is not available in app-server TUI yet."),
+            SlashCommand::TestApproval => self
+                .widget
+                .ui_mut()
+                .push_line("/test-approval is not available in app-server TUI."),
+            SlashCommand::MemoryDrop | SlashCommand::MemoryUpdate => self
+                .widget
+                .ui_mut()
+                .push_line("Memory debug commands are not available in app-server TUI."),
+            SlashCommand::ElevateSandbox => self
+                .widget
+                .ui_mut()
+                .push_line("/setup-default-sandbox is not available on this runtime."),
         }
         Ok(())
     }
@@ -1171,6 +1214,192 @@ impl App {
                 items,
                 ..Default::default()
             });
+        Ok(())
+    }
+
+    fn open_review_popup(&mut self) {
+        let items = vec![
+            crate::bottom_pane::SelectionItem {
+                name: "Review against a base branch".to_string(),
+                description: Some("(PR Style)".to_string()),
+                actions: vec![Box::new({
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+                    move |sender| {
+                        sender.send(WidgetAppEvent::OpenReviewBranchPicker(cwd.clone()));
+                    }
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Review uncommitted changes".to_string(),
+                actions: vec![Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::StartReviewUncommitted);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Review a commit".to_string(),
+                actions: vec![Box::new({
+                    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+                    move |sender| {
+                        sender.send(WidgetAppEvent::OpenReviewCommitPicker(cwd.clone()));
+                    }
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Custom review instructions".to_string(),
+                actions: vec![Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::OpenReviewCustomPrompt);
+                })],
+                dismiss_on_select: false,
+                ..Default::default()
+            },
+        ];
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a review preset".to_string()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    fn open_review_branch_picker(&mut self, cwd: &std::path::Path) {
+        let current_branch =
+            git_current_branch_name(cwd).unwrap_or_else(|| "(detached HEAD)".into());
+        let branches = git_local_branches(cwd);
+        if branches.is_empty() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("No local branches found for review.".to_string()));
+            return;
+        }
+
+        let items = branches
+            .into_iter()
+            .map(|branch| {
+                let search_value = branch.clone();
+                crate::bottom_pane::SelectionItem {
+                    name: format!("{current_branch} -> {branch}"),
+                    actions: vec![Box::new(move |sender| {
+                        sender.send(WidgetAppEvent::StartReviewBaseBranch {
+                            branch: branch.clone(),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    search_value: Some(search_value),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a base branch".to_string()),
+                items,
+                is_searchable: true,
+                search_placeholder: Some("Type to search branches".to_string()),
+                ..Default::default()
+            });
+    }
+
+    fn open_review_commit_picker(&mut self, cwd: &std::path::Path) {
+        let commits = git_recent_commits(cwd, 100);
+        if commits.is_empty() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("No commits found for review.".to_string()));
+            return;
+        }
+
+        let items = commits
+            .into_iter()
+            .map(|entry| {
+                let subject = entry.subject.clone();
+                let sha = entry.sha.clone();
+                let search_value = format!("{} {}", subject, sha);
+                crate::bottom_pane::SelectionItem {
+                    name: subject.clone(),
+                    actions: vec![Box::new(move |sender| {
+                        sender.send(WidgetAppEvent::StartReviewCommit {
+                            sha: sha.clone(),
+                            title: Some(subject.clone()),
+                        });
+                    })],
+                    dismiss_on_select: true,
+                    search_value: Some(search_value),
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select a commit to review".to_string()),
+                items,
+                is_searchable: true,
+                search_placeholder: Some("Type to search commits".to_string()),
+                ..Default::default()
+            });
+    }
+
+    fn start_review_uncommitted(&mut self) -> Result<()> {
+        self.start_review_with_target(json!({ "type": "uncommittedChanges" }))
+    }
+
+    fn start_review_base_branch(&mut self, branch: &str) -> Result<()> {
+        self.start_review_with_target(json!({
+            "type": "baseBranch",
+            "branch": branch,
+        }))
+    }
+
+    fn start_review_commit(&mut self, sha: &str, title: Option<&str>) -> Result<()> {
+        self.start_review_with_target(json!({
+            "type": "commit",
+            "sha": sha,
+            "title": title,
+        }))
+    }
+
+    fn start_review_custom(&mut self, instructions: &str) -> Result<()> {
+        self.start_review_with_target(json!({
+            "type": "custom",
+            "instructions": instructions,
+        }))
+    }
+
+    fn start_review_with_target(&mut self, target: Value) -> Result<()> {
+        let thread_id = self.widget.ui_mut().session_id.clone();
+        let response = app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "review/start",
+            json!({
+                "threadId": thread_id,
+                "target": target,
+            }),
+        )?;
+
+        if let Some(turn_id) = response
+            .result
+            .get("turn")
+            .and_then(|turn| turn.get("id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+        {
+            self.widget.ui_mut().active_turn_id = Some(turn_id);
+        }
+        self.widget
+            .ui_mut()
+            .set_status_message(Some("running review...".to_string()));
         Ok(())
     }
 
@@ -1817,6 +2046,72 @@ fn clean_background_terminals(state: &CliState, thread_id: &str) -> Result<()> {
         }),
     )?;
     Ok(())
+}
+
+#[derive(Clone)]
+struct CommitPickerEntry {
+    sha: String,
+    subject: String,
+}
+
+fn git_command_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+fn git_current_branch_name(cwd: &std::path::Path) -> Option<String> {
+    git_command_output(cwd, &["branch", "--show-current"])
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn git_local_branches(cwd: &std::path::Path) -> Vec<String> {
+    let mut branches = git_command_output(cwd, &["branch", "--format=%(refname:short)"])
+        .map(|out| {
+            out.lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    branches.sort_unstable();
+    branches
+}
+
+fn git_recent_commits(cwd: &std::path::Path, limit: usize) -> Vec<CommitPickerEntry> {
+    let mut args = vec!["log".to_string()];
+    if limit > 0 {
+        args.push("-n".to_string());
+        args.push(limit.to_string());
+    }
+    args.push("--pretty=format:%H%x1f%ct%x1f%s".to_string());
+    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+    let Some(out) = git_command_output(cwd, &arg_refs) else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\u{001f}');
+            let sha = parts.next()?.trim();
+            let _timestamp = parts.next()?.trim();
+            let subject = parts.next().unwrap_or_default().trim();
+            if sha.is_empty() {
+                return None;
+            }
+            Some(CommitPickerEntry {
+                sha: sha.to_string(),
+                subject: subject.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn fetch_mcp_tools_output(state: &CliState) -> Result<crate::history_cell::PlainHistoryCell> {
