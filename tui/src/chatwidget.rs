@@ -508,6 +508,9 @@ impl LiveAttachTui {
             UiEvent::AgentMessageItemCompleted { phase } => {
                 self.on_agent_message_item_completed(phase);
             }
+            UiEvent::PlanItemCompleted { text } => {
+                self.on_plan_item_completed(text);
+            }
             UiEvent::TurnCompleted {
                 status,
                 last_agent_message,
@@ -642,7 +645,13 @@ impl LiveAttachTui {
             UiEvent::ReviewModeEntered { hint } => {
                 self.on_entered_review_mode(hint, from_replay);
             }
-            UiEvent::ReviewModeExited => self.on_exited_review_mode(),
+            UiEvent::ReviewModeExited {
+                review_output_overall_explanation,
+                review_output_findings_count,
+            } => self.on_exited_review_mode(
+                review_output_overall_explanation,
+                review_output_findings_count,
+            ),
             UiEvent::UserMessage {
                 text,
                 text_elements,
@@ -1647,10 +1656,28 @@ impl LiveAttachTui {
         )));
     }
 
-    fn on_exited_review_mode(&mut self) {
+    fn on_exited_review_mode(
+        &mut self,
+        review_output_overall_explanation: Option<String>,
+        review_output_findings_count: Option<usize>,
+    ) {
         self.flush_assistant_message();
         self.flush_interrupt_queue();
         self.flush_active_cell();
+        if matches!(review_output_findings_count, Some(0))
+            && let Some(explanation) = review_output_overall_explanation
+        {
+            let trimmed = explanation.trim();
+            if trimmed.is_empty() {
+                self.add_boxed_history(Box::new(new_error_event(
+                    "Reviewer failed to output a response.".to_string(),
+                )));
+            } else {
+                self.add_boxed_history(Box::new(PlainHistoryCell::new(vec![
+                    trimmed.to_string().into(),
+                ])));
+            }
+        }
         self.is_review_mode = false;
         self.restore_pre_review_token_info();
         self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
@@ -1686,6 +1713,16 @@ impl LiveAttachTui {
     fn on_agent_message_item_completed(&mut self, phase: Option<String>) {
         self.pending_status_indicator_restore = matches!(phase.as_deref(), Some("commentary"));
         self.maybe_restore_status_indicator_after_stream_idle();
+    }
+
+    fn on_plan_item_completed(&mut self, text: String) {
+        let trimmed = text.trim();
+        if trimmed.is_empty() {
+            return;
+        }
+        self.add_boxed_history(Box::new(crate::history_cell::new_proposed_plan(
+            trimmed.to_string(),
+        )));
     }
 
     fn on_interrupted_turn(&mut self, reason: Option<String>, from_replay: bool) {

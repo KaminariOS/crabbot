@@ -70,6 +70,9 @@ pub(crate) enum UiEvent {
     AgentMessageItemCompleted {
         phase: Option<String>,
     },
+    PlanItemCompleted {
+        text: String,
+    },
     TurnCompleted {
         status: Option<String>,
         last_agent_message: Option<String>,
@@ -166,7 +169,10 @@ pub(crate) enum UiEvent {
     ReviewModeEntered {
         hint: Option<String>,
     },
-    ReviewModeExited,
+    ReviewModeExited {
+        review_output_overall_explanation: Option<String>,
+        review_output_findings_count: Option<usize>,
+    },
     UserMessage {
         text: String,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
@@ -587,6 +593,13 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                     text,
                     text_elements,
                 }]
+            })
+            .or_else(|| {
+                notification
+                    .params
+                    .get("item")
+                    .and_then(parse_plan_item_completed)
+                    .map(|text| vec![UiEvent::PlanItemCompleted { text }])
             })
             .or_else(|| {
                 notification
@@ -1101,7 +1114,26 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string),
         }],
-        "exited_review_mode" => vec![UiEvent::ReviewModeExited],
+        "exited_review_mode" => vec![UiEvent::ReviewModeExited {
+            review_output_overall_explanation: msg
+                .get("review_output")
+                .and_then(|output| output.get("overall_explanation"))
+                .or_else(|| {
+                    msg.get("reviewOutput")
+                        .and_then(|output| output.get("overallExplanation"))
+                })
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+            review_output_findings_count: msg
+                .get("review_output")
+                .and_then(|output| output.get("findings"))
+                .or_else(|| {
+                    msg.get("reviewOutput")
+                        .and_then(|output| output.get("findings"))
+                })
+                .and_then(Value::as_array)
+                .map(|findings| findings.len()),
+        }],
         "undo_started" => vec![UiEvent::UndoStarted { message: None }],
         "undo_completed" => vec![UiEvent::UndoCompleted { message: None }],
         "plan_update" => parse_plan_update(msg)
@@ -1764,6 +1796,17 @@ fn parse_agent_message_item_completed(item: &Value) -> Option<Option<String>> {
         .and_then(Value::as_str)
         .map(ToString::to_string);
     Some(phase)
+}
+
+fn parse_plan_item_completed(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if item_type != "plan" {
+        return None;
+    }
+    item.get("text")
+        .or_else(|| item.get("content"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {
