@@ -2,7 +2,6 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
-use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
 use crabbot_protocol::DaemonRpcNotification;
 use crabbot_protocol::DaemonRpcRequestResponse;
@@ -10,10 +9,8 @@ use crabbot_protocol::DaemonRpcServerRequest;
 use crabbot_protocol::DaemonRpcStreamEnvelope;
 use crabbot_protocol::DaemonRpcStreamEvent;
 use crabbot_protocol::DaemonSessionStatusResponse;
-use crabbot_protocol::DaemonStartSessionRequest;
 use crabbot_protocol::DaemonStreamEnvelope;
 use crabbot_protocol::DaemonStreamEvent;
-use crabbot_protocol::HealthResponse;
 use crossterm::event::DisableBracketedPaste;
 use crossterm::event::EnableBracketedPaste;
 use crossterm::event::Event;
@@ -38,9 +35,6 @@ use ratatui::text::Line;
 use ratatui::text::Span;
 use ratatui::widgets::Paragraph;
 use ratatui::widgets::Wrap;
-use reqwest::StatusCode;
-use reqwest::blocking::Client;
-use reqwest::blocking::Response;
 use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
@@ -1087,102 +1081,27 @@ fn persist_daemon_session(
     Ok(())
 }
 
-fn http_client_with_timeout(timeout: Duration) -> Result<Client> {
-    Client::builder()
-        .timeout(timeout)
-        .build()
-        .context("build http client")
-}
-
-fn http_client() -> Result<Client> {
-    http_client_with_timeout(Duration::from_secs(5))
-}
-
-fn endpoint_url(base: &str, path: &str) -> String {
-    format!(
-        "{}/{}",
-        base.trim_end_matches('/'),
-        path.trim_start_matches('/')
-    )
-}
-
-fn apply_auth(
-    request: reqwest::blocking::RequestBuilder,
-    auth_token: Option<&str>,
-) -> reqwest::blocking::RequestBuilder {
-    if let Some(token) = auth_token {
-        if !token.trim().is_empty() {
-            return request.bearer_auth(token);
-        }
-    }
-    request
-}
-
-fn fetch_api_health(api_endpoint: &str, auth_token: Option<&str>) -> Result<HealthResponse> {
-    let client = http_client()?;
-    let url = endpoint_url(api_endpoint, "/health");
-    let response = apply_auth(client.get(url), auth_token)
-        .send()
-        .context("request api health")?
-        .error_for_status()
-        .context("api health returned error status")?;
-    response
-        .json::<HealthResponse>()
-        .context("parse api health response")
-}
-
-fn health_http_client() -> Result<Client> {
-    Client::builder()
-        .timeout(Duration::from_millis(250))
-        .build()
-        .context("build health-check http client")
-}
-
-fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
-    let client = match health_http_client() {
-        Ok(client) => client,
-        Err(_) => return false,
-    };
-    let url = endpoint_url(daemon_endpoint, "/health");
-    let response = match apply_auth(client.get(url), auth_token).send() {
-        Ok(response) => response,
-        Err(_) => return false,
-    };
-    if !response.status().is_success() {
-        return false;
-    }
-
-    response
-        .json::<HealthResponse>()
-        .map(|health| health.status == "ok")
-        .unwrap_or(false)
-}
-
 fn ensure_daemon_ready(state: &CliState) -> Result<()> {
-    if app_server_ws_url(&state.config.daemon_endpoint).is_ok() {
-        with_app_server_ws_client(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-            |_| Ok(()),
-        )
-        .context("ensure websocket app-server is reachable")?;
-        return Ok(());
-    }
-
-    if daemon_is_healthy(
+    if with_app_server_ws_client(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
-    ) {
+        |_| Ok(()),
+    )
+    .is_ok()
+    {
         return Ok(());
     }
 
     auto_start_daemon_process()?;
 
     for _ in 0..20 {
-        if daemon_is_healthy(
+        if with_app_server_ws_client(
             &state.config.daemon_endpoint,
             state.config.auth_token.as_deref(),
-        ) {
+            |_| Ok(()),
+        )
+        .is_ok()
+        {
             return Ok(());
         }
         thread::sleep(Duration::from_millis(150));
@@ -1258,137 +1177,47 @@ fn spawn_daemon_via_cargo() -> Result<()> {
     Ok(())
 }
 
-fn daemon_start_session(
-    daemon_endpoint: &str,
-    session_id: Option<String>,
-    auth_token: Option<&str>,
-) -> Result<DaemonSessionStatusResponse> {
-    let client = http_client()?;
-    let url = endpoint_url(daemon_endpoint, "/v1/sessions/start");
-    let response = apply_auth(client.post(url), auth_token)
-        .json(&DaemonStartSessionRequest { session_id })
-        .send()
-        .context("request daemon session start")?
-        .error_for_status()
-        .context("daemon session start returned error status")?;
-    response
-        .json::<DaemonSessionStatusResponse>()
-        .context("parse daemon start response")
-}
-
-fn daemon_resume_session(
-    daemon_endpoint: &str,
-    session_id: &str,
-    auth_token: Option<&str>,
-) -> Result<DaemonSessionStatusResponse> {
-    let client = http_client()?;
-    let path = format!("/v1/sessions/{session_id}/resume");
-    let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.post(url), auth_token)
-        .send()
-        .context("request daemon session resume")?
-        .error_for_status()
-        .context("daemon session resume returned error status")?;
-    response
-        .json::<DaemonSessionStatusResponse>()
-        .context("parse daemon resume response")
-}
-
-fn daemon_interrupt_session(
-    daemon_endpoint: &str,
-    session_id: &str,
-    auth_token: Option<&str>,
-) -> Result<DaemonSessionStatusResponse> {
-    let client = http_client()?;
-    let path = format!("/v1/sessions/{session_id}/interrupt");
-    let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.post(url), auth_token)
-        .send()
-        .context("request daemon session interrupt")?
-        .error_for_status()
-        .context("daemon session interrupt returned error status")?;
-    response
-        .json::<DaemonSessionStatusResponse>()
-        .context("parse daemon interrupt response")
-}
-
 fn daemon_prompt_session(
     daemon_endpoint: &str,
     session_id: &str,
     text: &str,
     auth_token: Option<&str>,
 ) -> Result<DaemonPromptResponse> {
-    let path = format!("/v1/sessions/{session_id}/prompt");
-    let url = endpoint_url(daemon_endpoint, &path);
-    let request = DaemonPromptRequest {
-        prompt: text.to_string(),
-    };
-
-    let response = send_daemon_prompt_request(&url, &request, auth_token).with_context(|| {
-        format!("request daemon prompt (session={session_id}, endpoint={daemon_endpoint})")
+    let response = daemon_app_server_rpc_request(
+        daemon_endpoint,
+        auth_token,
+        "turn/start",
+        json!({
+            "threadId": session_id,
+            "input": [
+                {
+                    "type": "text",
+                    "text": text,
+                    "text_elements": []
+                }
+            ]
+        }),
+    )
+    .with_context(|| {
+        format!("request app-server turn/start (session={session_id}, endpoint={daemon_endpoint})")
     })?;
-    if response.status() == StatusCode::NOT_FOUND {
-        daemon_start_session(daemon_endpoint, Some(session_id.to_string()), auth_token)
-            .with_context(|| format!("recover missing daemon session {session_id}"))?;
-        let retry = send_daemon_prompt_request(&url, &request, auth_token).with_context(|| {
-            format!("retry daemon prompt after session recovery (session={session_id})")
-        })?;
-        return parse_daemon_prompt_response(retry);
-    }
 
-    parse_daemon_prompt_response(response)
-}
+    let turn_id = response
+        .result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("app-server turn/start response missing turn.id"))?
+        .to_string();
 
-fn send_daemon_prompt_request(
-    url: &str,
-    request: &DaemonPromptRequest,
-    auth_token: Option<&str>,
-) -> Result<Response> {
-    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
-    apply_auth(client.post(url.to_string()), auth_token)
-        .json(request)
-        .send()
-        .context("send daemon prompt request")
-}
-
-fn parse_daemon_prompt_response(response: Response) -> Result<DaemonPromptResponse> {
-    let status = response.status();
-    if !status.is_success() {
-        let body = response
-            .text()
-            .ok()
-            .map(|text| text.trim().to_string())
-            .unwrap_or_default();
-        if body.is_empty() {
-            bail!("daemon prompt returned HTTP {status}");
-        }
-        bail!(
-            "daemon prompt returned HTTP {status}: {}",
-            truncate_for_width(&body, 200)
-        );
-    }
-
-    response
-        .json::<DaemonPromptResponse>()
-        .context("parse daemon prompt response")
-}
-
-fn daemon_get_session_status(
-    daemon_endpoint: &str,
-    session_id: &str,
-    auth_token: Option<&str>,
-) -> Result<DaemonSessionStatusResponse> {
-    let client = http_client()?;
-    let path = format!("/v1/sessions/{session_id}/status");
-    let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.get(url), auth_token)
-        .send()
-        .context("request daemon session status")?
-        .error_for_status()
-        .context("daemon session status returned error status")?;
-    response
-        .json::<DaemonSessionStatusResponse>()
-        .context("parse daemon status response")
+    Ok(DaemonPromptResponse {
+        session_id: session_id.to_string(),
+        turn_id,
+        state: "active".to_string(),
+        last_event: "turn_started".to_string(),
+        updated_at_unix_ms: now_unix_ms(),
+        last_sequence: 0,
+    })
 }
 
 static APP_SERVER_WS_CLIENT: LazyLock<Mutex<Option<AppServerWsClient>>> =
@@ -1702,62 +1531,6 @@ fn extract_thread_id_from_rpc_result(result: &Value) -> Option<String> {
         .and_then(|thread| thread.get("id"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
-}
-
-#[derive(Debug)]
-enum DaemonStreamFetchResult {
-    Stream(Vec<DaemonStreamEnvelope>),
-    NotFound,
-}
-
-fn fetch_daemon_stream(
-    daemon_endpoint: &str,
-    session_id: &str,
-    auth_token: Option<&str>,
-    since_sequence: Option<u64>,
-) -> Result<DaemonStreamFetchResult> {
-    fetch_daemon_stream_with_timeout(
-        daemon_endpoint,
-        session_id,
-        auth_token,
-        since_sequence,
-        Duration::from_secs(5),
-    )
-}
-
-fn fetch_daemon_stream_with_timeout(
-    daemon_endpoint: &str,
-    session_id: &str,
-    auth_token: Option<&str>,
-    since_sequence: Option<u64>,
-    timeout: Duration,
-) -> Result<DaemonStreamFetchResult> {
-    let client = http_client_with_timeout(timeout)?;
-    let mut path = format!("/v1/sessions/{session_id}/stream");
-    if let Some(since_sequence) = since_sequence {
-        path.push_str(&format!("?since_sequence={since_sequence}"));
-    }
-    let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.get(url), auth_token)
-        .send()
-        .context("request daemon stream")?;
-    if response.status() == reqwest::StatusCode::NOT_FOUND {
-        return Ok(DaemonStreamFetchResult::NotFound);
-    }
-    let body = response
-        .error_for_status()
-        .context("daemon stream returned error status")?
-        .text()
-        .context("read daemon stream body")?;
-
-    let stream_events = body
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<DaemonStreamEnvelope>(line).context("parse daemon stream line")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    Ok(DaemonStreamFetchResult::Stream(stream_events))
 }
 
 fn latest_cached_session_id(state: &CliState) -> Option<String> {
