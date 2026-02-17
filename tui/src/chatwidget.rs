@@ -58,7 +58,12 @@ struct TranscriptRenderable<'a> {
 
 impl Renderable for TranscriptRenderable<'_> {
     fn render(&self, area: Rect, buf: &mut Buffer) {
-        let history_lines_vec = self.ui.history_view_lines(area.width);
+        let history_lines_vec = self
+            .ui
+            .history_view_lines(area.width)
+            .into_iter()
+            .map(|line| pad_line_to_width(line, area.width))
+            .collect::<Vec<_>>();
         let history_lines = history_lines_vec.len().max(1) as u16;
         let max_scroll = history_lines.saturating_sub(area.height);
         let scroll = max_scroll.saturating_sub(self.ui.history_scroll_offset.min(max_scroll));
@@ -72,6 +77,18 @@ impl Renderable for TranscriptRenderable<'_> {
     fn desired_height(&self, width: u16) -> u16 {
         self.ui.history_view_lines(width).len().max(1) as u16
     }
+}
+
+/// Mirror upstream `insert_history_lines` behavior for in-viewport transcript rendering:
+/// line-level style should visually fill the whole terminal row.
+fn pad_line_to_width(mut line: Line<'static>, width: u16) -> Line<'static> {
+    let target = usize::from(width);
+    let line_width = line.width();
+    if target > line_width {
+        let pad = " ".repeat(target - line_width);
+        line.spans.push(Span::styled(pad, line.style));
+    }
+    line
 }
 
 pub(crate) struct LiveAttachTui {
