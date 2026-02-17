@@ -175,13 +175,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 }]
             })
             .unwrap_or_default(),
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
-            if delta_from_params(&notification.params).is_some() {
-                vec![UiEvent::StatusMessage("reasoning...".to_string())]
-            } else {
-                Vec::new()
-            }
-        }
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => Vec::new(),
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
             delta_from_params(&notification.params)
                 .map(|delta| vec![UiEvent::TranscriptLine(delta.to_string())])
@@ -220,8 +214,8 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 "[exec done] exit_code={exit_code}"
             ))]
         }
-        "item/fileChange/begin" => vec![UiEvent::StatusMessage("applying patch...".to_string())],
-        "item/fileChange/end" => vec![UiEvent::StatusMessage("patch applied".to_string())],
+        "item/fileChange/begin" => Vec::new(),
+        "item/fileChange/end" => Vec::new(),
         "item/mcpToolCall/begin" => {
             let label = notification
                 .params
@@ -231,7 +225,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .unwrap_or("tool");
             vec![UiEvent::TranscriptLine(format!("[mcp call] {label}"))]
         }
-        "item/mcpToolCall/end" => vec![UiEvent::StatusMessage("mcp call completed".to_string())],
+        "item/mcpToolCall/end" => Vec::new(),
         "item/completed" => notification
             .params
             .get("item")
@@ -268,10 +262,8 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
         "turn/failed" => vec![UiEvent::TurnCompleted {
             status: Some("failed".to_string()),
         }],
-        "turn/diff/updated" => vec![UiEvent::StatusMessage("diff updated".to_string())],
-        "thread/tokenUsage/updated" => {
-            vec![UiEvent::StatusMessage("token usage updated".to_string())]
-        }
+        "turn/diff/updated" => Vec::new(),
+        "thread/tokenUsage/updated" => Vec::new(),
         _ => Vec::new(),
     }
 }
