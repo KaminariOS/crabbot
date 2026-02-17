@@ -547,6 +547,9 @@ pub(crate) enum AppEvent {
     /// User submitted input from the composer.
     SubmitInput(String),
 
+    /// Request to start a turn for the active thread with plain text input.
+    StartTurn(String),
+
     /// Request to start a new session / thread.
     NewSession,
 

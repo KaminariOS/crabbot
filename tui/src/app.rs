@@ -277,6 +277,15 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::SubmitInput(text) => self.handle_submit(&text),
+            AppEvent::StartTurn(text) => {
+                let ui = self.widget.ui_mut();
+                ui.push_user_prompt(&text);
+                if let Some(turn_id) = start_turn(&self.state, &ui.session_id, &text)? {
+                    ui.active_turn_id = Some(turn_id);
+                }
+                ui.status_message = Some("waiting for response...".to_string());
+                Ok(LiveTuiAction::Continue)
+            }
             AppEvent::NewSession => {
                 let thread_id = start_thread(&self.state)?;
                 self.switch_to_thread(thread_id, "started new thread", true);
@@ -486,12 +495,8 @@ impl App {
             return Ok(LiveTuiAction::Continue);
         }
 
-        let ui = self.widget.ui_mut();
-        ui.push_user_prompt(trimmed);
-        if let Some(turn_id) = start_turn(&self.state, &ui.session_id, trimmed)? {
-            ui.active_turn_id = Some(turn_id);
-        }
-        ui.status_message = Some("waiting for response...".to_string());
+        self.app_event_tx
+            .send(AppEvent::StartTurn(trimmed.to_string()));
         Ok(LiveTuiAction::Continue)
     }
 }
