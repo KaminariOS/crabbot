@@ -465,7 +465,12 @@ impl LiveAttachTui {
                 self.on_task_complete(status, last_agent_message, from_replay);
             }
             UiEvent::TurnAborted { reason } => {
-                self.on_interrupted_turn(reason, from_replay);
+                match reason.as_deref().map(|value| value.to_ascii_lowercase()) {
+                    Some(reason) if reason == "replaced" => {
+                        self.on_error("Turn aborted: replaced by a new task".to_string());
+                    }
+                    _ => self.on_interrupted_turn(reason, from_replay),
+                }
             }
             UiEvent::Error { message } => match rate_limit_error_kind(&message) {
                 Some(RateLimitErrorKind::ServerOverloaded) => {
@@ -2784,7 +2789,7 @@ impl LiveAttachTui {
         &mut self,
         snapshot: Option<codex_core::protocol::RateLimitSnapshot>,
     ) {
-        if let Some(snapshot) = snapshot {
+        if let Some(mut snapshot) = snapshot {
             let limit_id = snapshot
                 .limit_id
                 .clone()
@@ -2793,6 +2798,17 @@ impl LiveAttachTui {
                 .limit_name
                 .clone()
                 .unwrap_or_else(|| limit_id.clone());
+            if snapshot.credits.is_none() {
+                snapshot.credits = self
+                    .rate_limit_snapshots_by_limit_id
+                    .get(&limit_id)
+                    .and_then(|display| display.credits.as_ref())
+                    .map(|credits| codex_core::protocol::CreditsSnapshot {
+                        has_credits: credits.has_credits,
+                        unlimited: credits.unlimited,
+                        balance: credits.balance.clone(),
+                    });
+            }
             let display =
                 rate_limit_snapshot_display_for_limit(&snapshot, limit_label, chrono::Local::now());
             self.rate_limit_snapshots_by_limit_id
