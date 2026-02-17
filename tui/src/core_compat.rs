@@ -77,6 +77,10 @@ pub(crate) enum UiEvent {
         call_id: String,
         delta: String,
     },
+    TerminalInteraction {
+        process_id: String,
+        stdin: String,
+    },
     ExecCommandEnd {
         call_id: String,
         exit_code: i32,
@@ -314,17 +318,23 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 delta: delta.to_string(),
             }]
         }
-        "item/commandExecution/terminalInteraction" => notification
-            .params
-            .get("prompt")
-            .or_else(|| notification.params.get("stdin"))
-            .and_then(Value::as_str)
-            .map(|prompt| {
-                vec![UiEvent::TranscriptLine(format!(
-                    "[terminal interaction] {prompt}"
-                ))]
-            })
-            .unwrap_or_default(),
+        "item/commandExecution/terminalInteraction" => {
+            let process_id = notification
+                .params
+                .get("processId")
+                .or_else(|| notification.params.get("process_id"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let stdin = notification
+                .params
+                .get("stdin")
+                .or_else(|| notification.params.get("prompt"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            vec![UiEvent::TerminalInteraction { process_id, stdin }]
+        }
         "item/commandExecution/begin" => notification
             .params
             .get("command")
@@ -839,6 +849,21 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
             })
             .unwrap_or_else(|| vec![UiEvent::AgentReasoningFinal]),
         "agent_reasoning_section_break" => vec![UiEvent::AgentReasoningSectionBreak],
+        "terminal_interaction" => {
+            let process_id = msg
+                .get("process_id")
+                .or_else(|| msg.get("processId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let stdin = msg
+                .get("stdin")
+                .or_else(|| msg.get("prompt"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            vec![UiEvent::TerminalInteraction { process_id, stdin }]
+        }
         "entered_review_mode" => vec![UiEvent::TranscriptLine("[entered review mode]".to_string())],
         "exited_review_mode" => vec![UiEvent::TranscriptLine("[exited review mode]".to_string())],
         "undo_started" => vec![UiEvent::TranscriptLine("[undo started]".to_string())],

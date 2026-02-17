@@ -21,6 +21,7 @@ use crate::history_cell::new_active_mcp_tool_call;
 use crate::history_cell::new_active_web_search_call;
 use crate::history_cell::new_error_event;
 use crate::history_cell::new_info_event;
+use crate::history_cell::new_unified_exec_interaction;
 use crate::history_cell::new_user_prompt;
 use crate::history_cell::new_web_search_call;
 use crate::key_hint;
@@ -347,6 +348,9 @@ impl LiveAttachTui {
             UiEvent::ExecCommandOutputDelta { call_id, delta } => {
                 self.on_exec_command_output_delta(&call_id, &delta);
             }
+            UiEvent::TerminalInteraction { process_id, stdin } => {
+                self.on_terminal_interaction(process_id, stdin);
+            }
             UiEvent::ExecCommandEnd {
                 call_id,
                 exit_code,
@@ -666,6 +670,19 @@ impl LiveAttachTui {
         self.active_cell = Some(Box::new(cell));
         self.bump_active_cell_revision();
         self.flush_active_cell();
+    }
+
+    fn on_terminal_interaction(&mut self, _process_id: String, stdin: String) {
+        self.flush_assistant_message();
+        if stdin.is_empty() {
+            self.status_message = Some("Waiting for background terminal".to_string());
+        } else {
+            self.flush_active_cell();
+            self.add_boxed_history(Box::new(new_unified_exec_interaction(None, stdin)));
+            if self.agent_turn_running {
+                self.status_message = Some("Working".to_string());
+            }
+        }
     }
 
     fn on_mcp_tool_call_begin(
