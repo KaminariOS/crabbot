@@ -339,30 +339,32 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .to_string();
             vec![UiEvent::TerminalInteraction { process_id, stdin }]
         }
-        "item/commandExecution/begin" => notification
-            .params
-            .get("command")
-            .and_then(Value::as_array)
-            .map(|parts| {
-                vec![UiEvent::ExecCommandBegin {
-                    call_id: item_id_from_params(&notification.params)
-                        .unwrap_or_else(|| "exec".to_string()),
-                    process_id: notification
+        "item/commandExecution/begin" => {
+            let command = command_vec_from_value(notification.params.get("command"));
+            let command = if command.is_empty() {
+                vec!["command".to_string()]
+            } else {
+                command
+            };
+            vec![UiEvent::ExecCommandBegin {
+                call_id: item_id_from_params(&notification.params)
+                    .unwrap_or_else(|| "exec".to_string()),
+                process_id: notification
+                    .params
+                    .get("processId")
+                    .or_else(|| notification.params.get("process_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                command,
+                parsed: parsed_command_vec_from_value(
+                    notification
                         .params
-                        .get("processId")
-                        .or_else(|| notification.params.get("process_id"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string),
-                    command: parts
-                        .iter()
-                        .filter_map(Value::as_str)
-                        .map(ToString::to_string)
-                        .collect(),
-                    parsed: Vec::new(),
-                    source: parse_exec_source(notification.params.get("source")),
-                }]
-            })
-            .unwrap_or_else(|| vec![UiEvent::StatusMessage("running command...".to_string())]),
+                        .get("parsedCommand")
+                        .or_else(|| notification.params.get("commandActions")),
+                ),
+                source: parse_exec_source(notification.params.get("source")),
+            }]
+        }
         "item/commandExecution/end" => {
             let exit_code = notification
                 .params
