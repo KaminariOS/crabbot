@@ -19,6 +19,9 @@ use crate::mention_codec;
 use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
+use crate::streaming::chunking::AdaptiveChunkingPolicy;
+use crate::streaming::commit_tick::CommitTickScope;
+use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::StreamController;
 use crate::text_formatting;
 use crate::version::CODEX_CLI_VERSION;
@@ -35,6 +38,7 @@ pub(crate) struct InFlightPrompt {
 pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     history_cells: Vec<Box<dyn HistoryCell>>,
+    adaptive_chunking: AdaptiveChunkingPolicy,
     assistant_stream: StreamController,
     pub(crate) input: String,
     input_cursor: usize,
@@ -71,6 +75,7 @@ impl LiveAttachTui {
         Self {
             session_id,
             history_cells: Vec::new(),
+            adaptive_chunking: AdaptiveChunkingPolicy::default(),
             assistant_stream: StreamController::new(None),
             input: String::new(),
             input_cursor: 0,
@@ -155,6 +160,7 @@ impl LiveAttachTui {
             }
             UiEvent::TurnStarted(turn_id) => {
                 self.active_turn_id = Some(turn_id);
+                self.adaptive_chunking.reset();
                 self.assistant_stream = StreamController::new(None);
                 self.bottom_pane.set_task_running(true);
                 self.bottom_pane.set_interrupt_hint_visible(true);
@@ -262,12 +268,18 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
-        let (cell, _idle) = self.assistant_stream.on_commit_tick();
-        if let Some(cell) = cell {
-            self.history_cells.push(cell);
-            return true;
+        let output = run_commit_tick(
+            &mut self.adaptive_chunking,
+            Some(&mut self.assistant_stream),
+            None,
+            CommitTickScope::AnyMode,
+            Instant::now(),
+        );
+        if output.cells.is_empty() {
+            return false;
         }
-        false
+        self.history_cells.extend(output.cells);
+        true
     }
 
     pub(crate) fn input_insert_str(&mut self, text: &str) {
