@@ -429,7 +429,12 @@ impl LiveAttachTui {
             let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
                 Paragraph::new(history)
-                    .style(Style::default().fg(self.readable_fg_color()))
+                    .style(
+                        Style::default()
+                            .bg(Color::Black)
+                            .fg(self.readable_fg_color())
+                            .bold(),
+                    )
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
                 chunks[0],
@@ -467,11 +472,10 @@ impl LiveAttachTui {
             );
 
             frame.render_widget(
-                Paragraph::new(
-                    Line::from(self.footer_line_text(chunks[footer_chunk_index].width as usize))
-                        .style(Style::default().fg(self.readable_fg_color()))
-                        .dim(),
-                ),
+                Paragraph::new(Line::from(
+                    self.footer_line_text(chunks[footer_chunk_index].width as usize),
+                ))
+                .style(Style::default().fg(self.readable_fg_color())),
                 chunks[footer_chunk_index],
             );
 
@@ -548,11 +552,16 @@ impl LiveAttachTui {
 
     pub(crate) fn composer_row_style(&self) -> Style {
         // Keep composer panel explicitly grey like upstream.
-        Style::default().bg(Color::DarkGray).fg(Color::White)
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(self.readable_fg_color())
+            .bold()
     }
 
     fn readable_fg_color(&self) -> Color {
-        Color::White
+        // Explicit ANSI bright white avoids terminals that map default white
+        // to a dim/near-background color in alternate screen mode.
+        Color::Indexed(15)
     }
 
     pub(crate) fn special_token_style(&self, token: char) -> Option<Style> {

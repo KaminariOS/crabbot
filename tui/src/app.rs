@@ -111,7 +111,7 @@ impl App {
             stdout,
             EnterAlternateScreen,
             EnableBracketedPaste,
-            SetForegroundColor(CrosstermColor::White),
+            SetForegroundColor(CrosstermColor::AnsiValue(15)),
             SetBackgroundColor(CrosstermColor::Black)
         )
         .context("enter alternate screen for app-server tui")?;
