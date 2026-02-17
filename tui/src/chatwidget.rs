@@ -39,6 +39,8 @@ use codex_utils_fuzzy_match::fuzzy_match;
 use crossterm::event::KeyEvent;
 use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
+use ratatui::buffer::Buffer;
+use ratatui::layout::Rect;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
@@ -862,48 +864,56 @@ impl LiveAttachTui {
         (visible, cursor_col, offset)
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        terminal.draw(|frame| {
-            let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
-            let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
-            let bottom_pane_height = self.bottom_pane.desired_height(frame.area().width).max(1);
-            let chunks = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([
-                    Constraint::Min(1),
-                    Constraint::Length(shortcuts_overlay_height),
-                    Constraint::Length(bottom_pane_height),
-                ])
-                .split(frame.area());
+    pub(crate) fn desired_height(&self, width: u16) -> u16 {
+        let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
+        let bottom_pane_height = self.bottom_pane.desired_height(width).max(1);
+        1 + shortcuts_overlay_height + bottom_pane_height
+    }
 
-            let history_lines_vec = self.history_view_lines(chunks[0].width);
-            let history_lines = history_lines_vec.len().max(1) as u16;
-            let max_scroll = history_lines.saturating_sub(chunks[0].height);
-            self.history_scroll_offset = self.history_scroll_offset.min(max_scroll);
-            let scroll = max_scroll.saturating_sub(self.history_scroll_offset);
-            frame.render_widget(
-                Paragraph::new(history_lines_vec)
-                    .style(Style::default())
-                    .wrap(Wrap { trim: false })
-                    .scroll((scroll, 0)),
-                chunks[0],
-            );
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
+        let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
+        let bottom_pane_height = self.bottom_pane.desired_height(area.width).max(1);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(shortcuts_overlay_height),
+                Constraint::Length(bottom_pane_height),
+            ])
+            .split(area);
 
-            if shortcuts_overlay_height > 0 {
-                frame.render_widget(
-                    Paragraph::new(shortcuts_overlay_lines).style(self.composer_row_style()),
-                    chunks[1],
-                );
-            }
-            self.bottom_pane.render(chunks[2], frame.buffer_mut());
-            if let Some((x, y)) = self.bottom_pane.cursor_pos(chunks[2]) {
-                frame.set_cursor_position((x, y));
-            }
-        })?;
-        Ok(())
+        let history_lines_vec = self.history_view_lines(chunks[0].width);
+        let history_lines = history_lines_vec.len().max(1) as u16;
+        let max_scroll = history_lines.saturating_sub(chunks[0].height);
+        self.history_scroll_offset = self.history_scroll_offset.min(max_scroll);
+        let scroll = max_scroll.saturating_sub(self.history_scroll_offset);
+        Paragraph::new(history_lines_vec)
+            .style(Style::default())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .render(chunks[0], buf);
+
+        if shortcuts_overlay_height > 0 {
+            Paragraph::new(shortcuts_overlay_lines)
+                .style(self.composer_row_style())
+                .render(chunks[1], buf);
+        }
+        self.bottom_pane.render(chunks[2], buf);
+    }
+
+    pub(crate) fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
+        let bottom_pane_height = self.bottom_pane.desired_height(area.width).max(1);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(shortcuts_overlay_height),
+                Constraint::Length(bottom_pane_height),
+            ])
+            .split(area);
+        self.bottom_pane.cursor_pos(chunks[2])
     }
 
     pub(crate) fn scroll_history_page_up(&mut self) {
@@ -1450,11 +1460,16 @@ impl ChatWidget {
         &self.ui.session_id
     }
 
-    pub(crate) fn draw(
-        &mut self,
-        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    ) -> Result<()> {
-        self.ui.draw(terminal)
+    pub(crate) fn desired_height(&self, width: u16) -> u16 {
+        self.ui.desired_height(width)
+    }
+
+    pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
+        self.ui.render(area, buf)
+    }
+
+    pub(crate) fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
+        self.ui.cursor_pos(area)
     }
 }
 

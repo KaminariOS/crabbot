@@ -25,7 +25,6 @@ use crate::get_git_diff::get_git_diff;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use codex_core::protocol::ExecCommandSource;
-use crossterm::style::ResetColor;
 
 // ---------------------------------------------------------------------------
 // App struct — mirrors upstream `app::App` but backed by app-server transport
@@ -184,24 +183,10 @@ impl App {
             });
         }
 
-        enable_raw_mode().context("enable raw mode for app-server tui")?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-            .context("enter alternate screen for app-server tui")?;
-        let backend = CrosstermBackend::new(stdout);
-        let mut terminal = Terminal::new(backend).context("create app-server tui terminal")?;
-        terminal.clear().context("clear app-server tui terminal")?;
-
-        let loop_result = self.event_loop(&mut terminal);
-
-        let _ = disable_raw_mode();
-        let _ = execute!(
-            terminal.backend_mut(),
-            DisableBracketedPaste,
-            ResetColor,
-            LeaveAlternateScreen
-        );
-        let _ = terminal.show_cursor();
+        let terminal = crate::tui::init().context("initialize tui terminal")?;
+        let mut tui = crate::tui::Tui::new(terminal);
+        let loop_result = self.event_loop(&mut tui);
+        let _ = crate::tui::restore();
 
         loop_result?;
         self.state.last_thread_id = Some(self.widget.session_id().to_string());
@@ -222,12 +207,19 @@ impl App {
     // Event loop — mirrors upstream `App::run()` main loop body
     // -----------------------------------------------------------------------
 
-    fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
         loop {
             let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
             let in_paste_burst = self.widget.ui_mut().bottom_pane_is_in_paste_burst();
             let _ = self.widget.ui_mut().commit_assistant_stream_tick();
-            self.widget.draw(terminal)?;
+            let width = tui.terminal.size()?.width;
+            let desired_height = self.widget.desired_height(width);
+            tui.draw(desired_height, |frame| {
+                self.widget.render(frame.area(), frame.buffer_mut());
+                if let Some((x, y)) = self.widget.cursor_pos(frame.area()) {
+                    frame.set_cursor_position((x, y));
+                }
+            })?;
             let mut should_redraw = false;
 
             // Poll terminal for input events.
