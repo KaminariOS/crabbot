@@ -52,6 +52,8 @@ pub(crate) struct App {
     file_search: FileSearchManager,
     /// Runtime status data used by `/status` card rendering.
     status_runtime: StatusRuntime,
+    /// One-shot guard used while switching threads.
+    pending_thread_switch_clear: bool,
 }
 
 #[derive(Default)]
@@ -123,6 +125,7 @@ impl App {
             widget_event_rx: widget_rx,
             file_search,
             status_runtime,
+            pending_thread_switch_clear: false,
         })
     }
 
@@ -168,6 +171,7 @@ impl App {
             widget_event_rx: widget_rx,
             file_search,
             status_runtime,
+            pending_thread_switch_clear: false,
         })
     }
 
@@ -211,6 +215,11 @@ impl App {
 
     fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
         loop {
+            if self.pending_thread_switch_clear {
+                tui.terminal.clear_scrollback()?;
+                tui.terminal.clear()?;
+                self.pending_thread_switch_clear = false;
+            }
             let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
             let in_paste_burst = self.widget.ui_mut().bottom_pane_is_in_paste_burst();
             let _ = self.widget.ui_mut().commit_assistant_stream_tick();
@@ -310,6 +319,7 @@ impl App {
                 .ui_mut()
                 .reset_for_thread_switch(thread_id.clone());
             self.status_runtime = StatusRuntime::default();
+            self.pending_thread_switch_clear = true;
             if let Ok(events) = stream_events(&self.state, 0)
                 && !events.is_empty()
             {
