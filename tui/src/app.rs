@@ -14,6 +14,7 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
+use crate::key_hint::is_altgr;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
@@ -355,24 +356,80 @@ impl App {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
                 return Ok(LiveTuiAction::Continue);
             }
-            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                ui.clear_input();
+            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_to_beginning_of_line(true);
+            }
+            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_to_end_of_line(true);
+            }
+            KeyCode::Char('b') if key.modifiers == KeyModifiers::ALT => {
+                ui.move_input_cursor_word_left();
+            }
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::ALT => {
+                ui.move_input_cursor_word_right();
+            }
+            KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_left();
+            }
+            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_right();
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_up();
+            }
+            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_down();
+            }
+            KeyCode::Char('h') if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                ui.delete_input_word_backward();
+            }
+            KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.input_backspace();
+            }
+            KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.delete_input_word_backward();
+            }
+            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.kill_to_beginning_of_line();
+            }
+            KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.kill_to_end_of_line();
+            }
+            KeyCode::Char('y') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.yank_kill_buffer();
+            }
+            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
+                ui.input_delete();
             }
             KeyCode::Up => {
-                if ui.slash_picker_is_active() {
+                if key.modifiers == KeyModifiers::CONTROL {
+                    ui.move_input_cursor_up();
+                } else if ui.slash_picker_is_active() {
                     ui.slash_picker_move_up();
                 } else {
                     ui.history_prev();
                 }
             }
             KeyCode::Down => {
-                if ui.slash_picker_is_active() {
+                if key.modifiers == KeyModifiers::CONTROL {
+                    ui.move_input_cursor_down();
+                } else if ui.slash_picker_is_active() {
                     ui.slash_picker_move_down();
                 } else {
                     ui.history_next();
                 }
             }
+            KeyCode::Left if key.modifiers == KeyModifiers::ALT => ui.move_input_cursor_word_left(),
+            KeyCode::Left if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_word_left()
+            }
             KeyCode::Left => ui.move_input_cursor_left(),
+            KeyCode::Right if key.modifiers == KeyModifiers::ALT => {
+                ui.move_input_cursor_word_right()
+            }
+            KeyCode::Right if key.modifiers == KeyModifiers::CONTROL => {
+                ui.move_input_cursor_word_right()
+            }
             KeyCode::Right => ui.move_input_cursor_right(),
             KeyCode::Home => ui.move_input_cursor_home(),
             KeyCode::End => ui.move_input_cursor_end(),
@@ -391,10 +448,18 @@ impl App {
                 queued_submit = Some(ui.take_input());
             }
             KeyCode::Backspace => {
-                ui.input_backspace();
+                if key.modifiers == KeyModifiers::ALT {
+                    ui.delete_input_word_backward();
+                } else {
+                    ui.input_backspace();
+                }
             }
             KeyCode::Delete => {
-                ui.input_delete();
+                if key.modifiers == KeyModifiers::ALT {
+                    ui.delete_input_word_forward();
+                } else {
+                    ui.input_delete();
+                }
             }
             KeyCode::Tab => {
                 if ui.slash_picker_is_active() {
@@ -416,8 +481,9 @@ impl App {
                 }
             }
             KeyCode::Char(ch) => {
-                if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
+                if is_altgr(key.modifiers)
+                    || (!key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT))
                 {
                     ui.input_insert_char(ch);
                 }

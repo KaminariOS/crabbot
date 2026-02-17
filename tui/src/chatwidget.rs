@@ -35,6 +35,7 @@ pub(crate) struct LiveAttachTui {
     pub(crate) pending_approvals: BTreeMap<String, UiApprovalRequest>,
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
+    kill_buffer: String,
 }
 
 impl LiveAttachTui {
@@ -56,6 +57,7 @@ impl LiveAttachTui {
             pending_approvals: BTreeMap::new(),
             slash_picker_index: 0,
             shortcuts_overlay_visible: false,
+            kill_buffer: String::new(),
         }
     }
 
@@ -256,11 +258,113 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn move_input_cursor_home(&mut self) {
-        self.input_cursor = 0;
+        self.move_input_cursor_to_beginning_of_line(false);
     }
 
     pub(crate) fn move_input_cursor_end(&mut self) {
-        self.input_cursor = self.input.len();
+        self.move_input_cursor_to_end_of_line(false);
+    }
+
+    pub(crate) fn move_input_cursor_word_left(&mut self) {
+        self.input_cursor = self.beginning_of_previous_word();
+    }
+
+    pub(crate) fn move_input_cursor_word_right(&mut self) {
+        self.input_cursor = self.end_of_next_word();
+    }
+
+    pub(crate) fn delete_input_word_backward(&mut self) {
+        self.shortcuts_overlay_visible = false;
+        let start = self.beginning_of_previous_word();
+        self.kill_range(start, self.input_cursor);
+        self.sync_slash_picker();
+    }
+
+    pub(crate) fn delete_input_word_forward(&mut self) {
+        self.shortcuts_overlay_visible = false;
+        let end = self.end_of_next_word();
+        self.kill_range(self.input_cursor, end);
+        self.sync_slash_picker();
+    }
+
+    pub(crate) fn move_input_cursor_to_beginning_of_line(&mut self, move_up_at_bol: bool) {
+        let bol = self.beginning_of_current_line();
+        if move_up_at_bol && self.input_cursor == bol {
+            self.input_cursor = self.beginning_of_line(bol.saturating_sub(1));
+        } else {
+            self.input_cursor = bol;
+        }
+    }
+
+    pub(crate) fn move_input_cursor_to_end_of_line(&mut self, move_down_at_eol: bool) {
+        let eol = self.end_of_current_line();
+        if move_down_at_eol && self.input_cursor == eol {
+            let next_pos = (self.input_cursor.saturating_add(1)).min(self.input.len());
+            self.input_cursor = self.end_of_line(next_pos);
+        } else {
+            self.input_cursor = eol;
+        }
+    }
+
+    pub(crate) fn kill_to_beginning_of_line(&mut self) {
+        self.shortcuts_overlay_visible = false;
+        let bol = self.beginning_of_current_line();
+        if self.input_cursor == bol {
+            if bol > 0 {
+                self.kill_range(bol - 1, bol);
+            }
+        } else {
+            self.kill_range(bol, self.input_cursor);
+        }
+        self.sync_slash_picker();
+    }
+
+    pub(crate) fn kill_to_end_of_line(&mut self) {
+        self.shortcuts_overlay_visible = false;
+        let eol = self.end_of_current_line();
+        if self.input_cursor == eol {
+            if eol < self.input.len() {
+                self.kill_range(self.input_cursor, eol + 1);
+            }
+        } else {
+            self.kill_range(self.input_cursor, eol);
+        }
+        self.sync_slash_picker();
+    }
+
+    pub(crate) fn yank_kill_buffer(&mut self) {
+        if self.kill_buffer.is_empty() {
+            return;
+        }
+        let pasted = self.kill_buffer.clone();
+        self.input_insert_str(&pasted);
+    }
+
+    pub(crate) fn move_input_cursor_up(&mut self) {
+        let line_start = self.beginning_of_current_line();
+        if line_start == 0 {
+            self.input_cursor = 0;
+            return;
+        }
+        let target_col = display_width(&self.input[line_start..self.input_cursor]);
+        let prev_line_end = line_start.saturating_sub(1);
+        let prev_line_start = self.beginning_of_line(prev_line_end);
+        self.input_cursor =
+            byte_index_for_display_col(&self.input, prev_line_start, prev_line_end, target_col);
+    }
+
+    pub(crate) fn move_input_cursor_down(&mut self) {
+        let line_end = self.end_of_current_line();
+        if line_end >= self.input.len() {
+            self.input_cursor = self.input.len();
+            return;
+        }
+        let line_start = self.beginning_of_current_line();
+        let target_col = display_width(&self.input[line_start..self.input_cursor]);
+        let next_line_start = line_end + 1;
+        let next_line_end = self.end_of_line(next_line_start);
+        self.input_cursor =
+            byte_index_for_display_col(&self.input, next_line_start, next_line_end, target_col);
     }
 
     pub(crate) fn clear_input(&mut self) {
@@ -332,6 +436,76 @@ impl LiveAttachTui {
 
     pub(crate) fn has_pending_prompt(&self) -> bool {
         self.pending_prompt.is_some()
+    }
+
+    fn kill_range(&mut self, start: usize, end: usize) {
+        let start = start.min(self.input.len());
+        let end = end.min(self.input.len());
+        if start >= end {
+            return;
+        }
+        self.kill_buffer = self.input[start..end].to_string();
+        self.input.drain(start..end);
+        self.input_cursor = start.min(self.input.len());
+    }
+
+    fn beginning_of_line(&self, pos: usize) -> usize {
+        self.input[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0)
+    }
+
+    fn end_of_line(&self, pos: usize) -> usize {
+        self.input[pos..]
+            .find('\n')
+            .map(|i| i + pos)
+            .unwrap_or(self.input.len())
+    }
+
+    fn beginning_of_current_line(&self) -> usize {
+        self.beginning_of_line(self.input_cursor)
+    }
+
+    fn end_of_current_line(&self) -> usize {
+        self.end_of_line(self.input_cursor)
+    }
+
+    fn beginning_of_previous_word(&self) -> usize {
+        let prefix = &self.input[..self.input_cursor];
+        let trimmed_end = prefix.trim_end_matches(char::is_whitespace);
+        if trimmed_end.is_empty() {
+            return 0;
+        }
+        let mut iter = trimmed_end.char_indices().rev();
+        let Some((_, first_ch)) = iter.next() else {
+            return 0;
+        };
+        let is_separator = is_word_separator(first_ch);
+        for (idx, ch) in iter {
+            if ch.is_whitespace() || is_word_separator(ch) != is_separator {
+                return idx + ch.len_utf8();
+            }
+        }
+        0
+    }
+
+    fn end_of_next_word(&self) -> usize {
+        let suffix = &self.input[self.input_cursor..];
+        let Some(first_non_ws) = suffix.find(|c: char| !c.is_whitespace()) else {
+            return self.input.len();
+        };
+        let word_start = self.input_cursor + first_non_ws;
+        let mut iter = self.input[word_start..].char_indices();
+        let Some((_, first_ch)) = iter.next() else {
+            return word_start;
+        };
+        let is_separator = is_word_separator(first_ch);
+        let mut end = self.input.len();
+        for (idx, ch) in iter {
+            if ch.is_whitespace() || is_word_separator(ch) != is_separator {
+                end = word_start + idx;
+                break;
+            }
+        }
+        end
     }
 
     pub(crate) fn start_prompt_request(
@@ -768,6 +942,66 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .next()
             .map(|ch| ch.len_utf8())
             .unwrap_or(0)
+}
+
+fn is_word_separator(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | ','
+            | ';'
+            | ':'
+            | '!'
+            | '?'
+            | '('
+            | ')'
+            | '['
+            | ']'
+            | '{'
+            | '}'
+            | '<'
+            | '>'
+            | '/'
+            | '\\'
+            | '|'
+            | '"'
+            | '\''
+            | '`'
+            | '~'
+            | '@'
+            | '#'
+            | '$'
+            | '%'
+            | '^'
+            | '&'
+            | '*'
+            | '-'
+            | '+'
+            | '='
+    )
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars().count()
+}
+
+fn byte_index_for_display_col(
+    text: &str,
+    line_start: usize,
+    line_end: usize,
+    target_col: usize,
+) -> usize {
+    let line = &text[line_start..line_end];
+    if target_col == 0 {
+        return line_start;
+    }
+    let mut col = 0usize;
+    for (idx, _) in line.char_indices() {
+        if col >= target_col {
+            return line_start + idx;
+        }
+        col += 1;
+    }
+    line_end
 }
 
 fn display_cwd_for_welcome() -> String {
