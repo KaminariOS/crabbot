@@ -132,6 +132,7 @@ pub(crate) struct LiveAttachTui {
     mcp_startup_running: bool,
     reasoning_buffer: String,
     full_reasoning_buffer: String,
+    current_rollout_path: Option<std::path::PathBuf>,
 }
 
 pub(crate) struct ReviewCommitPickerEntry {
@@ -195,6 +196,7 @@ impl LiveAttachTui {
             mcp_startup_running: false,
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            current_rollout_path: None,
         }
     }
 
@@ -243,9 +245,13 @@ impl LiveAttachTui {
                 self.latest_state = state.clone();
                 self.previous_state = Some(state);
             }
-            UiEvent::ThreadStarted(thread_id) => {
+            UiEvent::ThreadStarted {
+                thread_id,
+                rollout_path,
+            } => {
                 let changed = self.session_id != thread_id;
                 self.session_id = thread_id.clone();
+                self.current_rollout_path = rollout_path.map(std::path::PathBuf::from);
                 self.latest_state = "active".to_string();
                 self.previous_state = Some("active".to_string());
                 if changed {
@@ -1676,6 +1682,10 @@ impl LiveAttachTui {
         self.sync_bottom_pane_status();
     }
 
+    pub(crate) fn rollout_path(&self) -> Option<std::path::PathBuf> {
+        self.current_rollout_path.clone()
+    }
+
     pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.bottom_pane.take_recent_submission_mention_bindings()
     }
@@ -1750,6 +1760,7 @@ impl LiveAttachTui {
         self.mcp_startup_running = false;
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+        self.current_rollout_path = None;
         self.bottom_pane.set_context_window(None, None);
         self.clear_input();
     }

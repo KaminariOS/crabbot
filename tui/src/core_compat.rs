@@ -49,7 +49,10 @@ pub(crate) struct UiApprovalRequest {
 #[derive(Debug, Clone)]
 pub(crate) enum UiEvent {
     SessionState(String),
-    ThreadStarted(String),
+    ThreadStarted {
+        thread_id: String,
+        rollout_path: Option<String>,
+    },
     ThreadRenamed(String),
     TurnStarted(String),
     AssistantDelta {
@@ -254,9 +257,18 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
         "thread/started" => notification
             .params
             .get("thread")
-            .and_then(|thread| thread.get("id"))
-            .and_then(Value::as_str)
-            .map(|thread_id| vec![UiEvent::ThreadStarted(thread_id.to_string())])
+            .and_then(|thread| {
+                let thread_id = thread.get("id").and_then(Value::as_str)?;
+                let rollout_path = thread
+                    .get("path")
+                    .or_else(|| thread.get("rolloutPath"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                Some(vec![UiEvent::ThreadStarted {
+                    thread_id: thread_id.to_string(),
+                    rollout_path,
+                }])
+            })
             .unwrap_or_default(),
         "turn/started" => notification
             .params

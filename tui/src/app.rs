@@ -758,11 +758,7 @@ impl App {
                     .set_status_message(Some("skill settings updated".to_string()));
             }
             WidgetAppEvent::OpenFeedbackConsent { category } => {
-                let thread_id = self.widget.ui_mut().session_id.clone();
-                let rollout_path = fetch_rollout_path(&self.state, &thread_id)
-                    .ok()
-                    .flatten()
-                    .map(std::path::PathBuf::from);
+                let rollout_path = self.widget.ui_mut().rollout_path();
                 self.widget
                     .ui_mut()
                     .open_feedback_consent(category, rollout_path);
@@ -771,11 +767,7 @@ impl App {
                 category,
                 include_logs,
             } => {
-                let thread_id = self.widget.ui_mut().session_id.clone();
-                let rollout_path = fetch_rollout_path(&self.state, &thread_id)
-                    .ok()
-                    .flatten()
-                    .map(std::path::PathBuf::from);
+                let rollout_path = self.widget.ui_mut().rollout_path();
                 self.widget
                     .ui_mut()
                     .open_feedback_note(category, include_logs, rollout_path);
@@ -1004,20 +996,14 @@ impl App {
                     .push_line(&format!("Failed to load MCP tools: {err}")),
             },
             SlashCommand::Rollout => {
-                let session_id = self.widget.ui_mut().session_id.clone();
-                match fetch_rollout_path(&self.state, &session_id) {
-                    Ok(Some(path)) => self
-                        .widget
+                if let Some(path) = self.widget.ui_mut().rollout_path() {
+                    self.widget
                         .ui_mut()
-                        .push_line(&format!("Current rollout path: {path}")),
-                    Ok(None) => self
-                        .widget
+                        .push_line(&format!("Current rollout path: {}", path.display()));
+                } else {
+                    self.widget
                         .ui_mut()
-                        .push_line("Rollout path is not available yet."),
-                    Err(err) => self
-                        .widget
-                        .ui_mut()
-                        .push_line(&format!("Failed to read rollout path: {err}")),
+                        .push_line("Rollout path is not available yet.");
                 }
             }
             SlashCommand::Feedback => self.widget.ui_mut().open_feedback_selection(),
@@ -2650,24 +2636,6 @@ fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnap
         })
         .collect();
     Ok(crate::app_event::ConnectorsSnapshot { connectors })
-}
-
-fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String>> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "thread/read",
-        json!({
-            "threadId": thread_id,
-            "includeTurns": false,
-        }),
-    )?;
-    Ok(response
-        .result
-        .get("thread")
-        .and_then(|thread| thread.get("path"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string))
 }
 
 fn clean_background_terminals(state: &CliState, thread_id: &str) -> Result<()> {
