@@ -52,6 +52,7 @@ use ratatui::layout::Rect;
 use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::VecDeque;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
@@ -63,6 +64,49 @@ struct RunningCommand {
     command: Vec<String>,
     parsed_cmd: Vec<codex_protocol::parse_command::ParsedCommand>,
     source: codex_core::protocol::ExecCommandSource,
+}
+
+#[derive(Debug)]
+enum QueuedUiInterrupt {
+    ExecApprovalRequest {
+        id: String,
+        command: Vec<String>,
+        reason: Option<String>,
+        network_approval_context: Option<codex_core::protocol::NetworkApprovalContext>,
+    },
+    PatchApprovalRequest {
+        id: String,
+        reason: Option<String>,
+        cwd: std::path::PathBuf,
+        changes: std::collections::HashMap<std::path::PathBuf, codex_core::protocol::FileChange>,
+    },
+    ElicitationRequest {
+        server_name: String,
+        request_id: codex_protocol::mcp::RequestId,
+        message: String,
+    },
+    RequestUserInputRequest(codex_protocol::request_user_input::RequestUserInputEvent),
+    ExecCommandBegin {
+        call_id: String,
+        command: Vec<String>,
+        parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
+        source: codex_core::protocol::ExecCommandSource,
+    },
+    ExecCommandEnd {
+        call_id: String,
+        exit_code: i32,
+        aggregated_output: String,
+        duration: Duration,
+    },
+    McpToolCallBegin {
+        call_id: String,
+        invocation: codex_core::protocol::McpInvocation,
+    },
+    McpToolCallEnd {
+        call_id: String,
+        duration: Duration,
+        result: Result<codex_protocol::mcp::CallToolResult, String>,
+    },
 }
 
 struct TranscriptRenderable<'a> {
@@ -139,6 +183,7 @@ pub(crate) struct LiveAttachTui {
     total_token_usage: codex_core::protocol::TokenUsage,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     running_commands: HashMap<String, RunningCommand>,
+    pending_interrupts: VecDeque<QueuedUiInterrupt>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
     reasoning_buffer: String,
@@ -206,6 +251,7 @@ impl LiveAttachTui {
             total_token_usage: codex_core::protocol::TokenUsage::default(),
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             running_commands: HashMap::new(),
+            pending_interrupts: VecDeque::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
             reasoning_buffer: String::new(),
@@ -344,7 +390,7 @@ impl LiveAttachTui {
                 command,
                 parsed,
                 source,
-            } => self.on_exec_command_begin(call_id, command, parsed, source),
+            } => self.on_exec_command_begin_deferred(call_id, command, parsed, source),
             UiEvent::ExecCommandOutputDelta { call_id, delta } => {
                 self.on_exec_command_output_delta(&call_id, &delta);
             }
@@ -356,16 +402,16 @@ impl LiveAttachTui {
                 exit_code,
                 aggregated_output,
                 duration,
-            } => self.on_exec_command_end(&call_id, exit_code, aggregated_output, duration),
+            } => self.on_exec_command_end_deferred(call_id, exit_code, aggregated_output, duration),
             UiEvent::McpToolCallBegin {
                 call_id,
                 invocation,
-            } => self.on_mcp_tool_call_begin(call_id, invocation),
+            } => self.on_mcp_tool_call_begin_deferred(call_id, invocation),
             UiEvent::McpToolCallEnd {
                 call_id,
                 duration,
                 result,
-            } => self.on_mcp_tool_call_end(&call_id, duration, result),
+            } => self.on_mcp_tool_call_end_deferred(call_id, duration, result),
             UiEvent::WebSearchBegin { call_id, query } => {
                 self.on_web_search_begin(call_id, query);
             }
@@ -446,8 +492,46 @@ impl LiveAttachTui {
                 command,
                 reason,
                 network_approval_context,
-            } => {
-                self.bottom_pane.push_approval_request(
+            } => self.on_exec_approval_request_deferred(
+                id,
+                command,
+                reason,
+                network_approval_context,
+            ),
+            UiEvent::PatchApprovalRequest {
+                id,
+                reason,
+                cwd,
+                changes,
+            } => self.on_patch_approval_request_deferred(id, reason, cwd, changes),
+            UiEvent::ElicitationRequest {
+                server_name,
+                request_id,
+                message,
+            } => self.on_elicitation_request_deferred(server_name, request_id, message),
+            UiEvent::RequestUserInputRequest(request) => {
+                self.on_request_user_input_deferred(request)
+            }
+        }
+        self.sync_bottom_pane_status();
+    }
+
+    fn on_exec_approval_request_deferred(
+        &mut self,
+        id: String,
+        command: Vec<String>,
+        reason: Option<String>,
+        network_approval_context: Option<codex_core::protocol::NetworkApprovalContext>,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::ExecApprovalRequest {
+                id: id.clone(),
+                command: command.clone(),
+                reason: reason.clone(),
+                network_approval_context: network_approval_context.clone(),
+            },
+            |s| {
+                s.bottom_pane.push_approval_request(
                     crate::bottom_pane::ApprovalRequest::Exec {
                         id,
                         command,
@@ -457,14 +541,26 @@ impl LiveAttachTui {
                     },
                     &codex_core::features::Features::default(),
                 );
-            }
-            UiEvent::PatchApprovalRequest {
-                id,
-                reason,
-                cwd,
-                changes,
-            } => {
-                self.bottom_pane.push_approval_request(
+            },
+        );
+    }
+
+    fn on_patch_approval_request_deferred(
+        &mut self,
+        id: String,
+        reason: Option<String>,
+        cwd: std::path::PathBuf,
+        changes: std::collections::HashMap<std::path::PathBuf, codex_core::protocol::FileChange>,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::PatchApprovalRequest {
+                id: id.clone(),
+                reason: reason.clone(),
+                cwd: cwd.clone(),
+                changes: changes.clone(),
+            },
+            |s| {
+                s.bottom_pane.push_approval_request(
                     crate::bottom_pane::ApprovalRequest::ApplyPatch {
                         id,
                         reason,
@@ -473,13 +569,24 @@ impl LiveAttachTui {
                     },
                     &codex_core::features::Features::default(),
                 );
-            }
-            UiEvent::ElicitationRequest {
-                server_name,
-                request_id,
-                message,
-            } => {
-                self.bottom_pane.push_approval_request(
+            },
+        );
+    }
+
+    fn on_elicitation_request_deferred(
+        &mut self,
+        server_name: String,
+        request_id: codex_protocol::mcp::RequestId,
+        message: String,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::ElicitationRequest {
+                server_name: server_name.clone(),
+                request_id: request_id.clone(),
+                message: message.clone(),
+            },
+            |s| {
+                s.bottom_pane.push_approval_request(
                     crate::bottom_pane::ApprovalRequest::McpElicitation {
                         server_name,
                         request_id,
@@ -487,12 +594,106 @@ impl LiveAttachTui {
                     },
                     &codex_core::features::Features::default(),
                 );
-            }
-            UiEvent::RequestUserInputRequest(request) => {
-                self.bottom_pane.push_user_input_request(request);
+            },
+        );
+    }
+
+    fn on_request_user_input_deferred(
+        &mut self,
+        request: codex_protocol::request_user_input::RequestUserInputEvent,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::RequestUserInputRequest(request.clone()),
+            |s| {
+                s.bottom_pane.push_user_input_request(request);
+            },
+        );
+    }
+
+    fn defer_or_handle(&mut self, queued: QueuedUiInterrupt, handle: impl FnOnce(&mut Self)) {
+        if self.assistant_stream.queued_lines() > 0 || !self.pending_interrupts.is_empty() {
+            self.pending_interrupts.push_back(queued);
+        } else {
+            handle(self);
+        }
+    }
+
+    fn flush_interrupt_queue(&mut self) {
+        while let Some(interrupt) = self.pending_interrupts.pop_front() {
+            match interrupt {
+                QueuedUiInterrupt::ExecApprovalRequest {
+                    id,
+                    command,
+                    reason,
+                    network_approval_context,
+                } => {
+                    self.bottom_pane.push_approval_request(
+                        crate::bottom_pane::ApprovalRequest::Exec {
+                            id,
+                            command,
+                            reason,
+                            network_approval_context,
+                            proposed_execpolicy_amendment: None,
+                        },
+                        &codex_core::features::Features::default(),
+                    );
+                }
+                QueuedUiInterrupt::PatchApprovalRequest {
+                    id,
+                    reason,
+                    cwd,
+                    changes,
+                } => {
+                    self.bottom_pane.push_approval_request(
+                        crate::bottom_pane::ApprovalRequest::ApplyPatch {
+                            id,
+                            reason,
+                            cwd,
+                            changes,
+                        },
+                        &codex_core::features::Features::default(),
+                    );
+                }
+                QueuedUiInterrupt::ElicitationRequest {
+                    server_name,
+                    request_id,
+                    message,
+                } => {
+                    self.bottom_pane.push_approval_request(
+                        crate::bottom_pane::ApprovalRequest::McpElicitation {
+                            server_name,
+                            request_id,
+                            message,
+                        },
+                        &codex_core::features::Features::default(),
+                    );
+                }
+                QueuedUiInterrupt::RequestUserInputRequest(request) => {
+                    self.bottom_pane.push_user_input_request(request);
+                }
+                QueuedUiInterrupt::ExecCommandBegin {
+                    call_id,
+                    command,
+                    parsed,
+                    source,
+                } => self.on_exec_command_begin(call_id, command, parsed, source),
+                QueuedUiInterrupt::ExecCommandEnd {
+                    call_id,
+                    exit_code,
+                    aggregated_output,
+                    duration,
+                } => self.on_exec_command_end(&call_id, exit_code, aggregated_output, duration),
+                QueuedUiInterrupt::McpToolCallBegin {
+                    call_id,
+                    invocation,
+                } => self.on_mcp_tool_call_begin(call_id, invocation),
+                QueuedUiInterrupt::McpToolCallEnd {
+                    call_id,
+                    duration,
+                    result,
+                } => self.on_mcp_tool_call_end(&call_id, duration, result),
             }
         }
-        self.sync_bottom_pane_status();
     }
 
     pub(crate) fn push_line(&mut self, line: &str) {
@@ -775,8 +976,83 @@ impl LiveAttachTui {
             self.bottom_pane_event_tx
                 .send(UiAppEvent::StopCommitAnimation);
             self.sync_bottom_pane_status();
+            self.flush_interrupt_queue();
         }
         changed
+    }
+
+    fn on_exec_command_begin_deferred(
+        &mut self,
+        call_id: String,
+        command: Vec<String>,
+        parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
+        source: codex_core::protocol::ExecCommandSource,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::ExecCommandBegin {
+                call_id: call_id.clone(),
+                command: command.clone(),
+                parsed: parsed.clone(),
+                source,
+            },
+            |s| {
+                s.on_exec_command_begin(call_id, command, parsed, source);
+            },
+        );
+    }
+
+    fn on_exec_command_end_deferred(
+        &mut self,
+        call_id: String,
+        exit_code: i32,
+        aggregated_output: String,
+        duration: Duration,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::ExecCommandEnd {
+                call_id: call_id.clone(),
+                exit_code,
+                aggregated_output: aggregated_output.clone(),
+                duration,
+            },
+            |s| {
+                s.on_exec_command_end(&call_id, exit_code, aggregated_output, duration);
+            },
+        );
+    }
+
+    fn on_mcp_tool_call_begin_deferred(
+        &mut self,
+        call_id: String,
+        invocation: codex_core::protocol::McpInvocation,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::McpToolCallBegin {
+                call_id: call_id.clone(),
+                invocation: invocation.clone(),
+            },
+            |s| {
+                s.on_mcp_tool_call_begin(call_id, invocation);
+            },
+        );
+    }
+
+    fn on_mcp_tool_call_end_deferred(
+        &mut self,
+        call_id: String,
+        duration: Duration,
+        result: Result<codex_protocol::mcp::CallToolResult, String>,
+    ) {
+        self.defer_or_handle(
+            QueuedUiInterrupt::McpToolCallEnd {
+                call_id: call_id.clone(),
+                duration,
+                result: result.clone(),
+            },
+            |s| {
+                s.on_mcp_tool_call_end(&call_id, duration, result);
+            },
+        );
     }
 
     pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
