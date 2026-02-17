@@ -12,6 +12,7 @@ use crate::mention_codec;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
 use crate::text_formatting;
+use crate::version::CODEX_CLI_VERSION;
 use crate::*;
 use codex_utils_fuzzy_match::fuzzy_match;
 
@@ -104,7 +105,7 @@ impl LiveAttachTui {
             }
             UiEvent::ThreadStarted(thread_id) => {
                 self.session_id = thread_id.clone();
-                self.push_line(&format!("[thread started] {thread_id}"));
+                self.status_message = Some("thread started".to_string());
             }
             UiEvent::ThreadRenamed(name) => {
                 self.push_line(&format!("[thread renamed] {name}"));
@@ -415,7 +416,7 @@ impl LiveAttachTui {
                 ])
                 .split(frame.area());
 
-            let history = self.transcript.clone();
+            let history = self.history_view_text();
             let history_lines = history.lines().count().max(1) as u16;
             let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
@@ -476,6 +477,18 @@ impl LiveAttachTui {
             frame.set_cursor_position((cursor_x, chunks[input_chunk_index].y));
         })?;
         Ok(())
+    }
+
+    fn history_view_text(&self) -> String {
+        let cwd = display_cwd_for_welcome();
+        let mut text = format!(
+            "  codex\n\n  >_ OpenAI Codex ({CODEX_CLI_VERSION})\n\n  model:     gpt-5.3-codex medium    /model to change\n\n  directory: {cwd}\n\n  Tip: New 2x rate limits until April 2nd.\n"
+        );
+        if !self.transcript.trim().is_empty() {
+            text.push('\n');
+            text.push_str(&self.transcript);
+        }
+        text
     }
 
     pub(crate) fn input_line(
@@ -775,6 +788,20 @@ fn next_char_boundary(text: &str, index: usize) -> usize {
             .unwrap_or(0)
 }
 
+fn display_cwd_for_welcome() -> String {
+    let cwd = env::current_dir()
+        .ok()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "~".to_string());
+    let home = env::var("HOME").ok();
+    if let Some(home) = home
+        && cwd == home
+    {
+        return "~".to_string();
+    }
+    cwd
+}
+
 pub(crate) struct ChatWidget {
     ui: LiveAttachTui,
 }
@@ -820,5 +847,28 @@ impl ChatWidget {
             // App-level events are handled by the App struct, not the widget.
             _ => Ok(LiveTuiAction::Continue),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LiveAttachTui;
+
+    #[test]
+    fn history_view_text_shows_welcome_card_when_empty() {
+        let ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
+        let text = ui.history_view_text();
+        assert!(text.contains("OpenAI Codex"));
+        assert!(text.contains("model:"));
+        assert!(text.contains("directory:"));
+    }
+
+    #[test]
+    fn history_view_text_prefers_transcript_when_non_empty() {
+        let mut ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
+        ui.push_line("hello");
+        let text = ui.history_view_text();
+        assert!(text.contains("hello"));
+        assert!(!text.contains("OpenAI Codex"));
     }
 }
