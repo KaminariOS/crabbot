@@ -17,12 +17,15 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements;
 pub(super) use crate::core_compat::stream_events;
+use crate::exec_cell::CommandOutput as ExecCommandOutput;
+use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
 use crate::get_git_diff::get_git_diff;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
+use codex_core::protocol::ExecCommandSource;
 use crossterm::style::ResetColor;
 
 // ---------------------------------------------------------------------------
@@ -486,6 +489,9 @@ impl App {
                 WidgetAppEvent::CodexOp(codex_core::protocol::Op::Interrupt) => {
                     self.app_event_tx.send(AppEvent::Interrupt);
                 }
+                WidgetAppEvent::InsertHistoryCell(cell) => {
+                    self.widget.ui_mut().add_history_cell(cell);
+                }
                 WidgetAppEvent::StartFileSearch(query) => {
                     self.file_search.on_user_query(query);
                 }
@@ -544,16 +550,12 @@ impl App {
                 self.widget.ui_mut().push_line(&diff_text);
             }
             _ => {
-                let text = if arg.trim().is_empty() {
-                    format!("/{}", cmd.command())
-                } else {
-                    format!("/{} {}", cmd.command(), arg)
-                };
-                self.app_event_tx.send(AppEvent::SubmitInput {
-                    text,
-                    text_elements,
-                    mention_bindings: Vec::new(),
-                });
+                let _ = arg;
+                let _ = text_elements;
+                self.widget.ui_mut().push_line(&format!(
+                    "[info] /{} is not yet ported in app-server tui",
+                    cmd.command()
+                ));
             }
         }
         Ok(())
@@ -645,10 +647,16 @@ impl App {
                 Some("prefix with ! to run a local shell command".to_string());
             return;
         }
-
-        self.widget
-            .ui_mut()
-            .push_line(&format!("[exec start] {command}"));
+        let started = Instant::now();
+        let call_id = format!("user-shell-{}", started.elapsed().as_nanos());
+        let mut cell = new_active_exec_command(
+            call_id.clone(),
+            vec!["bash".to_string(), "-lc".to_string(), command.to_string()],
+            Vec::new(),
+            ExecCommandSource::UserShell,
+            None,
+            true,
+        );
         let output = std::process::Command::new("bash")
             .arg("-lc")
             .arg(command)
@@ -656,25 +664,34 @@ impl App {
             .output();
         match output {
             Ok(output) => {
-                if !output.stdout.is_empty() {
-                    self.widget
-                        .ui_mut()
-                        .push_line(&String::from_utf8_lossy(&output.stdout));
-                }
-                if !output.stderr.is_empty() {
-                    self.widget
-                        .ui_mut()
-                        .push_line(&String::from_utf8_lossy(&output.stderr));
-                }
                 let exit_code = output.status.code().unwrap_or(1);
-                self.widget
-                    .ui_mut()
-                    .push_line(&format!("[exec done] exit_code={exit_code}"));
+                let aggregated_output = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                cell.complete_call(
+                    &call_id,
+                    ExecCommandOutput {
+                        exit_code,
+                        aggregated_output: aggregated_output.clone(),
+                        formatted_output: aggregated_output,
+                    },
+                    started.elapsed(),
+                );
+                self.widget.ui_mut().add_history_cell(Box::new(cell));
             }
             Err(err) => {
-                self.widget
-                    .ui_mut()
-                    .push_line(&format!("[error] shell command failed: {err}"));
+                cell.complete_call(
+                    &call_id,
+                    ExecCommandOutput {
+                        exit_code: 1,
+                        aggregated_output: format!("shell command failed: {err}"),
+                        formatted_output: String::new(),
+                    },
+                    started.elapsed(),
+                );
+                self.widget.ui_mut().add_history_cell(Box::new(cell));
             }
         }
     }

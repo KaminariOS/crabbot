@@ -952,6 +952,8 @@ mod codex_file_search_stub {
     use serde::Serialize;
     use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::mpsc;
+    use std::thread;
 
     /// File match result.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -990,31 +992,12 @@ mod codex_file_search_stub {
 
     /// Active file search session handle.
     pub struct FileSearchSession {
-        roots: Vec<PathBuf>,
-        reporter: Arc<dyn SessionReporter>,
+        query_tx: mpsc::Sender<String>,
     }
 
     impl FileSearchSession {
         pub fn update_query(&self, query: &str) {
-            let query = query.trim().to_ascii_lowercase();
-            if query.is_empty() {
-                self.reporter.on_update(&FileSearchSnapshot {
-                    query: String::new(),
-                    matches: Vec::new(),
-                });
-                return;
-            }
-
-            let mut matches = Vec::new();
-            for root in &self.roots {
-                collect_matches(root, root, &query, &mut matches);
-                if matches.len() >= 200 {
-                    break;
-                }
-            }
-            matches.sort_by_key(|m| m.path.clone());
-            self.reporter
-                .on_update(&FileSearchSnapshot { query, matches });
+            let _ = self.query_tx.send(query.to_string());
         }
     }
 
@@ -1028,7 +1011,35 @@ mod codex_file_search_stub {
         if roots.is_empty() {
             return Err("no search roots configured".to_string());
         }
-        Ok(FileSearchSession { roots, reporter })
+        let (query_tx, query_rx) = mpsc::channel::<String>();
+        thread::spawn(move || {
+            while let Ok(mut query) = query_rx.recv() {
+                while let Ok(next) = query_rx.try_recv() {
+                    query = next;
+                }
+
+                let query = query.trim().to_ascii_lowercase();
+                if query.is_empty() {
+                    reporter.on_update(&FileSearchSnapshot {
+                        query: String::new(),
+                        matches: Vec::new(),
+                    });
+                    continue;
+                }
+
+                let mut matches = Vec::new();
+                for root in &roots {
+                    collect_matches(root, root, &query, &mut matches);
+                    if matches.len() >= 200 {
+                        break;
+                    }
+                }
+                matches.sort_by_key(|m| m.path.clone());
+                reporter.on_update(&FileSearchSnapshot { query, matches });
+            }
+            reporter.on_complete();
+        });
+        Ok(FileSearchSession { query_tx })
     }
 
     fn collect_matches(root: &PathBuf, dir: &PathBuf, query: &str, out: &mut Vec<FileMatch>) {

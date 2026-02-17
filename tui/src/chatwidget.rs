@@ -944,6 +944,11 @@ impl LiveAttachTui {
         self.bottom_pane.on_file_search_result(query, matches);
     }
 
+    pub(crate) fn add_history_cell(&mut self, cell: Box<dyn HistoryCell>) {
+        self.flush_assistant_message();
+        self.history_cells.push(cell);
+    }
+
     pub(crate) fn set_skills(
         &mut self,
         skills: Option<Vec<codex_core::skills::model::SkillMetadata>>,
