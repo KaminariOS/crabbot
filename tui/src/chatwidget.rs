@@ -527,7 +527,11 @@ impl LiveAttachTui {
         if delta.is_empty() {
             return;
         }
-        self.assistant_stream.push(delta);
+        if self.assistant_stream.push(delta) {
+            self.bottom_pane_event_tx
+                .send(UiAppEvent::StartCommitAnimation);
+            self.run_catch_up_commit_tick();
+        }
     }
 
     fn flush_assistant_message(&mut self) {
@@ -724,19 +728,34 @@ impl LiveAttachTui {
         )));
     }
 
-    pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
+    fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) -> bool {
         let output = run_commit_tick(
             &mut self.adaptive_chunking,
             Some(&mut self.assistant_stream),
             None,
-            CommitTickScope::AnyMode,
+            scope,
             Instant::now(),
         );
-        if output.cells.is_empty() {
-            return false;
+        let mut changed = false;
+        for cell in output.cells {
+            self.bottom_pane.hide_status_indicator();
+            self.add_boxed_history(cell);
+            changed = true;
         }
-        self.history_cells.extend(output.cells);
-        true
+        if output.has_controller && output.all_idle {
+            self.bottom_pane_event_tx
+                .send(UiAppEvent::StopCommitAnimation);
+            self.sync_bottom_pane_status();
+        }
+        changed
+    }
+
+    pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
+        self.run_commit_tick_with_scope(CommitTickScope::AnyMode)
+    }
+
+    fn run_catch_up_commit_tick(&mut self) -> bool {
+        self.run_commit_tick_with_scope(CommitTickScope::CatchUpOnly)
     }
 
     fn on_agent_reasoning_delta(&mut self, delta: String) {
