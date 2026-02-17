@@ -844,10 +844,7 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("Collaboration modes are not available in app-server TUI yet."),
-            SlashCommand::Agent => self
-                .widget
-                .ui_mut()
-                .push_line("Agent thread picker is not available in app-server TUI yet."),
+            SlashCommand::Agent => self.open_agent_picker()?,
             SlashCommand::Experimental => self
                 .widget
                 .ui_mut()
@@ -1101,6 +1098,67 @@ impl App {
                 title: Some("Resume Chat".to_string()),
                 subtitle: Some("Select a saved chat to resume.".to_string()),
                 items,
+                ..Default::default()
+            });
+        Ok(())
+    }
+
+    fn open_agent_picker(&mut self) -> Result<()> {
+        let threads = fetch_resume_threads(&self.state)?;
+        if threads.is_empty() {
+            self.widget
+                .ui_mut()
+                .add_history_cell(Box::new(crate::history_cell::new_info_event(
+                    "No agents available yet.".to_string(),
+                    None,
+                )));
+            return Ok(());
+        }
+
+        let current_session_id = self.widget.ui_mut().session_id.clone();
+        let mut initial_selected_idx: Option<usize> = None;
+        let items = threads
+            .into_iter()
+            .enumerate()
+            .filter_map(|(idx, thread)| {
+                let thread_id_text = thread.thread_id.clone();
+                let thread_id =
+                    codex_protocol::ThreadId::from_string(thread_id_text.clone()).ok()?;
+                if current_session_id == thread_id_text {
+                    initial_selected_idx = Some(idx);
+                }
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::SelectAgentThread(thread_id.clone()));
+                });
+                Some(crate::bottom_pane::SelectionItem {
+                    name: thread_id_text.clone(),
+                    is_current: current_session_id == thread_id_text,
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    search_value: Some(thread_id_text),
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if items.is_empty() {
+            self.widget
+                .ui_mut()
+                .add_history_cell(Box::new(crate::history_cell::new_info_event(
+                    "No agents available yet.".to_string(),
+                    None,
+                )));
+            return Ok(());
+        }
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Agents".to_string()),
+                subtitle: Some("Select a thread to focus".to_string()),
+                items,
+                initial_selected_idx,
+                is_searchable: true,
                 ..Default::default()
             });
         Ok(())
