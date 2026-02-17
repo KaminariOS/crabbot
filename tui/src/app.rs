@@ -161,6 +161,7 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
+            self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
             self.widget.draw(terminal)?;
             let mut should_redraw = false;
 

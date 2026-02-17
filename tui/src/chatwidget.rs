@@ -665,6 +665,10 @@ impl LiveAttachTui {
         self.bottom_pane.handle_paste(text);
     }
 
+    pub(crate) fn flush_bottom_pane_paste_burst_if_due(&mut self) -> bool {
+        self.bottom_pane.flush_paste_burst_if_due()
+    }
+
     pub(crate) fn bottom_pane_composer_text(&self) -> String {
         self.bottom_pane.composer_text()
     }
