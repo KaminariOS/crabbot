@@ -302,18 +302,30 @@ impl App {
     }
 
     fn switch_to_thread(&mut self, thread_id: String, status_message: &str, announce_switch: bool) {
-        let ui = self.widget.ui_mut();
-        let previous_thread = ui.session_id.clone();
+        let previous_thread = self.widget.ui_mut().session_id.clone();
         let changed = previous_thread != thread_id;
-        ui.session_id = thread_id.clone();
-        ui.active_turn_id = None;
+
         if changed {
-            ui.pending_approvals.clear();
+            self.widget
+                .ui_mut()
+                .reset_for_thread_switch(thread_id.clone());
+            self.status_runtime = StatusRuntime::default();
+            if let Ok(events) = stream_events(&self.state, 0)
+                && !events.is_empty()
+            {
+                self.status_runtime.apply_stream_events(&events);
+                self.widget.ui_mut().apply_rpc_stream_events(&events);
+            }
         }
+
         if announce_switch && changed {
-            ui.push_line(&format!("[thread switched] {thread_id}"));
+            self.widget
+                .ui_mut()
+                .push_line(&format!("[thread switched] {thread_id}"));
         }
-        ui.set_status_message(Some(status_message.to_string()));
+        self.widget
+            .ui_mut()
+            .set_status_message(Some(status_message.to_string()));
         self.state.last_thread_id = Some(thread_id.clone());
         self.thread_id = thread_id;
     }

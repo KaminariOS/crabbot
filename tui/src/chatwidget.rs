@@ -1013,6 +1013,23 @@ impl LiveAttachTui {
         self.history_cells.push(cell);
     }
 
+    pub(crate) fn reset_for_thread_switch(&mut self, thread_id: String) {
+        self.session_id = thread_id;
+        self.history_cells.clear();
+        self.history_cells_flushed_to_scrollback = 0;
+        self.assistant_stream = StreamController::new(None);
+        self.adaptive_chunking.reset();
+        self.active_turn_id = None;
+        self.pending_approvals.clear();
+        self.pending_prompt = None;
+        self.history_scroll_offset = 0;
+        self.previous_state = None;
+        self.latest_state = "active".to_string();
+        self.received_events = 0;
+        self.last_sequence = 0;
+        self.clear_input();
+    }
+
     pub(crate) fn take_new_history_lines_for_scrollback(
         &mut self,
         width: u16,
