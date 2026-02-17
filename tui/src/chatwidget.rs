@@ -34,6 +34,7 @@ use crate::streaming::controller::StreamController;
 use crate::text_formatting;
 use crate::version::CODEX_CLI_VERSION;
 use crate::*;
+use codex_file_search::FileMatch;
 use codex_utils_fuzzy_match::fuzzy_match;
 use crossterm::event::KeyEvent;
 
@@ -937,6 +938,24 @@ impl LiveAttachTui {
 
     pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
         self.bottom_pane.take_recent_submission_mention_bindings()
+    }
+
+    pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
+        self.bottom_pane.on_file_search_result(query, matches);
+    }
+
+    pub(crate) fn set_skills(
+        &mut self,
+        skills: Option<Vec<codex_core::skills::model::SkillMetadata>>,
+    ) {
+        self.bottom_pane.set_skills(skills);
+    }
+
+    pub(crate) fn set_connectors_snapshot(
+        &mut self,
+        snapshot: Option<crate::app_event::ConnectorsSnapshot>,
+    ) {
+        self.bottom_pane.set_connectors_snapshot(snapshot);
     }
 
     fn sync_bottom_pane_status(&mut self) {

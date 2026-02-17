@@ -1,6 +1,7 @@
 use super::*;
 
 use crate::app_event::AppEvent as WidgetAppEvent;
+use crate::app_event_sender::AppEventSender as WidgetAppEventSender;
 use crate::bottom_pane::InputResult;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::LiveAttachTui;
@@ -16,6 +17,8 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements;
 pub(super) use crate::core_compat::stream_events;
+use crate::file_search::FileSearchManager;
+use crate::get_git_diff::get_git_diff;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
@@ -42,6 +45,10 @@ pub(crate) struct App {
     app_event_tx: AppEventSender,
     /// Internal app event receiver.
     app_event_rx: std::sync::mpsc::Receiver<AppEvent>,
+    /// Widget event receiver (bottom pane + file search).
+    widget_event_rx: tokio::sync::mpsc::UnboundedReceiver<WidgetAppEvent>,
+    /// Upstream-style @file search manager.
+    file_search: FileSearchManager,
 }
 
 struct DrainResult {
@@ -74,6 +81,20 @@ impl App {
             }
         }
         let (tx, rx) = std::sync::mpsc::channel();
+        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
+        let widget_sender = WidgetAppEventSender::new(widget_tx);
+        let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let file_search = FileSearchManager::new(search_dir, widget_sender);
+        if let Ok(skills) = fetch_skills_for_cwd(&state)
+            && !skills.is_empty()
+        {
+            widget.ui_mut().set_skills(Some(skills));
+        }
+        if let Ok(connectors) = fetch_connectors(&state)
+            && !connectors.connectors.is_empty()
+        {
+            widget.ui_mut().set_connectors_snapshot(Some(connectors));
+        }
 
         Ok(Self {
             widget,
@@ -81,6 +102,8 @@ impl App {
             thread_id,
             app_event_tx: AppEventSender::new(tx),
             app_event_rx: rx,
+            widget_event_rx: widget_rx,
+            file_search,
         })
     }
 
@@ -101,6 +124,20 @@ impl App {
         }
         state.last_thread_id = Some(session_id.clone());
         let (tx, rx) = std::sync::mpsc::channel();
+        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
+        let widget_sender = WidgetAppEventSender::new(widget_tx);
+        let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        let file_search = FileSearchManager::new(search_dir, widget_sender);
+        if let Ok(skills) = fetch_skills_for_cwd(&state)
+            && !skills.is_empty()
+        {
+            widget.ui_mut().set_skills(Some(skills));
+        }
+        if let Ok(connectors) = fetch_connectors(&state)
+            && !connectors.connectors.is_empty()
+        {
+            widget.ui_mut().set_connectors_snapshot(Some(connectors));
+        }
 
         Ok(Self {
             widget,
@@ -108,6 +145,8 @@ impl App {
             thread_id: session_id,
             app_event_tx: AppEventSender::new(tx),
             app_event_rx: rx,
+            widget_event_rx: widget_rx,
+            file_search,
         })
     }
 
@@ -443,11 +482,27 @@ impl App {
             ui.drain_bottom_pane_events()
         };
         for event in pending_widget_events {
-            if matches!(
-                event,
-                WidgetAppEvent::CodexOp(codex_core::protocol::Op::Interrupt)
-            ) {
-                self.app_event_tx.send(AppEvent::Interrupt);
+            match event {
+                WidgetAppEvent::CodexOp(codex_core::protocol::Op::Interrupt) => {
+                    self.app_event_tx.send(AppEvent::Interrupt);
+                }
+                WidgetAppEvent::StartFileSearch(query) => {
+                    self.file_search.on_user_query(query);
+                }
+                WidgetAppEvent::FileSearchResult { query, matches } => {
+                    self.widget
+                        .ui_mut()
+                        .apply_file_search_result(query, matches);
+                }
+                _ => {}
+            }
+        }
+
+        while let Ok(event) = self.widget_event_rx.try_recv() {
+            if let WidgetAppEvent::FileSearchResult { query, matches } = event {
+                self.widget
+                    .ui_mut()
+                    .apply_file_search_result(query, matches);
             }
         }
 
@@ -484,6 +539,10 @@ impl App {
             SlashCommand::Mention => {
                 self.widget.ui_mut().bottom_pane_insert_str("@");
             }
+            SlashCommand::Diff => {
+                let diff_text = run_diff_now();
+                self.widget.ui_mut().push_line(&diff_text);
+            }
             _ => {
                 let text = if arg.trim().is_empty() {
                     format!("/{}", cmd.command())
@@ -509,6 +568,10 @@ impl App {
     ) -> Result<LiveTuiAction> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
+            return Ok(LiveTuiAction::Continue);
+        }
+        if let Some(command) = input.strip_prefix('!') {
+            self.run_user_shell_command(command.trim());
             return Ok(LiveTuiAction::Continue);
         }
         let ui = self.widget.ui_mut();
@@ -574,6 +637,46 @@ impl App {
             mention_bindings,
         });
         Ok(LiveTuiAction::Continue)
+    }
+
+    fn run_user_shell_command(&mut self, command: &str) {
+        if command.is_empty() {
+            self.widget.ui_mut().status_message =
+                Some("prefix with ! to run a local shell command".to_string());
+            return;
+        }
+
+        self.widget
+            .ui_mut()
+            .push_line(&format!("[exec start] {command}"));
+        let output = std::process::Command::new("bash")
+            .arg("-lc")
+            .arg(command)
+            .current_dir(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()))
+            .output();
+        match output {
+            Ok(output) => {
+                if !output.stdout.is_empty() {
+                    self.widget
+                        .ui_mut()
+                        .push_line(&String::from_utf8_lossy(&output.stdout));
+                }
+                if !output.stderr.is_empty() {
+                    self.widget
+                        .ui_mut()
+                        .push_line(&String::from_utf8_lossy(&output.stderr));
+                }
+                let exit_code = output.status.code().unwrap_or(1);
+                self.widget
+                    .ui_mut()
+                    .push_line(&format!("[exec done] exit_code={exit_code}"));
+            }
+            Err(err) => {
+                self.widget
+                    .ui_mut()
+                    .push_line(&format!("[error] shell command failed: {err}"));
+            }
+        }
     }
 }
 
@@ -685,6 +788,129 @@ fn handle_app_server_approval_decision(
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
+
+fn fetch_skills_for_cwd(state: &CliState) -> Result<Vec<codex_core::skills::model::SkillMetadata>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "skills/list",
+        json!({
+            "cwds": [cwd],
+            "forceReload": false
+        }),
+    )?;
+    let mut out = Vec::new();
+    let data = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in data {
+        let Some(skills) = entry.get("skills").and_then(Value::as_array) else {
+            continue;
+        };
+        for skill in skills {
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let path = skill
+                .get("path")
+                .and_then(Value::as_str)
+                .map(PathBuf::from)
+                .unwrap_or_default();
+            out.push(codex_core::skills::model::SkillMetadata {
+                name: name.to_string(),
+                description,
+                short_description: skill
+                    .get("shortDescription")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                interface: None,
+                path,
+                scope: codex_core::protocol::SkillScope::User,
+            });
+        }
+    }
+    Ok(out)
+}
+
+fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnapshot> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "app/list",
+        json!({}),
+    )?;
+    let connectors = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|app| {
+            Some(codex_chatgpt::connectors::AppInfo {
+                id: app.get("id")?.as_str()?.to_string(),
+                name: app.get("name")?.as_str()?.to_string(),
+                description: app
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                logo_url: app
+                    .get("logoUrl")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                logo_url_dark: app
+                    .get("logoUrlDark")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                distribution_channel: app
+                    .get("distributionChannel")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                install_url: app
+                    .get("installUrl")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                is_accessible: app
+                    .get("isAccessible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_enabled: app
+                    .get("isEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    Ok(crate::app_event::ConnectorsSnapshot { connectors })
+}
+
+fn run_diff_now() -> String {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build();
+    let Ok(runtime) = runtime else {
+        return "failed to initialize runtime for /diff".to_string();
+    };
+    match runtime.block_on(get_git_diff()) {
+        Ok((is_git_repo, text)) => {
+            if is_git_repo {
+                text
+            } else {
+                "`/diff` — _not inside a git repository_".to_string()
+            }
+        }
+        Err(err) => format!("Failed to compute diff: {err}"),
+    }
+}
 
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {

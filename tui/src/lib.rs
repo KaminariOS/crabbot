@@ -951,6 +951,7 @@ mod codex_file_search_stub {
     use serde::Deserialize;
     use serde::Serialize;
     use std::path::PathBuf;
+    use std::sync::Arc;
 
     /// File match result.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -989,21 +990,93 @@ mod codex_file_search_stub {
 
     /// Active file search session handle.
     pub struct FileSearchSession {
-        _private: (),
+        roots: Vec<PathBuf>,
+        reporter: Arc<dyn SessionReporter>,
     }
 
     impl FileSearchSession {
-        pub fn update_query(&self, _query: &str) {}
+        pub fn update_query(&self, query: &str) {
+            let query = query.trim().to_ascii_lowercase();
+            if query.is_empty() {
+                self.reporter.on_update(&FileSearchSnapshot {
+                    query: String::new(),
+                    matches: Vec::new(),
+                });
+                return;
+            }
+
+            let mut matches = Vec::new();
+            for root in &self.roots {
+                collect_matches(root, root, &query, &mut matches);
+                if matches.len() >= 200 {
+                    break;
+                }
+            }
+            matches.sort_by_key(|m| m.path.clone());
+            self.reporter
+                .on_update(&FileSearchSnapshot { query, matches });
+        }
     }
 
     /// Create a file search session.
     pub fn create_session(
-        _roots: Vec<PathBuf>,
+        roots: Vec<PathBuf>,
         _options: FileSearchOptions,
-        _reporter: std::sync::Arc<dyn SessionReporter>,
+        reporter: std::sync::Arc<dyn SessionReporter>,
         _cancel: Option<()>,
     ) -> Result<FileSearchSession, String> {
-        Err("file search not implemented in crabbot stub".into())
+        if roots.is_empty() {
+            return Err("no search roots configured".to_string());
+        }
+        Ok(FileSearchSession { roots, reporter })
+    }
+
+    fn collect_matches(root: &PathBuf, dir: &PathBuf, query: &str, out: &mut Vec<FileMatch>) {
+        if out.len() >= 200 {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            if out.len() >= 200 {
+                break;
+            }
+            let path = entry.path();
+            let file_name = entry.file_name();
+            let file_name = file_name.to_string_lossy();
+            if file_name.starts_with(".git") || file_name == "target" {
+                continue;
+            }
+
+            if path.is_dir() {
+                collect_matches(root, &path, query, out);
+                continue;
+            }
+            if !path.is_file() {
+                continue;
+            }
+
+            let Ok(rel) = path.strip_prefix(root) else {
+                continue;
+            };
+            let rel_str = rel.to_string_lossy().to_ascii_lowercase();
+            if rel_str.contains(query) {
+                let score = if rel_str.ends_with(query) {
+                    100
+                } else if rel_str.contains(&format!("/{query}")) {
+                    80
+                } else {
+                    60
+                };
+                out.push(FileMatch {
+                    score,
+                    path: rel.to_path_buf(),
+                    root: root.clone(),
+                    indices: None,
+                });
+            }
+        }
     }
 }
 pub use codex_file_search_stub::FileMatch;
