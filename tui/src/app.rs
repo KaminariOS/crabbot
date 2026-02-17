@@ -51,15 +51,12 @@ impl App {
     /// ready, starts or reuses a thread, and creates the initial `ChatWidget`.
     pub(crate) fn new(args: TuiArgs, mut state: CliState) -> Result<Self> {
         ensure_app_server_ready(&state)?;
-        let thread_id = args
-            .thread_id
-            .or_else(|| state.last_thread_id.clone())
-            .map(Ok)
-            .unwrap_or_else(|| start_thread(&state))?;
+        let (thread_id, status_message) =
+            resolve_initial_thread_id(&state, args.thread_id, state.last_thread_id.clone())?;
         state.last_thread_id = Some(thread_id.clone());
 
         let mut widget = ChatWidget::new(thread_id.clone());
-        widget.ui_mut().status_message = Some("connected to app-server websocket".to_string());
+        widget.ui_mut().status_message = Some(status_message);
         let _ = widget.poll_stream_updates(&state);
 
         Ok(Self {
@@ -333,6 +330,48 @@ impl App {
         ui.status_message = Some("waiting for response...".to_string());
         Ok(LiveTuiAction::Continue)
     }
+}
+
+fn resolve_initial_thread_id(
+    state: &CliState,
+    explicit_thread_id: Option<String>,
+    cached_thread_id: Option<String>,
+) -> Result<(String, String)> {
+    if let Some(thread_id) = explicit_thread_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        let resumed = resume_thread(state, &thread_id).with_context(|| {
+            format!("resume explicit thread id before tui startup: {thread_id}")
+        })?;
+        let resolved = resumed.unwrap_or(thread_id);
+        return Ok((resolved, "connected to app-server websocket".to_string()));
+    }
+
+    if let Some(thread_id) = cached_thread_id
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        match resume_thread(state, &thread_id) {
+            Ok(Some(resumed_thread_id)) => {
+                return Ok((
+                    resumed_thread_id,
+                    "connected to app-server websocket".to_string(),
+                ));
+            }
+            Ok(None) => {}
+            Err(_) => {}
+        }
+
+        let new_thread_id = start_thread(state)?;
+        return Ok((
+            new_thread_id,
+            "cached thread was unavailable; started a new thread".to_string(),
+        ));
+    }
+
+    let thread_id = start_thread(state)?;
+    Ok((thread_id, "connected to app-server websocket".to_string()))
 }
 
 // ---------------------------------------------------------------------------

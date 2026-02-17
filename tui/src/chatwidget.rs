@@ -192,15 +192,6 @@ impl LiveAttachTui {
             return;
         }
 
-        if !delta.starts_with([' ', '\n', '\t'])
-            && let (Some(previous), Some(next)) =
-                (self.transcript.chars().last(), delta.chars().next())
-            && (previous.is_alphanumeric() && next.is_alphanumeric()
-                || matches!(previous, '.' | '!' | '?' | ':' | ';' | ',') && next.is_alphanumeric())
-        {
-            self.transcript.push(' ');
-        }
-
         self.transcript.push_str(delta);
     }
 

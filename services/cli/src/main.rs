@@ -357,7 +357,9 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
     }
     handle_tui_with_crate(
         TuiArgs {
-            thread_id: state.last_thread_id.clone(),
+            // Leave this empty so TUI can treat persisted `last_thread_id` as
+            // cache (resume-or-start fallback), not as strict explicit input.
+            thread_id: None,
         },
         state,
     )
