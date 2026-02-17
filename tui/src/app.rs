@@ -563,6 +563,12 @@ impl App {
                 WidgetAppEvent::UpdateModel(model) => {
                     self.apply_model_selection(model)?;
                 }
+                WidgetAppEvent::UpdateAskForApprovalPolicy(policy) => {
+                    self.apply_approval_policy_selection(policy)?;
+                }
+                WidgetAppEvent::UpdateSandboxPolicy(policy) => {
+                    self.apply_sandbox_policy_selection(policy)?;
+                }
                 WidgetAppEvent::StatusLineSetup { .. } => {
                     self.widget
                         .ui_mut()
@@ -637,10 +643,7 @@ impl App {
                 }
             }
             SlashCommand::Approvals | SlashCommand::Permissions => {
-                let pending = self.widget.ui_mut().pending_approvals.len();
-                self.widget
-                    .ui_mut()
-                    .push_line(&format!("Pending approvals: {pending}"));
+                self.open_permissions_picker()?
             }
             SlashCommand::Review => {
                 if arg.trim().is_empty() {
@@ -1086,6 +1089,101 @@ impl App {
             .set_status_message(Some(format!("model updated to {model}")));
         Ok(())
     }
+
+    fn open_permissions_picker(&mut self) -> Result<()> {
+        let current = fetch_current_permissions_from_config(&self.state);
+        let current_approval = current
+            .as_ref()
+            .map(|(approval, _)| *approval)
+            .unwrap_or(codex_core::protocol::AskForApproval::OnRequest);
+        let current_sandbox = current
+            .as_ref()
+            .map(|(_, sandbox)| sandbox.clone())
+            .unwrap_or_else(codex_core::protocol::SandboxPolicy::new_workspace_write_policy);
+
+        let presets = permissions_presets();
+        let items = presets
+            .into_iter()
+            .map(|preset| {
+                let approval = preset.approval;
+                let sandbox = preset.sandbox.clone();
+                let sandbox_for_action = sandbox.clone();
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::UpdateAskForApprovalPolicy(approval));
+                    sender.send(WidgetAppEvent::UpdateSandboxPolicy(
+                        sandbox_for_action.clone(),
+                    ));
+                });
+                crate::bottom_pane::SelectionItem {
+                    name: preset.label.to_string(),
+                    description: Some(preset.description.to_string()),
+                    is_current: approval == current_approval && sandbox == current_sandbox,
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                view_id: Some("permissions-picker"),
+                title: Some("Select Approval Mode".to_string()),
+                subtitle: Some("Switch between Codex approval presets".to_string()),
+                items,
+                ..Default::default()
+            });
+        Ok(())
+    }
+
+    fn apply_approval_policy_selection(
+        &mut self,
+        approval_policy: codex_core::protocol::AskForApproval,
+    ) -> Result<()> {
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": "approval_policy",
+                "value": approval_policy.to_string(),
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        self.widget.ui_mut().set_status_message(Some(format!(
+            "approval policy updated to {}",
+            approval_policy
+        )));
+        Ok(())
+    }
+
+    fn apply_sandbox_policy_selection(
+        &mut self,
+        sandbox_policy: codex_core::protocol::SandboxPolicy,
+    ) -> Result<()> {
+        let sandbox_mode = match sandbox_policy {
+            codex_core::protocol::SandboxPolicy::DangerFullAccess => "danger-full-access",
+            codex_core::protocol::SandboxPolicy::ReadOnly { .. } => "read-only",
+            codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
+            codex_core::protocol::SandboxPolicy::ExternalSandbox { .. } => "workspace-write",
+        };
+
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": "sandbox_mode",
+                "value": sandbox_mode,
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        self.widget
+            .ui_mut()
+            .set_status_message(Some(format!("sandbox mode updated to {sandbox_mode}")));
+        Ok(())
+    }
 }
 
 impl StatusRuntime {
@@ -1149,18 +1247,12 @@ impl StatusRuntime {
                 "cwd": config.cwd.display().to_string(),
             }),
         ) {
-            if let Some(model) = response
-                .result
-                .get("config")
-                .and_then(|cfg| cfg.get("model"))
-                .and_then(Value::as_str)
-            {
+            let cfg = response.result.get("config");
+            if let Some(model) = cfg.and_then(|c| c.get("model")).and_then(Value::as_str) {
                 config.model = Some(model.to_string());
             }
-            if let Some(summary) = response
-                .result
-                .get("config")
-                .and_then(|cfg| cfg.get("modelReasoningSummary"))
+            if let Some(summary) = cfg
+                .and_then(|c| c.get("modelReasoningSummary"))
                 .and_then(Value::as_str)
             {
                 config.model_reasoning_summary = match summary.to_ascii_lowercase().as_str() {
@@ -1169,6 +1261,18 @@ impl StatusRuntime {
                     "detailed" => codex_core::config::ReasoningSummary::Detailed,
                     _ => codex_core::config::ReasoningSummary::None,
                 };
+            }
+            if let Some(approval) = cfg
+                .and_then(|c| c.get("approval_policy").or_else(|| c.get("approvalPolicy")))
+                .and_then(parse_approval_policy_value)
+            {
+                config.permissions.approval_policy.0 = approval;
+            }
+            if let Some(sandbox) = cfg
+                .and_then(|c| c.get("sandbox_mode").or_else(|| c.get("sandboxMode")))
+                .and_then(parse_sandbox_policy_value)
+            {
+                config.permissions.sandbox_policy.0 = sandbox;
             }
             if let Some(reasoning_effort) = parse_reasoning_effort(
                 response
@@ -1782,6 +1886,13 @@ struct ModelPickerEntry {
     description: String,
 }
 
+struct PermissionsPresetEntry {
+    label: &'static str,
+    description: &'static str,
+    approval: codex_core::protocol::AskForApproval,
+    sandbox: codex_core::protocol::SandboxPolicy,
+}
+
 fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
@@ -1883,6 +1994,90 @@ fn fetch_current_model_from_config(state: &CliState) -> Option<String> {
         .and_then(|cfg| cfg.get("model"))
         .and_then(Value::as_str)
         .map(ToString::to_string)
+}
+
+fn permissions_presets() -> Vec<PermissionsPresetEntry> {
+    vec![
+        PermissionsPresetEntry {
+            label: "Default",
+            description: "Read and edit files in the current directory. Ask before commands and network.",
+            approval: codex_core::protocol::AskForApproval::OnRequest,
+            sandbox: codex_core::protocol::SandboxPolicy::new_workspace_write_policy(),
+        },
+        PermissionsPresetEntry {
+            label: "Auto",
+            description: "Read and edit files in the current directory. Run commands and network automatically.",
+            approval: codex_core::protocol::AskForApproval::Never,
+            sandbox: codex_core::protocol::SandboxPolicy::new_workspace_write_policy(),
+        },
+        PermissionsPresetEntry {
+            label: "Read Only",
+            description: "Read files and ask before commands.",
+            approval: codex_core::protocol::AskForApproval::OnRequest,
+            sandbox: codex_core::protocol::SandboxPolicy::new_read_only_policy(),
+        },
+        PermissionsPresetEntry {
+            label: "Full Access",
+            description: "Read and edit all files. Run commands and network automatically.",
+            approval: codex_core::protocol::AskForApproval::Never,
+            sandbox: codex_core::protocol::SandboxPolicy::DangerFullAccess,
+        },
+    ]
+}
+
+fn fetch_current_permissions_from_config(
+    state: &CliState,
+) -> Option<(
+    codex_core::protocol::AskForApproval,
+    codex_core::protocol::SandboxPolicy,
+)> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "config/read",
+        json!({
+            "includeLayers": false,
+        }),
+    )
+    .ok()?;
+
+    let config = response.result.get("config")?;
+    let approval = config
+        .get("approval_policy")
+        .or_else(|| config.get("approvalPolicy"))
+        .and_then(parse_approval_policy_value)?;
+    let sandbox = config
+        .get("sandbox_mode")
+        .or_else(|| config.get("sandboxMode"))
+        .and_then(parse_sandbox_policy_value)?;
+    Some((approval, sandbox))
+}
+
+fn parse_approval_policy_value(value: &Value) -> Option<codex_core::protocol::AskForApproval> {
+    let raw = value.as_str()?.to_ascii_lowercase();
+    match raw.as_str() {
+        "untrusted" => Some(codex_core::protocol::AskForApproval::UnlessTrusted),
+        "on-failure" | "on_failure" => Some(codex_core::protocol::AskForApproval::OnFailure),
+        "on-request" | "on_request" => Some(codex_core::protocol::AskForApproval::OnRequest),
+        "never" => Some(codex_core::protocol::AskForApproval::Never),
+        _ => None,
+    }
+}
+
+fn parse_sandbox_policy_value(value: &Value) -> Option<codex_core::protocol::SandboxPolicy> {
+    let raw = value.as_str()?.to_ascii_lowercase();
+    match raw.as_str() {
+        "read-only" | "read_only" => {
+            Some(codex_core::protocol::SandboxPolicy::new_read_only_policy())
+        }
+        "workspace-write" | "workspace_write" => {
+            Some(codex_core::protocol::SandboxPolicy::new_workspace_write_policy())
+        }
+        "danger-full-access" | "danger_full_access" => {
+            Some(codex_core::protocol::SandboxPolicy::DangerFullAccess)
+        }
+        _ => None,
+    }
 }
 
 fn run_diff_now() -> String {
