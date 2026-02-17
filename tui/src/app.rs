@@ -227,6 +227,23 @@ impl App {
         })
     }
 
+    fn switch_to_thread(&mut self, thread_id: String, status_message: &str, announce_switch: bool) {
+        let ui = self.widget.ui_mut();
+        let previous_thread = ui.session_id.clone();
+        let changed = previous_thread != thread_id;
+        ui.session_id = thread_id.clone();
+        ui.active_turn_id = None;
+        if changed {
+            ui.pending_approvals.clear();
+        }
+        if announce_switch && changed {
+            ui.push_line(&format!("[thread switched] {thread_id}"));
+        }
+        ui.status_message = Some(status_message.to_string());
+        self.state.last_thread_id = Some(thread_id.clone());
+        self.thread_id = thread_id;
+    }
+
     // -----------------------------------------------------------------------
     // Event handling — mirrors upstream `App::handle_event()`
     // -----------------------------------------------------------------------
@@ -262,14 +279,7 @@ impl App {
             AppEvent::SubmitInput(text) => self.handle_submit(&text),
             AppEvent::NewSession => {
                 let thread_id = start_thread(&self.state)?;
-                let ui = self.widget.ui_mut();
-                ui.session_id = thread_id.clone();
-                ui.active_turn_id = None;
-                ui.pending_approvals.clear();
-                ui.push_line(&format!("[thread switched] {thread_id}"));
-                ui.status_message = Some("started new thread".to_string());
-                self.state.last_thread_id = Some(thread_id.clone());
-                self.thread_id = thread_id;
+                self.switch_to_thread(thread_id, "started new thread", true);
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::Interrupt => {
@@ -304,9 +314,7 @@ impl App {
             AppEvent::ResumeSession => {
                 let ui = self.widget.ui_mut();
                 if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
-                    ui.session_id = thread_id.clone();
-                    self.state.last_thread_id = Some(thread_id);
-                    ui.status_message = Some("thread resumed".to_string());
+                    self.switch_to_thread(thread_id, "thread resumed", false);
                 } else {
                     ui.status_message = Some("resume returned no thread id".to_string());
                 }
