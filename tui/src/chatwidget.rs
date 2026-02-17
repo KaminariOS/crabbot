@@ -25,6 +25,7 @@ use crate::history_cell::new_web_search_call;
 use crate::key_hint;
 use crate::mention_codec;
 use crate::render::Insets;
+use crate::render::line_utils::is_blank_line_spaces_only;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt;
@@ -82,6 +83,9 @@ impl Renderable for TranscriptRenderable<'_> {
 /// Mirror upstream `insert_history_lines` behavior for in-viewport transcript rendering:
 /// line-level style should visually fill the whole terminal row.
 fn pad_line_to_width(mut line: Line<'static>, width: u16) -> Line<'static> {
+    if is_blank_line_spaces_only(&line) {
+        return line;
+    }
     let target = usize::from(width);
     let line_width = line.width();
     if target > line_width {
