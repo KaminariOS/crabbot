@@ -100,7 +100,13 @@ impl LiveAttachTui {
                 self.previous_state = Some(state);
             }
             UiEvent::ThreadStarted(thread_id) => {
+                let changed = self.session_id != thread_id;
                 self.session_id = thread_id.clone();
+                if changed {
+                    self.active_turn_id = None;
+                    self.pending_approvals.clear();
+                    self.push_line(&format!("[thread switched] {thread_id}"));
+                }
                 self.status_message = Some("thread started".to_string());
             }
             UiEvent::ThreadRenamed(name) => {
