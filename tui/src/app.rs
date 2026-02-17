@@ -745,11 +745,13 @@ impl App {
                     .ui_mut()
                     .push_line("Stopping all background terminals.");
             }
-            SlashCommand::Mcp => {
-                self.widget
+            SlashCommand::Mcp => match fetch_mcp_tools_output(&self.state) {
+                Ok(cell) => self.widget.ui_mut().add_history_cell(Box::new(cell)),
+                Err(err) => self
+                    .widget
                     .ui_mut()
-                    .add_history_cell(Box::new(crate::history_cell::empty_mcp_output()));
-            }
+                    .push_line(&format!("Failed to load MCP tools: {err}")),
+            },
             SlashCommand::Rollout => {
                 let session_id = self.widget.ui_mut().session_id.clone();
                 match fetch_rollout_path(&self.state, &session_id) {
@@ -1589,6 +1591,100 @@ fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String
         .and_then(|thread| thread.get("path"))
         .and_then(Value::as_str)
         .map(ToString::to_string))
+}
+
+fn fetch_mcp_tools_output(state: &CliState) -> Result<crate::history_cell::PlainHistoryCell> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "mcpServerStatus/list",
+        json!({
+            "limit": 200,
+        }),
+    )?;
+
+    let statuses = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if statuses.is_empty() {
+        return Ok(crate::history_cell::empty_mcp_output());
+    }
+
+    let mut tools: std::collections::HashMap<String, codex_protocol::mcp::Tool> =
+        std::collections::HashMap::new();
+    let mut resources: std::collections::HashMap<String, Vec<codex_protocol::mcp::Resource>> =
+        std::collections::HashMap::new();
+    let mut resource_templates: std::collections::HashMap<
+        String,
+        Vec<codex_protocol::mcp::ResourceTemplate>,
+    > = std::collections::HashMap::new();
+    let mut auth_statuses: std::collections::HashMap<String, codex_core::protocol::McpAuthStatus> =
+        std::collections::HashMap::new();
+    let mut server_configs =
+        std::collections::BTreeMap::<String, codex_core::config::types::McpServerConfig>::new();
+
+    for entry in statuses {
+        let Some(name) = entry.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let server_name = name.to_string();
+
+        if let Some(tool_map) = entry.get("tools")
+            && let Ok(map) = serde_json::from_value::<
+                std::collections::HashMap<String, codex_protocol::mcp::Tool>,
+            >(tool_map.clone())
+        {
+            for (tool_name, tool) in map {
+                tools.insert(format!("mcp__{server_name}__{tool_name}"), tool);
+            }
+        }
+
+        if let Some(raw_resources) = entry.get("resources")
+            && let Ok(parsed) =
+                serde_json::from_value::<Vec<codex_protocol::mcp::Resource>>(raw_resources.clone())
+        {
+            resources.insert(server_name.clone(), parsed);
+        }
+
+        if let Some(raw_templates) = entry
+            .get("resourceTemplates")
+            .or_else(|| entry.get("resource_templates"))
+            && let Ok(parsed) = serde_json::from_value::<Vec<codex_protocol::mcp::ResourceTemplate>>(
+                raw_templates.clone(),
+            )
+        {
+            resource_templates.insert(server_name.clone(), parsed);
+        }
+
+        if let Some(raw_auth) = entry.get("authStatus").or_else(|| entry.get("auth_status"))
+            && let Ok(auth) =
+                serde_json::from_value::<codex_core::protocol::McpAuthStatus>(raw_auth.clone())
+        {
+            auth_statuses.insert(server_name.clone(), auth);
+        }
+
+        server_configs.insert(
+            server_name,
+            codex_core::config::types::McpServerConfig {
+                transport: codex_core::config::types::McpServerTransportConfig::default(),
+                enabled: true,
+                disabled_reason: None,
+            },
+        );
+    }
+
+    let mut config = codex_core::config::Config::default();
+    config.mcp_servers = codex_core::config::McpServers(server_configs);
+    Ok(crate::history_cell::new_mcp_tools_output(
+        &config,
+        tools,
+        resources,
+        resource_templates,
+        &auth_statuses,
+    ))
 }
 
 struct ResumeThreadEntry {
