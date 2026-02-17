@@ -579,7 +579,19 @@ impl App {
 
     fn handle_widget_app_event(&mut self, event: WidgetAppEvent) -> Result<()> {
         match event {
+            WidgetAppEvent::CodexEvent(event) => {
+                self.widget.ui_mut().apply_codex_event(event);
+            }
+            WidgetAppEvent::FatalExitRequest(message) => {
+                self.widget
+                    .ui_mut()
+                    .add_history_cell(Box::new(crate::history_cell::new_error_event(message)));
+                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+            }
             WidgetAppEvent::CodexOp(op) => self.handle_widget_op(op)?,
+            WidgetAppEvent::OpenAgentPicker => {
+                self.open_agent_picker()?;
+            }
             WidgetAppEvent::InsertHistoryCell(cell) => {
                 self.widget.ui_mut().add_history_cell(cell);
             }
@@ -674,6 +686,9 @@ impl App {
             WidgetAppEvent::UpdateModel(model) => {
                 self.apply_model_selection(model)?;
             }
+            WidgetAppEvent::UpdateReasoningEffort(effort) => {
+                self.apply_reasoning_effort_selection(effort)?;
+            }
             WidgetAppEvent::UpdateAskForApprovalPolicy(policy) => {
                 self.apply_approval_policy_selection(policy)?;
             }
@@ -725,6 +740,58 @@ impl App {
                 self.widget
                     .ui_mut()
                     .open_feedback_note(category, include_logs, rollout_path);
+            }
+            WidgetAppEvent::OpenReasoningPopup { model } => {
+                self.widget.ui_mut().open_reasoning_popup(model);
+            }
+            WidgetAppEvent::OpenAllModelsPopup { models } => {
+                self.widget.ui_mut().open_all_models_popup(models);
+            }
+            WidgetAppEvent::OpenFullAccessConfirmation {
+                preset,
+                return_to_permissions,
+            } => {
+                self.widget
+                    .ui_mut()
+                    .open_full_access_confirmation(preset, return_to_permissions);
+            }
+            WidgetAppEvent::SubmitUserMessageWithMode {
+                text,
+                collaboration_mode,
+            } => {
+                let session_model = self
+                    .status_runtime
+                    .session_model
+                    .clone()
+                    .or_else(|| fetch_current_model_from_config(&self.state));
+                let session_effort = self.status_runtime.session_reasoning_effort;
+                let collaboration_mode = collaboration_mode_from_mask(
+                    Some(collaboration_mode),
+                    session_model,
+                    session_effort,
+                );
+                let ui = self.widget.ui_mut();
+                ui.push_user_prompt(&text, Vec::new());
+                if let Some(turn_id) = start_turn_with_elements_and_collaboration(
+                    &self.state,
+                    &ui.session_id,
+                    &text,
+                    Vec::new(),
+                    Vec::new(),
+                    collaboration_mode,
+                )? {
+                    ui.active_turn_id = Some(turn_id);
+                }
+                ui.set_status_message(Some("waiting for response...".to_string()));
+            }
+            WidgetAppEvent::LaunchExternalEditor => {
+                self.launch_external_editor()?;
+            }
+            WidgetAppEvent::StatusLineBranchUpdated { cwd: _, branch } => {
+                self.widget.ui_mut().set_status_message(Some(format!(
+                    "status line branch updated: {}",
+                    branch.unwrap_or_else(|| "(none)".to_string())
+                )));
             }
             WidgetAppEvent::StatusLineSetup { .. } => {
                 self.widget
@@ -1491,6 +1558,85 @@ impl App {
         self.widget
             .ui_mut()
             .set_status_message(Some(format!("model updated to {model}")));
+        Ok(())
+    }
+
+    fn apply_reasoning_effort_selection(
+        &mut self,
+        effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+    ) -> Result<()> {
+        let effort_value = effort.map(|v| v.to_string());
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": "modelReasoningEffort",
+                "value": effort_value,
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        self.status_runtime.session_reasoning_effort = effort;
+        self.widget.ui_mut().set_status_message(Some(match effort {
+            Some(level) => format!("reasoning effort updated to {level}"),
+            None => "reasoning effort reset to default".to_string(),
+        }));
+        Ok(())
+    }
+
+    fn launch_external_editor(&mut self) -> Result<()> {
+        if !self.widget.ui_mut().bottom_pane_no_modal_or_popup_active() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("close active popup before editing".to_string()));
+            return Ok(());
+        }
+        if !self.widget.ui_mut().bottom_pane_is_task_running()
+            && !self.widget.ui_mut().bottom_pane_composer_text().is_empty()
+        {
+            let seed = self.widget.ui_mut().bottom_pane_composer_text();
+            let editor_cmd = match crate::external_editor::resolve_editor_command() {
+                Ok(cmd) => cmd,
+                Err(err) => {
+                    self.widget.ui_mut().add_history_cell(Box::new(
+                        crate::history_cell::new_error_event(err.to_string()),
+                    ));
+                    return Ok(());
+                }
+            };
+            let edit_result = thread::spawn(move || -> Result<String> {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()?;
+                runtime
+                    .block_on(crate::external_editor::run_editor(&seed, &editor_cmd))
+                    .map_err(|err| anyhow::anyhow!("{err}"))
+            })
+            .join();
+
+            match edit_result {
+                Ok(Ok(edited)) => {
+                    self.widget.ui_mut().apply_external_edit(edited);
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("external editor applied".to_string()));
+                }
+                Ok(Err(err)) => {
+                    self.widget.ui_mut().add_history_cell(Box::new(
+                        crate::history_cell::new_error_event(format!(
+                            "external editor failed: {err}"
+                        )),
+                    ));
+                }
+                Err(_) => {
+                    self.widget.ui_mut().add_history_cell(Box::new(
+                        crate::history_cell::new_error_event(
+                            "external editor panicked".to_string(),
+                        ),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 

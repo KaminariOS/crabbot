@@ -696,6 +696,14 @@ fn map_rpc_server_request_to_ui_event(
     }
 }
 
+pub(crate) fn map_codex_protocol_event(event: &codex_core::protocol::Event) -> Vec<UiEvent> {
+    let Ok(event_value) = serde_json::to_value(event) else {
+        return Vec::new();
+    };
+    let params = json!({ "event": event_value });
+    map_codex_event_notification(&params)
+}
+
 fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
     let Some(event) = params.get("event").or_else(|| params.get("payload")) else {
         return Vec::new();

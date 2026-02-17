@@ -7,6 +7,7 @@ use crate::bottom_pane::InputResult;
 use crate::bottom_pane::MentionBinding;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
+use crate::core_compat::map_codex_protocol_event;
 use crate::core_compat::map_legacy_stream_events;
 use crate::core_compat::map_rpc_stream_events;
 use crate::exec_cell::CommandOutput;
@@ -209,6 +210,11 @@ impl LiveAttachTui {
         }
         self.received_events += stream_events.len();
         self.apply_ui_events(map_rpc_stream_events(stream_events));
+    }
+
+    pub(crate) fn apply_codex_event(&mut self, event: codex_core::protocol::Event) {
+        self.received_events += 1;
+        self.apply_ui_events(map_codex_protocol_event(&event));
     }
 
     fn apply_ui_events(&mut self, events: Vec<UiEvent>) {
@@ -1151,6 +1157,10 @@ impl LiveAttachTui {
         self.bottom_pane.composer_text()
     }
 
+    pub(crate) fn apply_external_edit(&mut self, text: String) {
+        self.bottom_pane.apply_external_edit(text);
+    }
+
     pub(crate) fn bottom_pane_insert_str(&mut self, text: &str) {
         self.bottom_pane.insert_str(text);
     }
@@ -1239,6 +1249,137 @@ impl LiveAttachTui {
                 title: Some("Select Collaboration Mode".to_string()),
                 subtitle: Some("Pick a collaboration preset.".to_string()),
                 footer_hint: Some(crate::bottom_pane::popup_consts::standard_popup_hint_line()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_all_models_popup(
+        &mut self,
+        presets: Vec<codex_protocol::openai_models::ModelPreset>,
+    ) {
+        if presets.is_empty() {
+            self.add_history_cell(Box::new(new_info_event(
+                "No additional models are available right now.".to_string(),
+                None,
+            )));
+            return;
+        }
+
+        let current_model = self
+            .active_collaboration_mask
+            .as_ref()
+            .and_then(|mask| mask.model.clone());
+        let items = presets
+            .into_iter()
+            .map(|preset| {
+                let model_name = preset.model.clone();
+                let preset_for_action = preset.clone();
+                let actions: Vec<crate::bottom_pane::SelectionAction> =
+                    vec![Box::new(move |sender| {
+                        sender.send(UiAppEvent::OpenReasoningPopup {
+                            model: preset_for_action.clone(),
+                        });
+                    })];
+                crate::bottom_pane::SelectionItem {
+                    name: model_name.clone(),
+                    description: (!preset.description.is_empty()).then_some(preset.description),
+                    is_current: current_model.as_deref() == Some(model_name.as_str()),
+                    actions,
+                    dismiss_on_select: false,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select Model and Effort".to_string()),
+                subtitle: Some("Select a model, then choose its reasoning effort.".to_string()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_reasoning_popup(
+        &mut self,
+        preset: codex_protocol::openai_models::ModelPreset,
+    ) {
+        if preset.supported_reasoning_efforts.is_empty() {
+            self.bottom_pane_event_tx
+                .send(UiAppEvent::UpdateModel(preset.model));
+            return;
+        }
+
+        let model_name = preset.model.clone();
+        let items = preset
+            .supported_reasoning_efforts
+            .iter()
+            .map(|effort_preset| {
+                let model = model_name.clone();
+                let effort = effort_preset.effort;
+                let actions: Vec<crate::bottom_pane::SelectionAction> =
+                    vec![Box::new(move |sender| {
+                        sender.send(UiAppEvent::UpdateModel(model.clone()));
+                        sender.send(UiAppEvent::UpdateReasoningEffort(Some(effort)));
+                    })];
+                crate::bottom_pane::SelectionItem {
+                    name: effort.to_string(),
+                    description: (!effort_preset.label.is_empty())
+                        .then_some(effort_preset.label.clone()),
+                    actions,
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some(format!("Reasoning Level for {}", preset.model)),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_full_access_confirmation(
+        &mut self,
+        preset: codex_utils_approval_presets::ApprovalPreset,
+        return_to_permissions: bool,
+    ) {
+        let mut items = Vec::new();
+        let preset_for_continue = preset.clone();
+        items.push(crate::bottom_pane::SelectionItem {
+            name: "Continue".to_string(),
+            description: Some("Apply full access settings.".to_string()),
+            actions: vec![Box::new(move |sender| {
+                sender.send(UiAppEvent::UpdateAskForApprovalPolicy(
+                    preset_for_continue.approval,
+                ));
+                sender.send(UiAppEvent::UpdateSandboxPolicy(
+                    preset_for_continue.sandbox.clone(),
+                ));
+            })],
+            dismiss_on_select: true,
+            ..Default::default()
+        });
+
+        if return_to_permissions {
+            items.push(crate::bottom_pane::SelectionItem {
+                name: "Back".to_string(),
+                description: Some("Return to permissions picker.".to_string()),
+                actions: vec![Box::new(move |sender| {
+                    sender.send(UiAppEvent::OpenPermissionsPopup);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            });
+        }
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Enable Full Access?".to_string()),
+                subtitle: Some("Codex will run without sandboxing.".to_string()),
                 items,
                 ..Default::default()
             });
