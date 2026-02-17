@@ -93,6 +93,20 @@ pub(crate) enum UiEvent {
     TranscriptLine(String),
     StatusMessage(String),
     ApprovalRequired(UiApprovalRequest),
+    TokenUsageUpdated {
+        token_info: codex_core::protocol::TokenUsageInfo,
+        total_usage: codex_core::protocol::TokenUsage,
+    },
+    RateLimitUpdated(codex_core::protocol::RateLimitSnapshot),
+    McpStartupUpdate {
+        server: String,
+        status: String,
+    },
+    McpStartupComplete {
+        failed: Vec<String>,
+        cancelled: Vec<String>,
+    },
+    CollabEvent(String),
 }
 
 pub(crate) fn map_legacy_stream_events(stream_events: &[DaemonStreamEnvelope]) -> Vec<UiEvent> {
@@ -387,9 +401,207 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             status: Some("failed".to_string()),
         }],
         "turn/diff/updated" => Vec::new(),
-        "thread/tokenUsage/updated" => Vec::new(),
+        "thread/tokenUsage/updated" => parse_token_usage_updated(&notification.params)
+            .map(|(token_info, total_usage)| {
+                vec![UiEvent::TokenUsageUpdated {
+                    token_info,
+                    total_usage,
+                }]
+            })
+            .unwrap_or_default(),
+        "account/rateLimits/updated" => notification
+            .params
+            .get("rateLimits")
+            .or_else(|| notification.params.get("rate_limits"))
+            .and_then(parse_rate_limit_snapshot)
+            .map(|snapshot| vec![UiEvent::RateLimitUpdated(snapshot)])
+            .unwrap_or_default(),
+        "mcp/startup/update" => {
+            let server = notification
+                .params
+                .get("server")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let status = notification
+                .params
+                .get("status")
+                .and_then(Value::as_str)
+                .unwrap_or("starting")
+                .to_string();
+            vec![UiEvent::McpStartupUpdate { server, status }]
+        }
+        "mcp/startup/complete" => {
+            let failed = notification
+                .params
+                .get("failed")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(|item| item.get("server").and_then(Value::as_str))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let cancelled = notification
+                .params
+                .get("cancelled")
+                .and_then(Value::as_array)
+                .map(|items| {
+                    items
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            vec![UiEvent::McpStartupComplete { failed, cancelled }]
+        }
+        method
+            if method.starts_with("collab/")
+                || method.starts_with("item/collab")
+                || method.contains("/collab")
+                || method.contains("collab/")
+                || method.contains("agentSpawn")
+                || method.contains("agent_spawn") =>
+        {
+            vec![UiEvent::CollabEvent(format!("[collab] {method}"))]
+        }
+        "codex/event" => map_codex_event_notification(&notification.params),
         _ => Vec::new(),
     }
+}
+
+fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
+    let Some(event) = params.get("event").or_else(|| params.get("payload")) else {
+        return Vec::new();
+    };
+    let msg_type = event
+        .get("msg")
+        .and_then(|msg| msg.get("type"))
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if msg_type.starts_with("collab_") || msg_type.starts_with("collab") {
+        return vec![UiEvent::CollabEvent(format!("[collab] {msg_type}"))];
+    }
+    Vec::new()
+}
+
+fn parse_token_usage_updated(
+    params: &Value,
+) -> Option<(
+    codex_core::protocol::TokenUsageInfo,
+    codex_core::protocol::TokenUsage,
+)> {
+    let token_usage = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))?;
+    let total = token_usage.get("total")?;
+    let last = token_usage.get("last")?;
+
+    let total_usage = parse_token_usage_breakdown(total);
+    let last_usage = parse_token_usage_breakdown(last);
+    let model_context_window = token_usage
+        .get("modelContextWindow")
+        .or_else(|| token_usage.get("model_context_window"))
+        .and_then(Value::as_i64);
+
+    Some((
+        codex_core::protocol::TokenUsageInfo {
+            last_token_usage: last_usage,
+            model_context_window,
+        },
+        total_usage,
+    ))
+}
+
+fn parse_token_usage_breakdown(value: &Value) -> codex_core::protocol::TokenUsage {
+    codex_core::protocol::TokenUsage {
+        total_tokens: value
+            .get("totalTokens")
+            .or_else(|| value.get("total_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        input_tokens: value
+            .get("inputTokens")
+            .or_else(|| value.get("input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        cached_input_tokens: value
+            .get("cachedInputTokens")
+            .or_else(|| value.get("cached_input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        output_tokens: value
+            .get("outputTokens")
+            .or_else(|| value.get("output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        reasoning_output_tokens: value
+            .get("reasoningOutputTokens")
+            .or_else(|| value.get("reasoning_output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::RateLimitSnapshot> {
+    let primary = parse_rate_limit_window(value.get("primary"));
+    let secondary = parse_rate_limit_window(value.get("secondary"));
+    let credits = value
+        .get("credits")
+        .map(|credits| codex_core::protocol::CreditsSnapshot {
+            has_credits: credits
+                .get("hasCredits")
+                .or_else(|| credits.get("has_credits"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            unlimited: credits
+                .get("unlimited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            balance: credits
+                .get("balance")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        });
+
+    Some(codex_core::protocol::RateLimitSnapshot {
+        limit_id: value
+            .get("limitId")
+            .or_else(|| value.get("limit_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        limit_name: value
+            .get("limitName")
+            .or_else(|| value.get("limit_name"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        primary,
+        secondary,
+        credits,
+    })
+}
+
+fn parse_rate_limit_window(value: Option<&Value>) -> Option<codex_core::protocol::RateLimitWindow> {
+    let window = value?;
+    Some(codex_core::protocol::RateLimitWindow {
+        used_percent: window
+            .get("usedPercent")
+            .or_else(|| window.get("used_percent"))
+            .and_then(Value::as_f64)
+            .unwrap_or_default(),
+        resets_at: window
+            .get("resetsAt")
+            .or_else(|| window.get("resets_at"))
+            .and_then(Value::as_i64),
+        window_minutes: window
+            .get("windowMinutes")
+            .or_else(|| window.get("window_minutes"))
+            .and_then(Value::as_i64),
+    })
 }
 
 fn delta_from_params(params: &Value) -> Option<&str> {

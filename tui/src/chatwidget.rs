@@ -32,6 +32,8 @@ use crate::render::renderable::RenderableExt;
 use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
+use crate::status::RateLimitSnapshotDisplay;
+use crate::status::rate_limit_snapshot_display_for_limit;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
@@ -46,6 +48,7 @@ use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use std::collections::BTreeMap;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
@@ -121,6 +124,11 @@ pub(crate) struct LiveAttachTui {
     bottom_pane: BottomPane,
     history_scroll_offset: u16,
     active_collaboration_mask: Option<codex_protocol::config_types::CollaborationModeMask>,
+    token_info: Option<codex_core::protocol::TokenUsageInfo>,
+    total_token_usage: codex_core::protocol::TokenUsage,
+    rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    agent_turn_running: bool,
+    mcp_startup_running: bool,
 }
 
 pub(crate) struct ReviewCommitPickerEntry {
@@ -177,6 +185,11 @@ impl LiveAttachTui {
             bottom_pane,
             history_scroll_offset: 0,
             active_collaboration_mask: None,
+            token_info: None,
+            total_token_usage: codex_core::protocol::TokenUsage::default(),
+            rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            agent_turn_running: false,
+            mcp_startup_running: false,
         }
     }
 
@@ -245,8 +258,8 @@ impl LiveAttachTui {
                 self.active_turn_id = Some(turn_id);
                 self.adaptive_chunking.reset();
                 self.assistant_stream = StreamController::new(None);
-                self.bottom_pane.set_task_running(true);
-                self.bottom_pane.set_interrupt_hint_visible(true);
+                self.agent_turn_running = true;
+                self.update_task_running_state();
                 self.status_message = Some("running turn...".to_string());
             }
             UiEvent::AssistantDelta { turn_id, delta } => {
@@ -269,8 +282,8 @@ impl LiveAttachTui {
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
                 self.active_turn_id = None;
-                self.bottom_pane.set_task_running(false);
-                self.bottom_pane.set_interrupt_hint_visible(false);
+                self.agent_turn_running = false;
+                self.update_task_running_state();
                 if let Some(status) = status
                     && status != "completed"
                 {
@@ -336,6 +349,46 @@ impl LiveAttachTui {
                         Some(reason.clone()),
                     )));
                 }
+            }
+            UiEvent::TokenUsageUpdated {
+                token_info,
+                total_usage,
+            } => {
+                self.total_token_usage = total_usage;
+                self.set_token_info(Some(token_info));
+            }
+            UiEvent::RateLimitUpdated(snapshot) => {
+                self.on_rate_limit_snapshot(Some(snapshot));
+            }
+            UiEvent::McpStartupUpdate { server, status } => {
+                self.mcp_startup_running = true;
+                self.update_task_running_state();
+                self.status_message = Some(format!("mcp {server}: {status}"));
+            }
+            UiEvent::McpStartupComplete { failed, cancelled } => {
+                self.mcp_startup_running = false;
+                self.update_task_running_state();
+                self.status_message = None;
+                if !failed.is_empty() || !cancelled.is_empty() {
+                    let failed_part = if failed.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" failed: {}", failed.join(","))
+                    };
+                    let cancelled_part = if cancelled.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" cancelled: {}", cancelled.join(","))
+                    };
+                    self.history_cells.push(Box::new(new_info_event(
+                        format!("[mcp startup incomplete]{failed_part}{cancelled_part}"),
+                        None,
+                    )));
+                }
+            }
+            UiEvent::CollabEvent(message) => {
+                self.history_cells
+                    .push(Box::new(new_info_event(message, None)));
             }
         }
         self.sync_bottom_pane_status();
@@ -891,8 +944,8 @@ impl LiveAttachTui {
             handle,
         });
         self.status_message = Some("waiting for assistant response...".to_string());
-        self.bottom_pane.set_task_running(true);
-        self.bottom_pane.set_interrupt_hint_visible(true);
+        self.agent_turn_running = true;
+        self.update_task_running_state();
         self.sync_bottom_pane_status();
         Ok(())
     }
@@ -903,8 +956,8 @@ impl LiveAttachTui {
             .as_ref()
             .is_some_and(|pending| pending.handle.is_finished());
         if done {
-            self.bottom_pane.set_task_running(false);
-            self.bottom_pane.set_interrupt_hint_visible(false);
+            self.agent_turn_running = false;
+            self.update_task_running_state();
             self.sync_bottom_pane_status();
             return self.pending_prompt.take();
         }
@@ -1370,6 +1423,12 @@ impl LiveAttachTui {
         self.latest_state = "active".to_string();
         self.received_events = 0;
         self.last_sequence = 0;
+        self.token_info = None;
+        self.total_token_usage = codex_core::protocol::TokenUsage::default();
+        self.rate_limit_snapshots_by_limit_id.clear();
+        self.agent_turn_running = false;
+        self.mcp_startup_running = false;
+        self.bottom_pane.set_context_window(None, None);
         self.clear_input();
     }
 
@@ -1405,6 +1464,73 @@ impl LiveAttachTui {
         snapshot: Option<crate::app_event::ConnectorsSnapshot>,
     ) {
         self.bottom_pane.set_connectors_snapshot(snapshot);
+    }
+
+    fn update_task_running_state(&mut self) {
+        let running = self.agent_turn_running || self.mcp_startup_running;
+        self.bottom_pane.set_task_running(running);
+        self.bottom_pane
+            .set_interrupt_hint_visible(self.agent_turn_running);
+    }
+
+    fn set_token_info(&mut self, info: Option<codex_core::protocol::TokenUsageInfo>) {
+        match info {
+            Some(info) => self.apply_token_info(info),
+            None => {
+                self.bottom_pane.set_context_window(None, None);
+                self.token_info = None;
+            }
+        }
+    }
+
+    fn apply_token_info(&mut self, info: codex_core::protocol::TokenUsageInfo) {
+        let percent = self.context_remaining_percent(&info);
+        let used_tokens = self.context_used_tokens(&info, percent.is_some());
+        self.bottom_pane.set_context_window(percent, used_tokens);
+        self.token_info = Some(info);
+    }
+
+    fn context_remaining_percent(
+        &self,
+        info: &codex_core::protocol::TokenUsageInfo,
+    ) -> Option<i64> {
+        info.model_context_window.map(|window| {
+            info.last_token_usage
+                .percent_of_context_window_remaining(window)
+        })
+    }
+
+    fn context_used_tokens(
+        &self,
+        info: &codex_core::protocol::TokenUsageInfo,
+        percent_known: bool,
+    ) -> Option<i64> {
+        if percent_known {
+            return None;
+        }
+        Some(info.last_token_usage.tokens_in_context_window())
+    }
+
+    fn on_rate_limit_snapshot(
+        &mut self,
+        snapshot: Option<codex_core::protocol::RateLimitSnapshot>,
+    ) {
+        if let Some(snapshot) = snapshot {
+            let limit_id = snapshot
+                .limit_id
+                .clone()
+                .unwrap_or_else(|| "codex".to_string());
+            let limit_label = snapshot
+                .limit_name
+                .clone()
+                .unwrap_or_else(|| limit_id.clone());
+            let display =
+                rate_limit_snapshot_display_for_limit(&snapshot, limit_label, chrono::Local::now());
+            self.rate_limit_snapshots_by_limit_id
+                .insert(limit_id, display);
+        } else {
+            self.rate_limit_snapshots_by_limit_id.clear();
+        }
     }
 
     fn sync_bottom_pane_status(&mut self) {
@@ -1543,6 +1669,15 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn context_left_percent(&self) -> usize {
+        if let Some(info) = &self.token_info
+            && let Some(window) = info.model_context_window
+        {
+            let remaining = info
+                .last_token_usage
+                .percent_of_context_window_remaining(window)
+                .clamp(0, 100);
+            return remaining as usize;
+        }
         let consumed = (self.received_events / 12).min(99);
         100_usize.saturating_sub(consumed)
     }
