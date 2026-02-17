@@ -401,11 +401,23 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ResumeSession => {
-                let ui = self.widget.ui_mut();
-                if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
+                let current_session_id = self.widget.ui_mut().session_id.clone();
+                if let Some(thread_id) = resume_thread(&self.state, &current_session_id)? {
                     self.switch_to_thread(thread_id, "thread resumed", false);
+                } else if let Some(fallback_thread_id) =
+                    find_recent_thread_to_resume(&self.state, &current_session_id)?
+                {
+                    if let Some(thread_id) = resume_thread(&self.state, &fallback_thread_id)? {
+                        self.switch_to_thread(thread_id, "thread resumed", false);
+                    } else {
+                        self.widget
+                            .ui_mut()
+                            .set_status_message(Some("resume returned no thread id".to_string()));
+                    }
                 } else {
-                    ui.set_status_message(Some("resume returned no thread id".to_string()));
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("no saved chats to resume".to_string()));
                 }
                 Ok(LiveTuiAction::Continue)
             }
@@ -1481,6 +1493,38 @@ fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String
         .and_then(|thread| thread.get("path"))
         .and_then(Value::as_str)
         .map(ToString::to_string))
+}
+
+fn find_recent_thread_to_resume(
+    state: &CliState,
+    current_thread_id: &str,
+) -> Result<Option<String>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/list",
+        json!({
+            "sortKey": "updated_at",
+            "limit": 20,
+            "archived": false,
+        }),
+    )?;
+
+    let Some(threads) = response.result.get("data").and_then(Value::as_array) else {
+        return Ok(None);
+    };
+
+    for thread in threads {
+        let Some(thread_id) = thread.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        if thread_id == current_thread_id {
+            continue;
+        }
+        return Ok(Some(thread_id.to_string()));
+    }
+
+    Ok(None)
 }
 
 fn run_diff_now() -> String {
