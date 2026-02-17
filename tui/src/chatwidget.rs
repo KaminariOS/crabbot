@@ -554,6 +554,46 @@ impl LiveAttachTui {
                 query,
                 action,
             } => self.on_web_search_end(&call_id, query, action),
+            UiEvent::ThreadRolledBack { num_turns } => {
+                if num_turns > 0 {
+                    self.apply_non_pending_thread_rollback(num_turns as u32);
+                    self.push_line(&format!("[thread rolled back] {num_turns} turns"));
+                } else {
+                    self.push_line("[thread rolled back]");
+                }
+            }
+            UiEvent::TurnDiffUpdated { unified_diff } => {
+                self.add_boxed_history(Box::new(new_info_event(
+                    "[turn diff updated]".to_string(),
+                    Some(unified_diff),
+                )));
+            }
+            UiEvent::UndoStarted { message } => {
+                if let Some(message) = message {
+                    self.push_line(&format!("[undo started] {message}"));
+                } else {
+                    self.push_line("[undo started]");
+                }
+            }
+            UiEvent::UndoCompleted { message } => {
+                if let Some(message) = message {
+                    self.push_line(&format!("[undo completed] {message}"));
+                } else {
+                    self.push_line("[undo completed]");
+                }
+            }
+            UiEvent::DeprecationNotice { message } => {
+                self.add_boxed_history(Box::new(new_info_event(
+                    "[deprecation notice]".to_string(),
+                    Some(message),
+                )));
+            }
+            UiEvent::BackgroundEvent { message } => {
+                self.add_boxed_history(Box::new(new_info_event(
+                    "[background event]".to_string(),
+                    Some(message),
+                )));
+            }
             UiEvent::TranscriptLine(line) => {
                 self.push_line(&line);
             }

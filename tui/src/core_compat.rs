@@ -123,6 +123,24 @@ pub(crate) enum UiEvent {
         query: String,
         action: codex_protocol::models::WebSearchAction,
     },
+    ThreadRolledBack {
+        num_turns: u64,
+    },
+    TurnDiffUpdated {
+        unified_diff: String,
+    },
+    UndoStarted {
+        message: Option<String>,
+    },
+    UndoCompleted {
+        message: Option<String>,
+    },
+    DeprecationNotice {
+        message: String,
+    },
+    BackgroundEvent {
+        message: String,
+    },
     TranscriptLine(String),
     StatusMessage(String),
     ApprovalRequired(UiApprovalRequest),
@@ -548,12 +566,8 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                     .or_else(|| rollback.get("num_turns"))
             })
             .and_then(Value::as_u64)
-            .map(|num_turns| {
-                vec![UiEvent::TranscriptLine(format!(
-                    "[thread rolled back] {num_turns} turns"
-                ))]
-            })
-            .unwrap_or_else(|| vec![UiEvent::TranscriptLine("[thread rolled back]".to_string())]),
+            .map(|num_turns| vec![UiEvent::ThreadRolledBack { num_turns }])
+            .unwrap_or_else(|| vec![UiEvent::ThreadRolledBack { num_turns: 0 }]),
         "turn/aborted" => vec![UiEvent::TurnAborted {
             reason: notification
                 .params
@@ -573,9 +587,43 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .or_else(|| notification.params.get("unified_diff"))
             .and_then(Value::as_str)
             .map(|diff| {
-                vec![UiEvent::TranscriptLine(format!(
-                    "[turn diff updated]\n{diff}"
-                ))]
+                vec![UiEvent::TurnDiffUpdated {
+                    unified_diff: diff.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "undo/started" => vec![UiEvent::UndoStarted {
+            message: notification
+                .params
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }],
+        "undo/completed" => vec![UiEvent::UndoCompleted {
+            message: notification
+                .params
+                .get("message")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }],
+        "deprecation/notice" => notification
+            .params
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| {
+                vec![UiEvent::DeprecationNotice {
+                    message: message.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "background/event" => notification
+            .params
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| {
+                vec![UiEvent::BackgroundEvent {
+                    message: message.to_string(),
+                }]
             })
             .unwrap_or_default(),
         "thread/tokenUsage/updated" => parse_token_usage_updated(&notification.params)
@@ -967,9 +1015,27 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
         }
         "entered_review_mode" => vec![UiEvent::TranscriptLine("[entered review mode]".to_string())],
         "exited_review_mode" => vec![UiEvent::TranscriptLine("[exited review mode]".to_string())],
-        "undo_started" => vec![UiEvent::TranscriptLine("[undo started]".to_string())],
-        "undo_completed" => vec![UiEvent::TranscriptLine("[undo completed]".to_string())],
+        "undo_started" => vec![UiEvent::UndoStarted { message: None }],
+        "undo_completed" => vec![UiEvent::UndoCompleted { message: None }],
         "context_compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "deprecation_notice" => msg
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| {
+                vec![UiEvent::DeprecationNotice {
+                    message: message.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "background_event" => msg
+            .get("message")
+            .and_then(Value::as_str)
+            .map(|message| {
+                vec![UiEvent::BackgroundEvent {
+                    message: message.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
         "mcp_startup_update" => {
             let server = msg
                 .get("server")
