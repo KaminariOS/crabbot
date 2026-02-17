@@ -334,7 +334,28 @@ impl HistoryCell for UserHistoryCell {
         }
 
         lines.push(Line::from("").style(style));
+
+        // Keep user message rows visually consistent with the active composer row
+        // by extending the background style through the full transcript width.
+        let target_width = usize::from(width);
         lines
+            .into_iter()
+            .map(|mut line| {
+                let current_width: usize = line
+                    .spans
+                    .iter()
+                    .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+                    .sum();
+                if current_width < target_width {
+                    line.spans.push(Span::styled(
+                        " ".repeat(target_width.saturating_sub(current_width)),
+                        style,
+                    ));
+                }
+                line.style = style;
+                line
+            })
+            .collect()
     }
 
     fn desired_height(&self, width: u16) -> u16 {
