@@ -853,6 +853,11 @@ pub mod features {
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
     #[allow(dead_code)]
     pub enum Feature {
+        CollaborationModes,
+        Personality,
+        Apps,
+        PreventIdleSleep,
+        RuntimeMetrics,
         GhostCommit,
         ShellTool,
         JsRepl,
@@ -898,6 +903,53 @@ pub mod features {
 
         pub fn is_enabled(&self, _feature: Feature) -> bool {
             false
+        }
+    }
+
+    impl Feature {
+        pub const fn key(self) -> &'static str {
+            match self {
+                Feature::CollaborationModes => "collaboration_modes",
+                Feature::Personality => "personality",
+                Feature::Apps => "apps",
+                Feature::PreventIdleSleep => "prevent_idle_sleep",
+                Feature::RuntimeMetrics => "runtime_metrics",
+                Feature::GhostCommit => "ghost_commit",
+                Feature::ShellTool => "shell_tool",
+                Feature::JsRepl => "js_repl",
+                Feature::UnifiedExec => "unified_exec",
+                Feature::ApplyPatchFreeform => "apply_patch_freeform",
+                Feature::WebSearchRequest => "web_search_request",
+                Feature::WebSearchCached => "web_search_cached",
+                Feature::SearchTool => "search_tool",
+                Feature::UseLinuxSandboxBwrap => "use_linux_sandbox_bwrap",
+                Feature::RequestRule => "request_rule",
+                Feature::WindowsSandbox => "windows_sandbox",
+                Feature::WindowsSandboxElevated => "windows_sandbox_elevated",
+            }
+        }
+
+        pub fn from_key(key: &str) -> Option<Self> {
+            match key {
+                "collaboration_modes" => Some(Feature::CollaborationModes),
+                "personality" => Some(Feature::Personality),
+                "apps" => Some(Feature::Apps),
+                "prevent_idle_sleep" => Some(Feature::PreventIdleSleep),
+                "runtime_metrics" => Some(Feature::RuntimeMetrics),
+                "ghost_commit" => Some(Feature::GhostCommit),
+                "shell_tool" => Some(Feature::ShellTool),
+                "js_repl" => Some(Feature::JsRepl),
+                "unified_exec" => Some(Feature::UnifiedExec),
+                "apply_patch_freeform" => Some(Feature::ApplyPatchFreeform),
+                "web_search_request" => Some(Feature::WebSearchRequest),
+                "web_search_cached" => Some(Feature::WebSearchCached),
+                "search_tool" => Some(Feature::SearchTool),
+                "use_linux_sandbox_bwrap" => Some(Feature::UseLinuxSandboxBwrap),
+                "request_rule" => Some(Feature::RequestRule),
+                "windows_sandbox" => Some(Feature::WindowsSandbox),
+                "windows_sandbox_elevated" => Some(Feature::WindowsSandboxElevated),
+                _ => None,
+            }
         }
     }
 
@@ -1353,12 +1405,43 @@ mod codex_protocol_stub {
             pub developer_instructions: Option<Option<String>>,
         }
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(rename_all = "lowercase")]
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+        #[serde(rename_all = "snake_case")]
         pub enum ModeKind {
-            Code,
-            Chat,
-            Ask,
+            Plan,
+            #[default]
+            #[serde(
+                alias = "code",
+                alias = "pair_programming",
+                alias = "execute",
+                alias = "custom"
+            )]
+            Default,
+            #[doc(hidden)]
+            #[serde(skip_serializing, skip_deserializing)]
+            PairProgramming,
+            #[doc(hidden)]
+            #[serde(skip_serializing, skip_deserializing)]
+            Execute,
+        }
+
+        impl ModeKind {
+            pub const fn is_tui_visible(self) -> bool {
+                matches!(self, Self::Plan | Self::Default)
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct Settings {
+            pub model: String,
+            pub reasoning_effort: Option<super::openai_models::ReasoningEffort>,
+            pub developer_instructions: Option<String>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct CollaborationMode {
+            pub mode: ModeKind,
+            pub settings: Settings,
         }
     }
 

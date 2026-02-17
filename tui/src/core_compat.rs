@@ -680,7 +680,7 @@ pub(crate) fn start_thread(state: &CliState) -> Result<String> {
 }
 
 pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Result<Option<String>> {
-    start_turn_with_elements(state, thread_id, text, Vec::new(), Vec::new())
+    start_turn_with_elements_and_collaboration(state, thread_id, text, Vec::new(), Vec::new(), None)
 }
 
 pub(crate) fn start_turn_with_elements(
@@ -689,6 +689,24 @@ pub(crate) fn start_turn_with_elements(
     text: &str,
     text_elements: Vec<codex_protocol::user_input::TextElement>,
     mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
+) -> Result<Option<String>> {
+    start_turn_with_elements_and_collaboration(
+        state,
+        thread_id,
+        text,
+        text_elements,
+        mention_bindings,
+        None,
+    )
+}
+
+pub(crate) fn start_turn_with_elements_and_collaboration(
+    state: &CliState,
+    thread_id: &str,
+    text: &str,
+    text_elements: Vec<codex_protocol::user_input::TextElement>,
+    mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
+    collaboration_mode: Option<codex_protocol::config_types::CollaborationMode>,
 ) -> Result<Option<String>> {
     let mut input_items = vec![json!({
         "type": "text",
@@ -725,7 +743,8 @@ pub(crate) fn start_turn_with_elements(
         "turn/start",
         json!({
             "threadId": thread_id,
-            "input": input_items
+            "input": input_items,
+            "collaborationMode": collaboration_mode,
         }),
     )?;
     Ok(response

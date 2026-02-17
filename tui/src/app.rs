@@ -17,7 +17,7 @@ pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::set_thread_name;
 pub(super) use crate::core_compat::start_thread;
-pub(super) use crate::core_compat::start_turn_with_elements;
+pub(super) use crate::core_compat::start_turn_with_elements_and_collaboration;
 pub(super) use crate::core_compat::stream_events;
 use crate::exec_cell::CommandOutput as ExecCommandOutput;
 use crate::exec_cell::new_active_exec_command;
@@ -390,14 +390,24 @@ impl App {
                 text_elements,
                 mention_bindings,
             } => {
+                let selected_mask = self.widget.ui_mut().active_collaboration_mask();
+                let session_model = self
+                    .status_runtime
+                    .session_model
+                    .clone()
+                    .or_else(|| fetch_current_model_from_config(&self.state));
+                let session_effort = self.status_runtime.session_reasoning_effort;
+                let collaboration_mode =
+                    collaboration_mode_from_mask(selected_mask, session_model, session_effort);
                 let ui = self.widget.ui_mut();
                 ui.push_user_prompt(&text, text_elements.clone());
-                if let Some(turn_id) = start_turn_with_elements(
+                if let Some(turn_id) = start_turn_with_elements_and_collaboration(
                     &self.state,
                     &ui.session_id,
                     &text,
                     text_elements,
                     mention_bindings,
+                    collaboration_mode,
                 )? {
                     ui.active_turn_id = Some(turn_id);
                 }
@@ -610,6 +620,15 @@ impl App {
                 }
                 WidgetAppEvent::UpdatePersonality(personality) => {
                     self.apply_personality_selection(personality)?;
+                }
+                WidgetAppEvent::UpdateCollaborationMode(mask) => {
+                    self.widget.ui_mut().set_collaboration_mask(mask);
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("collaboration mode updated".to_string()));
+                }
+                WidgetAppEvent::UpdateFeatureFlags { updates } => {
+                    self.apply_feature_flags(updates)?;
                 }
                 WidgetAppEvent::SetSkillEnabled { path, enabled } => {
                     self.apply_skill_enabled(path, enabled)?;
@@ -853,15 +872,53 @@ impl App {
             }
             SlashCommand::Feedback => self.widget.ui_mut().open_feedback_selection(),
             SlashCommand::Compact => self.start_compaction()?,
-            SlashCommand::Plan | SlashCommand::Collab => self
-                .widget
-                .ui_mut()
-                .push_line("Collaboration modes are not available in app-server TUI yet."),
+            SlashCommand::Plan => {
+                if !self.widget.ui_mut().collaboration_modes_enabled() {
+                    self.widget
+                        .ui_mut()
+                        .push_line("Collaboration modes are disabled.");
+                    return Ok(());
+                }
+                let modes = fetch_collaboration_modes(&self.state)?;
+                if let Some(plan_mask) = modes
+                    .iter()
+                    .find(|mask| {
+                        matches!(
+                            mask.mode,
+                            Some(codex_protocol::config_types::ModeKind::Plan)
+                        )
+                    })
+                    .cloned()
+                {
+                    self.widget.ui_mut().set_collaboration_mask(plan_mask);
+                    if !arg.trim().is_empty() {
+                        self.app_event_tx.send(AppEvent::StartTurn {
+                            text: arg.trim().to_string(),
+                            text_elements: Vec::new(),
+                            mention_bindings: Vec::new(),
+                        });
+                    }
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .push_line("Plan mode unavailable right now.");
+                }
+            }
+            SlashCommand::Collab => {
+                if !self.widget.ui_mut().collaboration_modes_enabled() {
+                    self.widget
+                        .ui_mut()
+                        .push_line("Collaboration modes are disabled.");
+                    return Ok(());
+                }
+                let modes = fetch_collaboration_modes(&self.state)?;
+                self.widget.ui_mut().open_collaboration_modes_popup(modes);
+            }
             SlashCommand::Agent => self.open_agent_picker()?,
-            SlashCommand::Experimental => self
-                .widget
-                .ui_mut()
-                .push_line("Experimental feature picker is not available in app-server TUI yet."),
+            SlashCommand::Experimental => {
+                let features = fetch_experimental_features(&self.state)?;
+                self.widget.ui_mut().open_experimental_popup(features);
+            }
             SlashCommand::Personality => self.open_personality_picker(),
             SlashCommand::TestApproval => self
                 .widget
@@ -1320,6 +1377,33 @@ impl App {
             "personality set to {}",
             personality_label(personality)
         )));
+        Ok(())
+    }
+
+    fn apply_feature_flags(
+        &mut self,
+        updates: Vec<(codex_core::features::Feature, bool)>,
+    ) -> Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        for (feature, enabled) in updates {
+            app_server_rpc_request(
+                &self.state.config.app_server_endpoint,
+                self.state.config.auth_token.as_deref(),
+                "config/value/write",
+                json!({
+                    "keyPath": format!("features.{}", feature.key()),
+                    "value": enabled,
+                    "mergeStrategy": "replace",
+                }),
+            )?;
+        }
+
+        self.widget
+            .ui_mut()
+            .set_status_message(Some("experimental features updated".to_string()));
         Ok(())
     }
 
@@ -1943,6 +2027,26 @@ fn personality_config_value(
     }
 }
 
+fn collaboration_mode_from_mask(
+    mask: Option<codex_protocol::config_types::CollaborationModeMask>,
+    session_model: Option<String>,
+    session_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+) -> Option<codex_protocol::config_types::CollaborationMode> {
+    let mask = mask?;
+    let mode = mask.mode?;
+    let model = mask.model.or(session_model)?;
+    let reasoning_effort = mask.reasoning_effort.unwrap_or(session_effort);
+    let developer_instructions = mask.developer_instructions.unwrap_or(None);
+    Some(codex_protocol::config_types::CollaborationMode {
+        mode,
+        settings: codex_protocol::config_types::Settings {
+            model,
+            reasoning_effort,
+            developer_instructions,
+        },
+    })
+}
+
 fn parse_plan_type(value: Option<&Value>) -> Option<codex_protocol::account::PlanType> {
     let raw = value.and_then(Value::as_str)?.to_ascii_lowercase();
     match raw.as_str() {
@@ -2467,6 +2571,84 @@ fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
             })
         })
         .collect())
+}
+
+fn fetch_collaboration_modes(
+    state: &CliState,
+) -> Result<Vec<codex_protocol::config_types::CollaborationModeMask>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "collaborationMode/list",
+        json!({}),
+    )?;
+    let data = response
+        .result
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let mut modes: Vec<codex_protocol::config_types::CollaborationModeMask> =
+        serde_json::from_value(data)?;
+    modes.retain(|mask| mask.mode.is_some_and(|mode| mode.is_tui_visible()));
+    Ok(modes)
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentalFeatureListResponsePayload {
+    data: Vec<ExperimentalFeaturePayload>,
+    next_cursor: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ExperimentalFeaturePayload {
+    name: String,
+    stage: String,
+    display_name: Option<String>,
+    description: Option<String>,
+    enabled: bool,
+}
+
+fn fetch_experimental_features(
+    state: &CliState,
+) -> Result<Vec<crate::bottom_pane::ExperimentalFeatureItem>> {
+    let mut cursor: Option<String> = None;
+    let mut out = Vec::new();
+    loop {
+        let response = app_server_rpc_request(
+            &state.config.app_server_endpoint,
+            state.config.auth_token.as_deref(),
+            "experimentalFeature/list",
+            json!({
+                "cursor": cursor,
+            }),
+        )?;
+        let payload: ExperimentalFeatureListResponsePayload =
+            serde_json::from_value(response.result.clone())?;
+
+        for feature in payload.data {
+            let Some(mapped_feature) = codex_core::features::Feature::from_key(&feature.name)
+            else {
+                continue;
+            };
+            let description = feature
+                .description
+                .unwrap_or_else(|| format!("Stage: {}", feature.stage));
+            out.push(crate::bottom_pane::ExperimentalFeatureItem {
+                feature: mapped_feature,
+                name: feature.display_name.unwrap_or(feature.name),
+                description,
+                enabled: feature.enabled,
+            });
+        }
+
+        cursor = payload.next_cursor;
+        if cursor.is_none() {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 fn fetch_model_picker_entries(state: &CliState) -> Result<Vec<ModelPickerEntry>> {

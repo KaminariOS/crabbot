@@ -120,6 +120,7 @@ pub(crate) struct LiveAttachTui {
     kill_buffer: String,
     bottom_pane: BottomPane,
     history_scroll_offset: u16,
+    active_collaboration_mask: Option<codex_protocol::config_types::CollaborationModeMask>,
 }
 
 pub(crate) struct ReviewCommitPickerEntry {
@@ -148,6 +149,8 @@ impl LiveAttachTui {
             animations_enabled: true,
             skills: None,
         });
+        let mut bottom_pane = bottom_pane;
+        bottom_pane.set_collaboration_modes_enabled(true);
         Self {
             session_id,
             history_cells: Vec::new(),
@@ -173,6 +176,7 @@ impl LiveAttachTui {
             kill_buffer: String::new(),
             bottom_pane,
             history_scroll_offset: 0,
+            active_collaboration_mask: None,
         }
     }
 
@@ -1008,6 +1012,98 @@ impl LiveAttachTui {
 
     pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
         self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn collaboration_modes_enabled(&self) -> bool {
+        true
+    }
+
+    pub(crate) fn active_collaboration_mask(
+        &self,
+    ) -> Option<codex_protocol::config_types::CollaborationModeMask> {
+        self.active_collaboration_mask.clone()
+    }
+
+    pub(crate) fn set_collaboration_mask(
+        &mut self,
+        mask: codex_protocol::config_types::CollaborationModeMask,
+    ) {
+        let indicator = match mask
+            .mode
+            .unwrap_or(codex_protocol::config_types::ModeKind::Default)
+        {
+            codex_protocol::config_types::ModeKind::Plan => {
+                Some(crate::bottom_pane::CollaborationModeIndicator::Plan)
+            }
+            codex_protocol::config_types::ModeKind::PairProgramming => {
+                Some(crate::bottom_pane::CollaborationModeIndicator::PairProgramming)
+            }
+            codex_protocol::config_types::ModeKind::Execute => {
+                Some(crate::bottom_pane::CollaborationModeIndicator::Execute)
+            }
+            codex_protocol::config_types::ModeKind::Default => {
+                Some(crate::bottom_pane::CollaborationModeIndicator::PairProgramming)
+            }
+        };
+        self.bottom_pane.set_collaboration_mode_indicator(indicator);
+        self.status_message = Some(format!("collaboration mode set to {}", mask.name));
+        self.active_collaboration_mask = Some(mask);
+    }
+
+    pub(crate) fn open_collaboration_modes_popup(
+        &mut self,
+        presets: Vec<codex_protocol::config_types::CollaborationModeMask>,
+    ) {
+        if presets.is_empty() {
+            self.add_history_cell(Box::new(new_info_event(
+                "No collaboration modes are available right now.".to_string(),
+                None,
+            )));
+            return;
+        }
+
+        let current_kind = self
+            .active_collaboration_mask
+            .as_ref()
+            .and_then(|mask| mask.mode);
+
+        let items = presets
+            .into_iter()
+            .map(|mask| {
+                let name = mask.name.clone();
+                let is_current = current_kind == mask.mode;
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(UiAppEvent::UpdateCollaborationMode(mask.clone()));
+                });
+                crate::bottom_pane::SelectionItem {
+                    name,
+                    is_current,
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Select Collaboration Mode".to_string()),
+                subtitle: Some("Pick a collaboration preset.".to_string()),
+                footer_hint: Some(crate::bottom_pane::popup_consts::standard_popup_hint_line()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_experimental_popup(
+        &mut self,
+        features: Vec<crate::bottom_pane::ExperimentalFeatureItem>,
+    ) {
+        let view = crate::bottom_pane::ExperimentalFeaturesView::new(
+            features,
+            self.bottom_pane_event_tx.clone(),
+        );
+        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn show_review_custom_prompt(&mut self) {
