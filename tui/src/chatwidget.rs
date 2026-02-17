@@ -16,7 +16,6 @@ use crate::exec_cell::new_active_exec_command;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
-use crate::history_cell::SessionHeaderHistoryCell;
 use crate::history_cell::SessionInfoCell;
 use crate::history_cell::new_active_mcp_tool_call;
 use crate::history_cell::new_active_web_search_call;
@@ -41,7 +40,6 @@ use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::StreamController;
 use crate::text_formatting;
-use crate::version::CODEX_CLI_VERSION;
 use crate::*;
 use codex_file_search::FileMatch;
 use codex_utils_fuzzy_match::fuzzy_match;
@@ -1725,6 +1723,10 @@ impl LiveAttachTui {
         lines
     }
 
+    pub(crate) fn has_history_cells(&self) -> bool {
+        !self.history_cells.is_empty()
+    }
+
     pub(crate) fn set_skills(
         &mut self,
         skills: Option<Vec<codex_core::skills::model::SkillMetadata>>,
@@ -1837,49 +1839,6 @@ impl LiveAttachTui {
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        let show_welcome =
-            self.history_cells.is_empty() && self.history_cells_flushed_to_scrollback == 0;
-        if show_welcome {
-            let header = SessionHeaderHistoryCell::new(
-                "gpt-5.3-codex".to_string(),
-                None,
-                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                CODEX_CLI_VERSION,
-            );
-            lines.extend(HistoryCell::display_lines(&header, width));
-            lines.push(Line::from(""));
-            lines.push(
-                "  To get started, describe a task or try one of these commands:"
-                    .dim()
-                    .into(),
-            );
-            lines.push(Line::from(""));
-            lines.push(Line::from(vec![
-                "  ".into(),
-                "/init".into(),
-                " - create an AGENTS.md file with instructions for Codex".dim(),
-            ]));
-            lines.push(Line::from(vec![
-                "  ".into(),
-                "/status".into(),
-                " - show current session configuration".dim(),
-            ]));
-            lines.push(Line::from(vec![
-                "  ".into(),
-                "/permissions".into(),
-                " - choose what Codex is allowed to do".dim(),
-            ]));
-            lines.push(Line::from(vec![
-                "  ".into(),
-                "/model".into(),
-                " - choose what model and reasoning effort to use".dim(),
-            ]));
-            lines.push(Line::from(vec![
-                "  ".into(),
-                "/review".into(),
-                " - review any changes and find issues".dim(),
-            ]));
-        }
         for cell in self
             .history_cells
             .iter()

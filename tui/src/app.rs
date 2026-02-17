@@ -23,8 +23,10 @@ use crate::exec_cell::CommandOutput as ExecCommandOutput;
 use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
 use crate::get_git_diff::get_git_diff;
+use crate::history_cell::SessionHeaderHistoryCell;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
+use crate::version::CODEX_CLI_VERSION;
 use codex_core::protocol::ExecCommandSource;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -110,6 +112,20 @@ impl App {
                 )));
             }
         }
+        if !widget.ui_mut().has_history_cells() {
+            let model = status_runtime
+                .session_model
+                .clone()
+                .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            widget
+                .ui_mut()
+                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
+                    model,
+                    status_runtime.session_reasoning_effort,
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    CODEX_CLI_VERSION,
+                )));
+        }
         let (tx, rx) = std::sync::mpsc::channel();
         let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
         let widget_sender = WidgetAppEventSender::new(widget_tx);
@@ -156,6 +172,16 @@ impl App {
                 .to_string();
             ui.apply_stream_events(&initial_events);
             ui.set_status_message(Some("attached to app-server websocket".to_string()));
+        }
+        if !widget.ui_mut().has_history_cells() {
+            widget
+                .ui_mut()
+                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
+                    "gpt-5.3-codex".to_string(),
+                    None,
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    CODEX_CLI_VERSION,
+                )));
         }
         state.last_thread_id = Some(session_id.clone());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -340,6 +366,19 @@ impl App {
                 self.status_runtime.apply_stream_events(&events);
                 self.widget.ui_mut().apply_rpc_stream_events(&events);
             }
+            let model = self
+                .status_runtime
+                .session_model
+                .clone()
+                .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+            self.widget
+                .ui_mut()
+                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
+                    model,
+                    self.status_runtime.session_reasoning_effort,
+                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                    CODEX_CLI_VERSION,
+                )));
         }
 
         if announce_switch && changed {
