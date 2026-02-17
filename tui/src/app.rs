@@ -745,9 +745,17 @@ impl App {
                 ));
             }
             SlashCommand::Clean => {
-                self.widget
-                    .ui_mut()
-                    .push_line("Stopping all background terminals.");
+                let thread_id = self.widget.ui_mut().session_id.clone();
+                match clean_background_terminals(&self.state, &thread_id) {
+                    Ok(()) => self
+                        .widget
+                        .ui_mut()
+                        .push_line("Stopped all background terminals."),
+                    Err(err) => self
+                        .widget
+                        .ui_mut()
+                        .push_line(&format!("Failed to stop background terminals: {err}")),
+                }
             }
             SlashCommand::Mcp => match fetch_mcp_tools_output(&self.state) {
                 Ok(cell) => self.widget.ui_mut().add_history_cell(Box::new(cell)),
@@ -1655,6 +1663,18 @@ fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String
         .and_then(|thread| thread.get("path"))
         .and_then(Value::as_str)
         .map(ToString::to_string))
+}
+
+fn clean_background_terminals(state: &CliState, thread_id: &str) -> Result<()> {
+    app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/backgroundTerminals/clean",
+        json!({
+            "threadId": thread_id,
+        }),
+    )?;
+    Ok(())
 }
 
 fn fetch_mcp_tools_output(state: &CliState) -> Result<crate::history_cell::PlainHistoryCell> {
