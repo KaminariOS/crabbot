@@ -556,8 +556,21 @@ impl App {
                     });
                 }
             }
+            SlashCommand::Approvals | SlashCommand::Permissions => {
+                let pending = self.widget.ui_mut().pending_approvals.len();
+                self.widget
+                    .ui_mut()
+                    .push_line(&format!("Pending approvals: {pending}"));
+            }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
+            }
+            SlashCommand::Logout => {
+                self.state.config.auth_token = None;
+                self.widget
+                    .ui_mut()
+                    .push_line("Logged out from app-server auth token.");
+                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
             }
             SlashCommand::Mention => {
                 self.widget.ui_mut().bottom_pane_insert_str("@");
@@ -623,6 +636,11 @@ impl App {
                 self.widget
                     .ui_mut()
                     .add_history_cell(Box::new(crate::history_cell::empty_mcp_output()));
+            }
+            SlashCommand::Rollout => {
+                self.widget
+                    .ui_mut()
+                    .push_line("Rollout path is not available in app-server tui.");
             }
             _ => {
                 let _ = arg;
