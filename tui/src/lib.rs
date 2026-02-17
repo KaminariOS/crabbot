@@ -530,6 +530,9 @@ pub mod protocol {
     #[allow(dead_code)]
     pub enum Op {
         Interrupt,
+        Compact,
+        DropMemories,
+        UpdateMemories,
         UserInput {
             items: Vec<serde_json::Value>,
         },

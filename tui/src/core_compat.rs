@@ -379,6 +379,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .map(ToString::to_string);
             vec![UiEvent::TurnCompleted { status }]
         }
+        "thread/compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
         "turn/aborted" => vec![UiEvent::TurnCompleted {
             status: Some("aborted".to_string()),
         }],

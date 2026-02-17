@@ -532,9 +532,7 @@ impl App {
         };
         for event in pending_widget_events {
             match event {
-                WidgetAppEvent::CodexOp(codex_core::protocol::Op::Interrupt) => {
-                    self.app_event_tx.send(AppEvent::Interrupt);
-                }
+                WidgetAppEvent::CodexOp(op) => self.handle_widget_op(op)?,
                 WidgetAppEvent::InsertHistoryCell(cell) => {
                     self.widget.ui_mut().add_history_cell(cell);
                 }
@@ -836,10 +834,7 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("Feedback flow is not available in app-server TUI yet."),
-            SlashCommand::Compact => self
-                .widget
-                .ui_mut()
-                .push_line("/compact is not available in app-server TUI yet."),
+            SlashCommand::Compact => self.start_compaction()?,
             SlashCommand::Plan | SlashCommand::Collab => self
                 .widget
                 .ui_mut()
@@ -857,14 +852,38 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("/test-approval is not available in app-server TUI."),
-            SlashCommand::MemoryDrop | SlashCommand::MemoryUpdate => self
-                .widget
-                .ui_mut()
-                .push_line("Memory debug commands are not available in app-server TUI."),
+            SlashCommand::MemoryDrop => {
+                self.handle_widget_op(codex_core::protocol::Op::DropMemories)?
+            }
+            SlashCommand::MemoryUpdate => {
+                self.handle_widget_op(codex_core::protocol::Op::UpdateMemories)?
+            }
             SlashCommand::ElevateSandbox => self
                 .widget
                 .ui_mut()
                 .push_line("/setup-default-sandbox is not available on this runtime."),
+        }
+        Ok(())
+    }
+
+    fn handle_widget_op(&mut self, op: codex_core::protocol::Op) -> Result<()> {
+        match op {
+            codex_core::protocol::Op::Interrupt => {
+                self.app_event_tx.send(AppEvent::Interrupt);
+            }
+            codex_core::protocol::Op::Compact => {
+                self.start_compaction()?;
+            }
+            codex_core::protocol::Op::DropMemories | codex_core::protocol::Op::UpdateMemories => {
+                self.widget
+                    .ui_mut()
+                    .push_line("Memory debug commands are not available in app-server TUI.");
+            }
+            _ => {
+                self.widget
+                    .ui_mut()
+                    .push_line("This operation is not available in app-server TUI.");
+            }
         }
         Ok(())
     }
@@ -1309,6 +1328,22 @@ impl App {
 
     fn start_review_uncommitted(&mut self) -> Result<()> {
         self.start_review_with_target(json!({ "type": "uncommittedChanges" }))
+    }
+
+    fn start_compaction(&mut self) -> Result<()> {
+        let thread_id = self.widget.ui_mut().session_id.clone();
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "thread/compact/start",
+            json!({
+                "threadId": thread_id,
+            }),
+        )?;
+        self.widget
+            .ui_mut()
+            .set_status_message(Some("compacting context...".to_string()));
+        Ok(())
     }
 
     fn start_review_base_branch(&mut self, branch: &str) -> Result<()> {
