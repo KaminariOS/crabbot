@@ -186,15 +186,20 @@ struct SessionRuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CliConfig {
     api_endpoint: String,
+    #[serde(alias = "app_server_endpoint", default = "default_daemon_endpoint")]
     daemon_endpoint: String,
     auth_token: Option<String>,
+}
+
+fn default_daemon_endpoint() -> String {
+    "http://127.0.0.1:8788".to_string()
 }
 
 impl Default for CliConfig {
     fn default() -> Self {
         Self {
             api_endpoint: "http://127.0.0.1:8787".to_string(),
-            daemon_endpoint: "http://127.0.0.1:8788".to_string(),
+            daemon_endpoint: default_daemon_endpoint(),
             auth_token: None,
         }
     }
