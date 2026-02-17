@@ -401,24 +401,7 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ResumeSession => {
-                let current_session_id = self.widget.ui_mut().session_id.clone();
-                if let Some(thread_id) = resume_thread(&self.state, &current_session_id)? {
-                    self.switch_to_thread(thread_id, "thread resumed", false);
-                } else if let Some(fallback_thread_id) =
-                    find_recent_thread_to_resume(&self.state, &current_session_id)?
-                {
-                    if let Some(thread_id) = resume_thread(&self.state, &fallback_thread_id)? {
-                        self.switch_to_thread(thread_id, "thread resumed", false);
-                    } else {
-                        self.widget
-                            .ui_mut()
-                            .set_status_message(Some("resume returned no thread id".to_string()));
-                    }
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("no saved chats to resume".to_string()));
-                }
+                self.open_resume_picker()?;
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ApprovalDecision { arg, approve } => {
@@ -525,6 +508,21 @@ impl App {
                         .ui_mut()
                         .apply_file_search_result(query, matches);
                 }
+                WidgetAppEvent::OpenResumePicker => {
+                    self.open_resume_picker()?;
+                }
+                WidgetAppEvent::SelectAgentThread(thread_id) => {
+                    let selected_thread_id = thread_id.to_string();
+                    if let Some(resumed_thread_id) =
+                        resume_thread(&self.state, &selected_thread_id)?
+                    {
+                        self.switch_to_thread(resumed_thread_id, "thread resumed", false);
+                    } else {
+                        self.widget
+                            .ui_mut()
+                            .set_status_message(Some("resume returned no thread id".to_string()));
+                    }
+                }
                 WidgetAppEvent::StatusLineSetup { .. } => {
                     self.widget
                         .ui_mut()
@@ -572,7 +570,7 @@ impl App {
         let arg = args.unwrap_or_default();
         match cmd {
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
-            SlashCommand::Resume => self.app_event_tx.send(AppEvent::ResumeSession),
+            SlashCommand::Resume => self.open_resume_picker()?,
             SlashCommand::Status => self.emit_status_summary(),
             SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(None),
             SlashCommand::DebugConfig => self
@@ -785,7 +783,7 @@ impl App {
                 return Ok(LiveTuiAction::Continue);
             }
             "/resume" => {
-                self.app_event_tx.send(AppEvent::ResumeSession);
+                self.open_resume_picker()?;
                 return Ok(LiveTuiAction::Continue);
             }
             _ => {}
@@ -923,6 +921,59 @@ impl App {
             reasoning_effort_override,
         );
         self.widget.ui_mut().add_history_cell(Box::new(cell));
+    }
+
+    fn open_resume_picker(&mut self) -> Result<()> {
+        let threads = fetch_resume_threads(&self.state)?;
+        if threads.is_empty() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("no saved chats to resume".to_string()));
+            return Ok(());
+        }
+
+        let current_session_id = self.widget.ui_mut().session_id.clone();
+        let items = threads
+            .into_iter()
+            .filter_map(|thread| {
+                let thread_id_text = thread.thread_id.clone();
+                let thread_id =
+                    codex_protocol::ThreadId::from_string(thread_id_text.clone()).ok()?;
+                let display_name = thread
+                    .thread_name
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| thread_id_text.clone());
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::SelectAgentThread(thread_id.clone()));
+                });
+                Some(crate::bottom_pane::SelectionItem {
+                    name: display_name,
+                    description: Some(thread_id_text.clone()),
+                    is_current: current_session_id == thread_id_text,
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        if items.is_empty() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("no saved chats to resume".to_string()));
+            return Ok(());
+        }
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                view_id: Some("resume-session-picker"),
+                title: Some("Resume Chat".to_string()),
+                subtitle: Some("Select a saved chat to resume.".to_string()),
+                items,
+                ..Default::default()
+            });
+        Ok(())
     }
 }
 
@@ -1495,36 +1546,42 @@ fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String
         .map(ToString::to_string))
 }
 
-fn find_recent_thread_to_resume(
-    state: &CliState,
-    current_thread_id: &str,
-) -> Result<Option<String>> {
+struct ResumeThreadEntry {
+    thread_id: String,
+    thread_name: Option<String>,
+}
+
+fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "thread/list",
         json!({
             "sortKey": "updated_at",
-            "limit": 20,
+            "limit": 50,
             "archived": false,
         }),
     )?;
 
     let Some(threads) = response.result.get("data").and_then(Value::as_array) else {
-        return Ok(None);
+        return Ok(Vec::new());
     };
 
-    for thread in threads {
-        let Some(thread_id) = thread.get("id").and_then(Value::as_str) else {
-            continue;
-        };
-        if thread_id == current_thread_id {
-            continue;
-        }
-        return Ok(Some(thread_id.to_string()));
-    }
-
-    Ok(None)
+    Ok(threads
+        .iter()
+        .filter_map(|thread| {
+            let thread_id = thread.get("id").and_then(Value::as_str)?.to_string();
+            let thread_name = thread
+                .get("threadName")
+                .or_else(|| thread.get("name"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            Some(ResumeThreadEntry {
+                thread_id,
+                thread_name,
+            })
+        })
+        .collect())
 }
 
 fn run_diff_now() -> String {

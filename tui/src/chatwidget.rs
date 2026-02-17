@@ -940,6 +940,10 @@ impl LiveAttachTui {
         self.bottom_pane.open_status_line_setup(status_line_items);
     }
 
+    pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
+        self.bottom_pane.show_selection_view(params);
+    }
+
     pub(crate) fn set_status_message(&mut self, message: Option<String>) {
         self.status_message = message;
         self.sync_bottom_pane_status();
