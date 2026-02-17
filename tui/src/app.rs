@@ -678,6 +678,10 @@ impl App {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
                 return Ok(LiveTuiAction::Continue);
             }
+            "/status" => {
+                self.emit_status_summary();
+                return Ok(LiveTuiAction::Continue);
+            }
             "/refresh" => {
                 self.app_event_tx.send(AppEvent::RefreshStream);
                 return Ok(LiveTuiAction::Continue);
@@ -799,6 +803,7 @@ impl App {
             "thread={} approvals={} seq={} v={}",
             ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
         );
+        ui.push_line("/status");
         ui.push_line(&summary);
         ui.set_status_message(Some(summary));
     }
