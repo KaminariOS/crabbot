@@ -1672,6 +1672,7 @@ mod slash_command;
 mod slash_commands;
 mod status;
 mod status_indicator_widget;
+mod streaming;
 mod style;
 mod terminal_palette;
 mod text_formatting;
