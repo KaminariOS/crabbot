@@ -560,6 +560,9 @@ impl App {
                             .set_status_message(Some("resume returned no thread id".to_string()));
                     }
                 }
+                WidgetAppEvent::UpdateModel(model) => {
+                    self.apply_model_selection(model)?;
+                }
                 WidgetAppEvent::StatusLineSetup { .. } => {
                     self.widget
                         .ui_mut()
@@ -606,6 +609,7 @@ impl App {
     ) -> Result<()> {
         let arg = args.unwrap_or_default();
         match cmd {
+            SlashCommand::Model => self.open_model_picker()?,
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
             SlashCommand::Resume => self.open_resume_picker()?,
             SlashCommand::Status => self.emit_status_summary(),
@@ -1012,6 +1016,66 @@ impl App {
                 items,
                 ..Default::default()
             });
+        Ok(())
+    }
+
+    fn open_model_picker(&mut self) -> Result<()> {
+        let models = fetch_model_picker_entries(&self.state)?;
+        if models.is_empty() {
+            self.widget
+                .ui_mut()
+                .set_status_message(Some("no models available".to_string()));
+            return Ok(());
+        }
+
+        let current_model = fetch_current_model_from_config(&self.state)
+            .or_else(|| self.status_runtime.session_model.clone());
+
+        let items = models
+            .into_iter()
+            .map(|entry| {
+                let slug = entry.slug.clone();
+                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
+                    sender.send(WidgetAppEvent::UpdateModel(slug.clone()));
+                });
+                crate::bottom_pane::SelectionItem {
+                    name: entry.display_name,
+                    description: Some(entry.description),
+                    is_current: current_model.as_deref() == Some(entry.slug.as_str()),
+                    actions: vec![action],
+                    dismiss_on_select: true,
+                    ..Default::default()
+                }
+            })
+            .collect::<Vec<_>>();
+
+        self.widget
+            .ui_mut()
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                view_id: Some("model-picker"),
+                title: Some("Select Model".to_string()),
+                subtitle: Some("Choose the model Codex should use.".to_string()),
+                items,
+                ..Default::default()
+            });
+        Ok(())
+    }
+
+    fn apply_model_selection(&mut self, model: String) -> Result<()> {
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": "model",
+                "value": model,
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        self.status_runtime.session_model = Some(model.clone());
+        self.widget
+            .ui_mut()
+            .set_status_message(Some(format!("model updated to {model}")));
         Ok(())
     }
 }
@@ -1692,6 +1756,12 @@ struct ResumeThreadEntry {
     thread_name: Option<String>,
 }
 
+struct ModelPickerEntry {
+    slug: String,
+    display_name: String,
+    description: String,
+}
+
 fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
@@ -1723,6 +1793,76 @@ fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
             })
         })
         .collect())
+}
+
+fn fetch_model_picker_entries(state: &CliState) -> Result<Vec<ModelPickerEntry>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "model/list",
+        json!({
+            "includeHidden": false,
+            "limit": 100,
+        }),
+    )?;
+
+    let models = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for model in models {
+        let slug = model
+            .get("model")
+            .or_else(|| model.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if slug.is_empty() {
+            continue;
+        }
+
+        let display_name = model
+            .get("displayName")
+            .or_else(|| model.get("display_name"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| slug.clone());
+        let description = model
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        out.push(ModelPickerEntry {
+            slug,
+            display_name,
+            description,
+        });
+    }
+    Ok(out)
+}
+
+fn fetch_current_model_from_config(state: &CliState) -> Option<String> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "config/read",
+        json!({
+            "includeLayers": false,
+        }),
+    )
+    .ok()?;
+
+    response
+        .result
+        .get("config")
+        .and_then(|cfg| cfg.get("model"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
 }
 
 fn run_diff_now() -> String {
