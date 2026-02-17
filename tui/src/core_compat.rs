@@ -369,6 +369,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             let exit_code = notification
                 .params
                 .get("exitCode")
+                .or_else(|| notification.params.get("exit_code"))
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
             let Some(call_id) = item_id_from_params(&notification.params) else {
@@ -397,6 +398,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 aggregated_output: notification
                     .params
                     .get("aggregatedOutput")
+                    .or_else(|| notification.params.get("aggregated_output"))
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
@@ -404,6 +406,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                     notification
                         .params
                         .get("durationMs")
+                        .or_else(|| notification.params.get("duration_ms"))
                         .and_then(Value::as_i64)
                         .unwrap_or_default(),
                 ),
