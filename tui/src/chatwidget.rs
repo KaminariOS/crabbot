@@ -130,6 +130,8 @@ pub(crate) struct LiveAttachTui {
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
+    reasoning_buffer: String,
+    full_reasoning_buffer: String,
 }
 
 pub(crate) struct ReviewCommitPickerEntry {
@@ -191,6 +193,8 @@ impl LiveAttachTui {
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
+            reasoning_buffer: String::new(),
+            full_reasoning_buffer: String::new(),
         }
     }
 
@@ -266,7 +270,9 @@ impl LiveAttachTui {
                 self.assistant_stream = StreamController::new(None);
                 self.agent_turn_running = true;
                 self.update_task_running_state();
-                self.status_message = Some("running turn...".to_string());
+                self.status_message = Some("Working".to_string());
+                self.reasoning_buffer.clear();
+                self.full_reasoning_buffer.clear();
             }
             UiEvent::AssistantDelta { turn_id, delta } => {
                 let is_new_turn = if let Some(turn_id) = turn_id {
@@ -285,11 +291,22 @@ impl LiveAttachTui {
                 };
                 self.append_assistant_delta(delta);
             }
+            UiEvent::AgentReasoningDelta { delta } => {
+                self.on_agent_reasoning_delta(delta);
+            }
+            UiEvent::AgentReasoningFinal => {
+                self.on_agent_reasoning_final();
+            }
+            UiEvent::AgentReasoningSectionBreak => {
+                self.on_reasoning_section_break();
+            }
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
                 self.active_turn_id = None;
                 self.agent_turn_running = false;
                 self.update_task_running_state();
+                self.reasoning_buffer.clear();
+                self.full_reasoning_buffer.clear();
                 if let Some(status) = status
                     && status != "completed"
                 {
@@ -374,7 +391,11 @@ impl LiveAttachTui {
             UiEvent::McpStartupComplete { failed, cancelled } => {
                 self.mcp_startup_running = false;
                 self.update_task_running_state();
-                self.status_message = None;
+                if self.agent_turn_running {
+                    self.status_message = Some("Working".to_string());
+                } else {
+                    self.status_message = None;
+                }
                 if !failed.is_empty() || !cancelled.is_empty() {
                     let failed_part = if failed.is_empty() {
                         String::new()
@@ -665,6 +686,34 @@ impl LiveAttachTui {
         }
         self.history_cells.extend(output.cells);
         true
+    }
+
+    fn on_agent_reasoning_delta(&mut self, delta: String) {
+        self.reasoning_buffer.push_str(&delta);
+        if let Some(header) = extract_first_bold(&self.reasoning_buffer) {
+            self.status_message = Some(header);
+        }
+    }
+
+    fn on_agent_reasoning_final(&mut self) {
+        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+        if !self.full_reasoning_buffer.is_empty() {
+            self.history_cells
+                .push(crate::history_cell::new_reasoning_summary_block(
+                    self.full_reasoning_buffer.clone(),
+                ));
+        }
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+        if self.agent_turn_running {
+            self.status_message = Some("Working".to_string());
+        }
+    }
+
+    fn on_reasoning_section_break(&mut self) {
+        self.full_reasoning_buffer.push_str(&self.reasoning_buffer);
+        self.full_reasoning_buffer.push_str("\n\n");
+        self.reasoning_buffer.clear();
     }
 
     pub(crate) fn on_commit_tick(&mut self) {
@@ -1699,6 +1748,8 @@ impl LiveAttachTui {
         self.rate_limit_snapshots_by_limit_id.clear();
         self.agent_turn_running = false;
         self.mcp_startup_running = false;
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
         self.bottom_pane.set_context_window(None, None);
         self.clear_input();
     }
@@ -2279,6 +2330,32 @@ pub(crate) fn get_limits_duration(minutes: i64) -> String {
         return format!("{hours}h");
     }
     format!("{minutes}m")
+}
+
+fn extract_first_bold(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'*' && bytes[i + 1] == b'*' {
+            let start = i + 2;
+            let mut j = start;
+            while j + 1 < bytes.len() {
+                if bytes[j] == b'*' && bytes[j + 1] == b'*' {
+                    let inner = &s[start..j];
+                    let trimmed = inner.trim();
+                    if !trimmed.is_empty() {
+                        return Some(trimmed.to_string());
+                    } else {
+                        return None;
+                    }
+                }
+                j += 1;
+            }
+            return None;
+        }
+        i += 1;
+    }
+    None
 }
 
 #[cfg(test)]

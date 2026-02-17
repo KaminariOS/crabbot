@@ -56,6 +56,11 @@ pub(crate) enum UiEvent {
         turn_id: Option<String>,
         delta: String,
     },
+    AgentReasoningDelta {
+        delta: String,
+    },
+    AgentReasoningFinal,
+    AgentReasoningSectionBreak,
     TurnCompleted {
         status: Option<String>,
     },
@@ -275,7 +280,16 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 }]
             })
             .unwrap_or_default(),
-        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => Vec::new(),
+        "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => {
+            delta_from_params(&notification.params)
+                .map(|delta| {
+                    vec![UiEvent::AgentReasoningDelta {
+                        delta: delta.to_string(),
+                    }]
+                })
+                .unwrap_or_default()
+        }
+        "item/reasoning/summaryPartAdded" => vec![UiEvent::AgentReasoningSectionBreak],
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
             let Some(delta) = delta_from_params(&notification.params) else {
                 return Vec::new();
@@ -780,7 +794,7 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 }]
             })
             .unwrap_or_default(),
-        "agent_message_delta" | "plan_delta" | "agent_reasoning_delta" => msg
+        "agent_message_delta" | "plan_delta" => msg
             .get("delta")
             .and_then(Value::as_str)
             .map(|delta| {
@@ -790,6 +804,29 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 }]
             })
             .unwrap_or_default(),
+        "agent_reasoning_delta" | "agent_reasoning_raw_content_delta" => msg
+            .get("delta")
+            .and_then(Value::as_str)
+            .map(|delta| {
+                vec![UiEvent::AgentReasoningDelta {
+                    delta: delta.to_string(),
+                }]
+            })
+            .unwrap_or_default(),
+        "agent_reasoning" => vec![UiEvent::AgentReasoningFinal],
+        "agent_reasoning_raw_content" => msg
+            .get("text")
+            .and_then(Value::as_str)
+            .map(|text| {
+                vec![
+                    UiEvent::AgentReasoningDelta {
+                        delta: text.to_string(),
+                    },
+                    UiEvent::AgentReasoningFinal,
+                ]
+            })
+            .unwrap_or_else(|| vec![UiEvent::AgentReasoningFinal]),
+        "agent_reasoning_section_break" => vec![UiEvent::AgentReasoningSectionBreak],
         "entered_review_mode" => vec![UiEvent::TranscriptLine("[entered review mode]".to_string())],
         "exited_review_mode" => vec![UiEvent::TranscriptLine("[exited review mode]".to_string())],
         "undo_started" => vec![UiEvent::TranscriptLine("[undo started]".to_string())],
@@ -1016,6 +1053,26 @@ fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
         return Vec::new();
     };
     match item_type {
+        "reasoning" => {
+            let text = item
+                .get("text")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    item.get("summary")
+                        .and_then(Value::as_array)
+                        .and_then(|summary| summary.first())
+                        .and_then(Value::as_str)
+                })
+                .unwrap_or_default()
+                .to_string();
+
+            let mut events = Vec::new();
+            if !text.is_empty() {
+                events.push(UiEvent::AgentReasoningDelta { delta: text });
+            }
+            events.push(UiEvent::AgentReasoningFinal);
+            events
+        }
         "command_execution" | "commandExecution" => {
             let call_id = item
                 .get("id")
