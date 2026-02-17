@@ -549,6 +549,9 @@ impl App {
                 WidgetAppEvent::OpenResumePicker => {
                     self.open_resume_picker()?;
                 }
+                WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
+                    self.open_permissions_picker()?;
+                }
                 WidgetAppEvent::ForkCurrentSession => {
                     let active_thread_id = self.widget.ui_mut().session_id.clone();
                     if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
