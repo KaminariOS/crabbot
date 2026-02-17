@@ -917,7 +917,17 @@ impl LiveAttachTui {
         second.push_span(Span::from(key_hint::plain(KeyCode::Tab)));
         second.push_span(" apply slash command");
 
-        vec![first, second]
+        let mut third = Line::default();
+        third.push_span(Span::from(key_hint::ctrl(KeyCode::Char('a'))));
+        third.push_span("/");
+        third.push_span(Span::from(key_hint::ctrl(KeyCode::Char('e'))));
+        third.push_span(" line home/end  ");
+        third.push_span(Span::from(key_hint::alt(KeyCode::Char('b'))));
+        third.push_span("/");
+        third.push_span(Span::from(key_hint::alt(KeyCode::Char('f'))));
+        third.push_span(" word move");
+
+        vec![first, second, third]
     }
 }
 
