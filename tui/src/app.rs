@@ -5,6 +5,7 @@ use crate::chatwidget::LiveAttachTui;
 pub(super) use crate::core_compat::AppEvent;
 pub(super) use crate::core_compat::AppEventSender;
 pub(super) use crate::core_compat::AppExitInfo;
+pub(super) use crate::core_compat::ExitMode;
 pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::interrupt_turn;
@@ -40,6 +41,11 @@ pub(crate) struct App {
     app_event_rx: std::sync::mpsc::Receiver<AppEvent>,
 }
 
+struct DrainResult {
+    redraw: bool,
+    detach: bool,
+}
+
 impl App {
     /// Create a new `App` for an interactive TUI session.
     ///
@@ -53,7 +59,17 @@ impl App {
 
         let mut widget = ChatWidget::new(thread_id.clone());
         widget.ui_mut().status_message = Some(status_message);
-        let _ = widget.poll_stream_updates(&state);
+        match stream_events(&state, widget.ui_mut().last_sequence) {
+            Ok(events) => {
+                if !events.is_empty() {
+                    widget.ui_mut().apply_rpc_stream_events(&events);
+                }
+            }
+            Err(err) => {
+                widget.ui_mut().status_message =
+                    Some(format!("connected; initial stream sync failed: {}", err));
+            }
+        }
         let (tx, rx) = std::sync::mpsc::channel();
 
         Ok(Self {
@@ -168,28 +184,47 @@ impl App {
                 should_redraw = true;
             }
 
-            while let Ok(app_event) = self.app_event_rx.try_recv() {
-                match self.handle_event(app_event)? {
-                    LiveTuiAction::Continue => {}
-                    LiveTuiAction::Detach => return Ok(()),
-                }
-                should_redraw = true;
+            let drained = self.drain_pending_app_events()?;
+            if drained.detach {
+                return Ok(());
             }
+            should_redraw |= drained.redraw;
 
             // Tick: poll stream for app-server events.
             match self.handle_event(AppEvent::Tick)? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => return Ok(()),
             }
-
-            if self.widget.poll_stream_updates(&self.state)? {
-                should_redraw = true;
+            let drained = self.drain_pending_app_events()?;
+            if drained.detach {
+                return Ok(());
             }
+            should_redraw |= drained.redraw;
 
             if !should_redraw {
                 thread::sleep(TUI_STREAM_POLL_INTERVAL);
             }
         }
+    }
+
+    fn drain_pending_app_events(&mut self) -> Result<DrainResult> {
+        let mut handled_any = false;
+        while let Ok(app_event) = self.app_event_rx.try_recv() {
+            match self.handle_event(app_event)? {
+                LiveTuiAction::Continue => {}
+                LiveTuiAction::Detach => {
+                    return Ok(DrainResult {
+                        redraw: handled_any,
+                        detach: true,
+                    });
+                }
+            }
+            handled_any = true;
+        }
+        Ok(DrainResult {
+            redraw: handled_any,
+            detach: false,
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -209,7 +244,21 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::Resize => Ok(LiveTuiAction::Continue),
-            AppEvent::Tick => Ok(LiveTuiAction::Continue),
+            AppEvent::Tick => {
+                let since_sequence = self.widget.ui_mut().last_sequence;
+                match stream_events(&self.state, since_sequence) {
+                    Ok(envelopes) => {
+                        if !envelopes.is_empty() {
+                            self.app_event_tx.send(AppEvent::StreamUpdate(envelopes));
+                        }
+                    }
+                    Err(err) => {
+                        self.widget.ui_mut().status_message =
+                            Some(format!("stream poll failed: {err}"));
+                    }
+                }
+                Ok(LiveTuiAction::Continue)
+            }
             AppEvent::SubmitInput(text) => self.handle_submit(&text),
             AppEvent::NewSession => {
                 let thread_id = start_thread(&self.state)?;
@@ -233,6 +282,26 @@ impl App {
                 }
                 Ok(LiveTuiAction::Continue)
             }
+            AppEvent::ResumeSession => {
+                let ui = self.widget.ui_mut();
+                if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
+                    ui.session_id = thread_id.clone();
+                    self.state.last_thread_id = Some(thread_id);
+                    ui.status_message = Some("thread resumed".to_string());
+                } else {
+                    ui.status_message = Some("resume returned no thread id".to_string());
+                }
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::ApprovalDecision { arg, approve } => {
+                handle_app_server_approval_decision(
+                    &mut self.state,
+                    self.widget.ui_mut(),
+                    &arg,
+                    approve,
+                )?;
+                Ok(LiveTuiAction::Continue)
+            }
             AppEvent::Exit(_mode) => Ok(LiveTuiAction::Detach),
             AppEvent::StreamUpdate(envelopes) => {
                 self.widget.ui_mut().apply_rpc_stream_events(&envelopes);
@@ -247,7 +316,8 @@ impl App {
         let ui = self.widget.ui_mut();
         match key.code {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                return Ok(LiveTuiAction::Detach);
+                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                return Ok(LiveTuiAction::Continue);
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 ui.clear_input();
@@ -335,7 +405,10 @@ impl App {
         ui.remember_history_entry(trimmed);
 
         match trimmed {
-            "/exit" | "/quit" => return Ok(LiveTuiAction::Detach),
+            "/exit" | "/quit" => {
+                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+                return Ok(LiveTuiAction::Continue);
+            }
             "/status" => {
                 let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
                 let approvals = if approval_ids.is_empty() {
@@ -351,45 +424,37 @@ impl App {
             }
             "/refresh" => {
                 ui.status_message = Some("refreshing stream...".to_string());
+                self.app_event_tx.send(AppEvent::Tick);
                 return Ok(LiveTuiAction::Continue);
             }
             "/new" => {
-                // Delegate to the NewSession AppEvent path.
-                return self.handle_event(AppEvent::NewSession);
+                self.app_event_tx.send(AppEvent::NewSession);
+                return Ok(LiveTuiAction::Continue);
             }
             "/interrupt" => {
-                return self.handle_event(AppEvent::Interrupt);
+                self.app_event_tx.send(AppEvent::Interrupt);
+                return Ok(LiveTuiAction::Continue);
             }
             "/resume" => {
-                if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
-                    ui.session_id = thread_id.clone();
-                    self.state.last_thread_id = Some(thread_id);
-                    ui.status_message = Some("thread resumed".to_string());
-                } else {
-                    ui.status_message = Some("resume returned no thread id".to_string());
-                }
+                self.app_event_tx.send(AppEvent::ResumeSession);
                 return Ok(LiveTuiAction::Continue);
             }
             _ => {}
         }
 
         if let Some(rest) = trimmed.strip_prefix("/approve") {
-            return handle_app_server_approval_decision(
-                &mut self.state,
-                self.widget.ui_mut(),
-                rest.trim(),
-                true,
-            )
-            .map(|_| LiveTuiAction::Continue);
+            self.app_event_tx.send(AppEvent::ApprovalDecision {
+                arg: rest.trim().to_string(),
+                approve: true,
+            });
+            return Ok(LiveTuiAction::Continue);
         }
         if let Some(rest) = trimmed.strip_prefix("/deny") {
-            return handle_app_server_approval_decision(
-                &mut self.state,
-                self.widget.ui_mut(),
-                rest.trim(),
-                false,
-            )
-            .map(|_| LiveTuiAction::Continue);
+            self.app_event_tx.send(AppEvent::ApprovalDecision {
+                arg: rest.trim().to_string(),
+                approve: false,
+            });
+            return Ok(LiveTuiAction::Continue);
         }
 
         if let Some(command) = trimmed
@@ -519,18 +584,6 @@ fn handle_app_server_approval_decision(
     Ok(())
 }
 
-pub(crate) fn poll_app_server_tui_stream_updates(
-    state: &CliState,
-    ui: &mut LiveAttachTui,
-) -> Result<bool> {
-    let events = stream_events(state, ui.last_sequence)?;
-    if events.is_empty() {
-        return Ok(false);
-    }
-    ui.apply_rpc_stream_events(&events);
-    Ok(true)
-}
-
 // ---------------------------------------------------------------------------
 // Utility functions
 // ---------------------------------------------------------------------------
@@ -548,14 +601,6 @@ fn truncate_for_width(text: &str, width: usize) -> String {
     let mut truncated = text.chars().take(width - 3).collect::<String>();
     truncated.push_str("...");
     truncated
-}
-
-fn error_chain_summary(error: &anyhow::Error) -> String {
-    error
-        .chain()
-        .map(|cause| cause.to_string())
-        .collect::<Vec<_>>()
-        .join(": ")
 }
 
 pub(crate) fn align_left_right(left: &str, right: &str, width: usize) -> String {

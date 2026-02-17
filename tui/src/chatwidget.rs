@@ -1,5 +1,4 @@
 use crate::app::align_left_right;
-use crate::app::poll_app_server_tui_stream_updates;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
@@ -820,10 +819,6 @@ impl ChatWidget {
 
     pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         self.ui.draw(terminal)
-    }
-
-    pub(crate) fn poll_stream_updates(&mut self, state: &CliState) -> Result<bool> {
-        poll_app_server_tui_stream_updates(state, &mut self.ui)
     }
 }
 

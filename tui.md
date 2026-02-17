@@ -99,6 +99,11 @@ Execution order to finish full port:
 - [x] Added upstream-style internal `AppEvent` dispatch queue in `App` (`AppEventSender` + receiver drain in main loop).
 - [x] Centralized Enter submit path through `AppEvent::SubmitInput` -> `App::handle_submit` for app-runner flow.
 - [x] Removed duplicate legacy key/submit path from `app.rs`; app runtime now has a single active submit/action route.
+- [x] Routed stream polling through `AppEvent::Tick` -> `AppEvent::StreamUpdate` queue handling (removed direct widget polling path).
+- [x] `/new` and `/interrupt` submit commands now enqueue app events instead of recursively calling handlers.
+- [x] `/resume`, `/approve`, `/deny`, and `/refresh` now dispatch through explicit app events (`ResumeSession`, `ApprovalDecision`, `Tick`) instead of inline side effects.
+- [x] Event-loop queue draining deduplicated into a single helper to keep loop scheduling flow centralized.
+- [x] Ctrl-C and `/exit`/`/quit` now route through `AppEvent::Exit` dispatch; tick stream poll failures now set status and continue instead of aborting the TUI loop.
 - [ ] Remove `codex-core` calls from `app.rs`; route backend operations through `core_compat.rs`.
 - [ ] Preserve upstream app event handling order and redraw scheduling.
 - [ ] Preserve upstream overlays/pickers mode transitions.
@@ -160,6 +165,7 @@ Execution order to finish full port:
 - `tui/src/app.rs` now uses an internal event queue similar to upstream app-event dispatch and drains queued events each loop iteration.
 - App submit handling in the app runtime is now single-path (`Enter` queues `SubmitInput`, handled by `App::handle_submit`) to reduce duplicated behavior drift.
 - Removed now-unused alternate `ChatWidget::on_event` bridge that relied on deleted legacy key/submit helpers.
+- Stream ingestion now follows the same app-event pipeline (`Tick` polls stream, emits `StreamUpdate`, applies in `handle_event`), matching upstream central dispatch style.
 - `tui/src/tui.rs` and `tui/src/notifications/mod.rs` now match upstream exactly.
 - `tui/src/insert_history.rs` now matches upstream exactly.
 - `lib.rs` now provides an expanded compatibility surface so upstream `history_cell` / `exec_cell` / `status` compile while transport remains app-server driven.

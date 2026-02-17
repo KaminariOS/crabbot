@@ -553,6 +553,15 @@ pub(crate) enum AppEvent {
     /// Request to interrupt the active turn.
     Interrupt,
 
+    /// Request to resume the current thread/session.
+    ResumeSession,
+
+    /// Request to resolve a pending approval (optionally by explicit key).
+    ApprovalDecision {
+        arg: String,
+        approve: bool,
+    },
+
     /// Request to exit the application.
     Exit(ExitMode),
 }
