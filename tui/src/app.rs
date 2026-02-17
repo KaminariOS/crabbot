@@ -168,6 +168,7 @@ impl App {
                 thread::sleep(Duration::from_millis(5));
                 continue;
             }
+            let _ = self.widget.ui_mut().commit_assistant_stream_tick();
             self.widget.draw(terminal)?;
             let mut should_redraw = false;
 

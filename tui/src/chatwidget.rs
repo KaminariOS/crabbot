@@ -246,9 +246,7 @@ impl LiveAttachTui {
         if delta.is_empty() {
             return;
         }
-        if self.assistant_stream.push(delta) {
-            self.drain_assistant_stream();
-        }
+        self.assistant_stream.push(delta);
     }
 
     fn flush_assistant_message(&mut self) {
@@ -257,11 +255,13 @@ impl LiveAttachTui {
         }
     }
 
-    fn drain_assistant_stream(&mut self) {
-        let (cell, _idle) = self.assistant_stream.on_commit_tick_batch(usize::MAX);
+    pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
+        let (cell, _idle) = self.assistant_stream.on_commit_tick();
         if let Some(cell) = cell {
             self.history_cells.push(cell);
+            return true;
         }
+        false
     }
 
     pub(crate) fn input_insert_str(&mut self, text: &str) {
