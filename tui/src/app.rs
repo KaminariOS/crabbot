@@ -214,6 +214,14 @@ impl App {
             let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
             let in_paste_burst = self.widget.ui_mut().bottom_pane_is_in_paste_burst();
             let _ = self.widget.ui_mut().commit_assistant_stream_tick();
+            let history_width = tui.terminal.size()?.width;
+            let new_history_lines = self
+                .widget
+                .ui_mut()
+                .take_new_history_lines_for_scrollback(history_width);
+            if !new_history_lines.is_empty() {
+                tui.insert_history_lines(new_history_lines);
+            }
             let width = tui.terminal.size()?.width;
             let desired_height = self.widget.desired_height(width);
             tui.draw(desired_height, |frame| {

@@ -98,6 +98,7 @@ fn pad_line_to_width(mut line: Line<'static>, width: u16) -> Line<'static> {
 pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     history_cells: Vec<Box<dyn HistoryCell>>,
+    history_cells_flushed_to_scrollback: usize,
     adaptive_chunking: AdaptiveChunkingPolicy,
     assistant_stream: StreamController,
     pub(crate) input: String,
@@ -136,6 +137,7 @@ impl LiveAttachTui {
         Self {
             session_id,
             history_cells: Vec::new(),
+            history_cells_flushed_to_scrollback: 0,
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             assistant_stream: StreamController::new(None),
             input: String::new(),
@@ -1011,6 +1013,26 @@ impl LiveAttachTui {
         self.history_cells.push(cell);
     }
 
+    pub(crate) fn take_new_history_lines_for_scrollback(
+        &mut self,
+        width: u16,
+    ) -> Vec<Line<'static>> {
+        if self.history_cells_flushed_to_scrollback >= self.history_cells.len() {
+            return Vec::new();
+        }
+
+        let mut lines = Vec::new();
+        for cell in self
+            .history_cells
+            .iter()
+            .skip(self.history_cells_flushed_to_scrollback)
+        {
+            lines.extend(cell.display_lines(width));
+        }
+        self.history_cells_flushed_to_scrollback = self.history_cells.len();
+        lines
+    }
+
     pub(crate) fn set_skills(
         &mut self,
         skills: Option<Vec<codex_core::skills::model::SkillMetadata>>,
@@ -1089,7 +1111,11 @@ impl LiveAttachTui {
                 " - review any changes and find issues".dim(),
             ]));
         }
-        for cell in &self.history_cells {
+        for cell in self
+            .history_cells
+            .iter()
+            .skip(self.history_cells_flushed_to_scrollback)
+        {
             lines.extend(cell.display_lines(width));
         }
         if lines.is_empty() {
