@@ -12,6 +12,7 @@ use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell::new_error_event;
 use crate::history_cell::new_info_event;
 use crate::history_cell::new_user_prompt;
 use crate::key_hint;
@@ -219,9 +220,18 @@ impl LiveAttachTui {
 
     pub(crate) fn push_line(&mut self, line: &str) {
         self.flush_assistant_message();
-        self.history_cells.push(Box::new(PlainHistoryCell::new(vec![
-            line.to_string().into(),
-        ])));
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("[error") || trimmed.starts_with("error:") {
+            self.history_cells
+                .push(Box::new(new_error_event(line.to_string())));
+        } else if trimmed.starts_with('[') && trimmed.ends_with(']') {
+            self.history_cells
+                .push(Box::new(new_info_event(line.to_string(), None)));
+        } else {
+            self.history_cells.push(Box::new(PlainHistoryCell::new(vec![
+                line.to_string().into(),
+            ])));
+        }
     }
 
     pub(crate) fn push_user_prompt(&mut self, prompt: &str) {
