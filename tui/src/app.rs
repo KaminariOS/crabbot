@@ -14,6 +14,7 @@ pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::interrupt_turn;
 pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread;
+pub(super) use crate::core_compat::set_thread_name;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements;
 pub(super) use crate::core_compat::stream_events;
@@ -598,10 +599,11 @@ impl App {
                         .ui_mut()
                         .push_line("[info] usage: /rename <thread-name>");
                 } else {
-                    self.widget.ui_mut().push_line(&format!(
-                        "[info] rename is not yet ported to app-server api: {}",
-                        arg.trim()
-                    ));
+                    let thread_id = self.widget.ui_mut().session_id.clone();
+                    set_thread_name(&self.state, &thread_id, arg.trim())?;
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some(format!("thread renamed to {}", arg.trim())));
                 }
             }
             SlashCommand::SandboxReadRoot => {
@@ -691,9 +693,21 @@ impl App {
                     .add_history_cell(Box::new(crate::history_cell::empty_mcp_output()));
             }
             SlashCommand::Rollout => {
-                self.widget
-                    .ui_mut()
-                    .push_line("Rollout path is not available in app-server tui.");
+                let session_id = self.widget.ui_mut().session_id.clone();
+                match fetch_rollout_path(&self.state, &session_id) {
+                    Ok(Some(path)) => self
+                        .widget
+                        .ui_mut()
+                        .push_line(&format!("Current rollout path: {path}")),
+                    Ok(None) => self
+                        .widget
+                        .ui_mut()
+                        .push_line("Rollout path is not available yet."),
+                    Err(err) => self
+                        .widget
+                        .ui_mut()
+                        .push_line(&format!("Failed to read rollout path: {err}")),
+                }
             }
             _ => {
                 let _ = arg;
@@ -1438,6 +1452,24 @@ fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnap
         })
         .collect();
     Ok(crate::app_event::ConnectorsSnapshot { connectors })
+}
+
+fn fetch_rollout_path(state: &CliState, thread_id: &str) -> Result<Option<String>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/read",
+        json!({
+            "threadId": thread_id,
+            "includeTurns": false,
+        }),
+    )?;
+    Ok(response
+        .result
+        .get("thread")
+        .and_then(|thread| thread.get("path"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string))
 }
 
 fn run_diff_now() -> String {

@@ -760,6 +760,19 @@ pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<
     Ok(extract_thread_id_from_rpc_result(&response.result))
 }
 
+pub(crate) fn set_thread_name(state: &CliState, thread_id: &str, name: &str) -> Result<()> {
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/name/set",
+        json!({
+            "threadId": thread_id,
+            "name": name,
+        }),
+    )?;
+    Ok(())
+}
+
 pub(crate) fn respond_to_approval(
     state: &CliState,
     request_id: Value,
