@@ -24,6 +24,8 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", default-features = true }
 strum = "0.27.2"
 strum_macros = "0.27.2"
 tokio = { workspace = true, features = ["process"] }
@@ -45,6 +47,9 @@ tempfile = "3"
 diffy = "0.4.2"
 pathdiff = "0.2.3"
 dirs = "6.0.0"
+uuid = { version = "1.21.0", features = ["v4"] }
+tungstenite = "0.28.0"
+url.workspace = true
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

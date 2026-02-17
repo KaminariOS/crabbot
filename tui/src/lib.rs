@@ -5,9 +5,7 @@ use anyhow::bail;
 use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
 use crabbot_protocol::DaemonRpcNotification;
-use crabbot_protocol::DaemonRpcRequest;
 use crabbot_protocol::DaemonRpcRequestResponse;
-use crabbot_protocol::DaemonRpcRespondRequest;
 use crabbot_protocol::DaemonRpcStreamEnvelope;
 use crabbot_protocol::DaemonRpcStreamEvent;
 use crabbot_protocol::DaemonSessionStatusResponse;
@@ -47,18 +45,34 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::VecDeque;
 use std::env;
 use std::io::IsTerminal;
 use std::io::{self};
+use std::net::TcpStream;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 use std::process::Stdio;
+use std::sync::LazyLock;
+use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use tungstenite::Error as WsError;
+use tungstenite::Message as WsMessage;
+use tungstenite::WebSocket;
+use tungstenite::client::IntoClientRequest;
+use tungstenite::connect;
+use tungstenite::stream::MaybeTlsStream;
+use url::Url;
 
+extern crate self as codex_chatgpt;
 extern crate self as codex_core;
+extern crate self as codex_file_search;
+extern crate self as codex_protocol;
+extern crate self as codex_utils_approval_presets;
+extern crate self as codex_utils_cli;
 
 pub mod config {
     pub mod types {
@@ -235,6 +249,99 @@ pub mod protocol {
         UserInput { items: Vec<serde_json::Value> },
         Shutdown,
     }
+
+    /// Approval policy.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum AskForApproval {
+        UnlessTrusted,
+        OnFailure,
+        #[default]
+        OnRequest,
+        Never,
+    }
+
+    impl std::fmt::Display for AskForApproval {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                AskForApproval::UnlessTrusted => write!(f, "untrusted"),
+                AskForApproval::OnFailure => write!(f, "on-failure"),
+                AskForApproval::OnRequest => write!(f, "on-request"),
+                AskForApproval::Never => write!(f, "never"),
+            }
+        }
+    }
+
+    /// Event from the agent.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Event {
+        pub id: String,
+        pub msg: EventMsg,
+    }
+
+    /// Response event payload.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    #[allow(dead_code)]
+    pub enum EventMsg {
+        Error { message: String },
+        AgentMessage { text: String },
+        TaskComplete,
+        Other(serde_json::Value),
+    }
+
+    /// Rate limit snapshot.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RateLimitSnapshot {
+        pub limit_id: Option<String>,
+        pub limit_name: Option<String>,
+    }
+
+    /// MCP request identifier.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(untagged)]
+    pub enum RequestId {
+        String(String),
+    }
+
+    impl std::fmt::Display for RequestId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                RequestId::String(s) => f.write_str(s),
+            }
+        }
+    }
+
+    /// Network approval protocol.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum NetworkApprovalProtocol {
+        Http,
+        Https,
+    }
+
+    /// Network approval context.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct NetworkApprovalContext {
+        pub host: String,
+        pub protocol: NetworkApprovalProtocol,
+    }
+
+    /// Exec policy amendment.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ExecPolicyAmendment {
+        pub command: Vec<String>,
+    }
+
+    impl ExecPolicyAmendment {
+        pub fn new(command: Vec<String>) -> Self {
+            Self { command }
+        }
+
+        pub fn command(&self) -> &[String] {
+            &self.command
+        }
+    }
 }
 
 pub mod git_info {
@@ -273,9 +380,308 @@ pub mod parse_command {
     }
 }
 
+pub mod features {
+    /// Feature flags.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+    #[allow(dead_code)]
+    pub enum Feature {
+        GhostCommit,
+        ShellTool,
+        JsRepl,
+        UnifiedExec,
+        ApplyPatchFreeform,
+        WebSearchRequest,
+        WebSearchCached,
+        SearchTool,
+        UseLinuxSandboxBwrap,
+        RequestRule,
+        WindowsSandbox,
+        WindowsSandboxElevated,
+    }
+
+    /// Feature spec for tooltip announcements.
+    pub struct FeatureSpec {
+        pub feature: Feature,
+        pub stage: FeatureStage,
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    pub enum FeatureStage {
+        Stable,
+        Experimental(&'static str),
+    }
+
+    impl FeatureStage {
+        pub fn experimental_announcement(&self) -> Option<&'static str> {
+            match self {
+                FeatureStage::Experimental(msg) => Some(msg),
+                _ => None,
+            }
+        }
+    }
+
+    /// Static feature list (empty in stub — features are server-side in crabbot).
+    pub static FEATURES: &[FeatureSpec] = &[];
+}
+
+// ---------------------------------------------------------------------------
+// External crate stub modules
+// ---------------------------------------------------------------------------
+
+/// Stub backing `codex_chatgpt::connectors`.
+mod codex_chatgpt_stub {
+    pub mod connectors {
+        /// App connector info.
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub struct AppInfo {
+            pub id: String,
+            pub name: String,
+            pub description: Option<String>,
+            pub logo_url: Option<String>,
+            pub logo_url_dark: Option<String>,
+            pub distribution_channel: Option<String>,
+            pub install_url: Option<String>,
+            #[serde(default)]
+            pub is_accessible: bool,
+        }
+    }
+}
+pub use codex_chatgpt_stub::connectors;
+
+/// Stub backing `codex_file_search`.
+mod codex_file_search_stub {
+    use serde::Deserialize;
+    use serde::Serialize;
+    use std::path::PathBuf;
+
+    /// File match result.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct FileMatch {
+        pub score: u32,
+        pub path: PathBuf,
+        pub root: PathBuf,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub indices: Option<Vec<u32>>,
+    }
+
+    impl FileMatch {
+        pub fn full_path(&self) -> PathBuf {
+            self.root.join(&self.path)
+        }
+    }
+
+    /// Options for creating a file search session.
+    #[derive(Debug, Clone, Default)]
+    pub struct FileSearchOptions {
+        pub compute_indices: bool,
+    }
+
+    /// File search snapshot.
+    #[derive(Debug, Clone)]
+    pub struct FileSearchSnapshot {
+        pub query: String,
+        pub matches: Vec<FileMatch>,
+    }
+
+    /// Trait for receiving search updates.
+    pub trait SessionReporter: Send + Sync + 'static {
+        fn on_update(&self, snapshot: &FileSearchSnapshot);
+        fn on_complete(&self);
+    }
+
+    /// Active file search session handle.
+    pub struct FileSearchSession {
+        _private: (),
+    }
+
+    impl FileSearchSession {
+        pub fn update_query(&self, _query: &str) {}
+    }
+
+    /// Create a file search session.
+    pub fn create_session(
+        _roots: Vec<PathBuf>,
+        _options: FileSearchOptions,
+        _reporter: std::sync::Arc<dyn SessionReporter>,
+        _cancel: Option<()>,
+    ) -> Result<FileSearchSession, String> {
+        Err("file search not implemented in crabbot stub".into())
+    }
+}
+pub use codex_file_search_stub::FileMatch;
+pub use codex_file_search_stub::FileSearchOptions;
+pub use codex_file_search_stub::FileSearchSession;
+pub use codex_file_search_stub::FileSearchSnapshot;
+pub use codex_file_search_stub::SessionReporter;
+pub use codex_file_search_stub::create_session;
+
+/// Stub backing `codex_protocol`.
+mod codex_protocol_stub {
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    /// Thread identifier.
+    #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+    pub struct ThreadId {
+        uuid: String,
+    }
+
+    impl ThreadId {
+        pub fn new() -> Self {
+            Self {
+                uuid: uuid::Uuid::new_v4().to_string(),
+            }
+        }
+    }
+
+    impl Default for ThreadId {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl std::fmt::Display for ThreadId {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(&self.uuid)
+        }
+    }
+
+    pub mod openai_models {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum ReasoningEffort {
+            None,
+            Minimal,
+            Low,
+            #[default]
+            Medium,
+            High,
+            XHigh,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct ModelPreset {
+            pub id: String,
+            pub model: String,
+            pub display_name: String,
+            pub description: String,
+            pub default_reasoning_effort: ReasoningEffort,
+            #[serde(default)]
+            pub supported_reasoning_efforts: Vec<ReasoningEffortPreset>,
+            #[serde(default)]
+            pub supports_personality: bool,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct ReasoningEffortPreset {
+            pub effort: ReasoningEffort,
+            pub label: String,
+        }
+    }
+
+    pub mod config_types {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum Personality {
+            #[default]
+            None,
+            Friendly,
+            Pragmatic,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct CollaborationModeMask {
+            pub name: String,
+            pub mode: Option<ModeKind>,
+            pub model: Option<String>,
+            pub reasoning_effort: Option<Option<super::openai_models::ReasoningEffort>>,
+            pub developer_instructions: Option<Option<String>>,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum ModeKind {
+            Code,
+            Chat,
+            Ask,
+        }
+    }
+
+    pub mod account {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "lowercase")]
+        pub enum PlanType {
+            Free,
+            Go,
+            Plus,
+            Pro,
+            Team,
+            Business,
+            Enterprise,
+        }
+    }
+}
+pub use codex_protocol_stub::*;
+
+/// Stub backing `codex_utils_approval_presets`.
+mod codex_utils_approval_presets_stub {
+    use crate::protocol::AskForApproval;
+    use crate::protocol::SandboxPolicy;
+
+    /// Approval preset pairing approval + sandbox policies.
+    #[derive(Debug, Clone)]
+    pub struct ApprovalPreset {
+        pub id: &'static str,
+        pub label: &'static str,
+        pub description: &'static str,
+        pub approval: AskForApproval,
+        pub sandbox: SandboxPolicy,
+    }
+}
+pub use codex_utils_approval_presets_stub::ApprovalPreset;
+
+/// Stub backing `codex_utils_cli`.
+mod codex_utils_cli_stub {
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum ApprovalModeCliArg {
+        OnFailure,
+        UnlessTrusted,
+        OnRequest,
+        Never,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum SandboxModeCliArg {
+        DangerFullAccess,
+        ReadOnly,
+        WorkspaceWrite,
+    }
+
+    #[derive(Debug, Clone, Default)]
+    pub struct CliConfigOverrides {
+        pub model_provider: Option<String>,
+    }
+}
+pub use codex_utils_cli_stub::ApprovalModeCliArg;
+pub use codex_utils_cli_stub::CliConfigOverrides;
+pub use codex_utils_cli_stub::SandboxModeCliArg;
+
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
-const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
 const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const TUI_COMPOSER_PROMPT: &str = "\u{203a} ";
 const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
@@ -342,8 +748,13 @@ struct ConfigSetArgs {
 
 mod additional_dirs;
 mod app;
+mod app_event;
+mod app_event_sender;
 mod ascii_animation;
+#[path = "bottom_pane_stub.rs"]
+mod bottom_pane;
 mod chatwidget;
+mod cli;
 mod color;
 mod core_compat;
 mod custom_terminal;
@@ -351,8 +762,11 @@ mod cwd_prompt;
 mod diff_render;
 mod exec_command;
 mod external_editor;
+mod file_search;
 mod frames;
 mod get_git_diff;
+#[path = "history_cell_stub.rs"]
+mod history_cell;
 mod insert_history;
 mod key_hint;
 pub mod live_wrap;
@@ -364,6 +778,7 @@ mod model_migration;
 mod notifications;
 mod render;
 mod selection_list;
+mod session_log;
 mod shimmer;
 mod slash_command;
 #[path = "bottom_pane/slash_commands.rs"]
@@ -585,6 +1000,16 @@ fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
 }
 
 fn ensure_daemon_ready(state: &CliState) -> Result<()> {
+    if app_server_ws_url(&state.config.daemon_endpoint).is_ok() {
+        with_app_server_ws_client(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+            |_| Ok(()),
+        )
+        .context("ensure websocket app-server is reachable")?;
+        return Ok(());
+    }
+
     if daemon_is_healthy(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
@@ -807,26 +1232,237 @@ fn daemon_get_session_status(
         .context("parse daemon status response")
 }
 
+static APP_SERVER_WS_CLIENT: LazyLock<Mutex<Option<AppServerWsClient>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+struct AppServerWsClient {
+    ws_url: String,
+    auth_token: Option<String>,
+    socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    next_request_id: i64,
+    next_sequence: u64,
+    buffered_events: VecDeque<DaemonRpcStreamEnvelope>,
+}
+
+impl AppServerWsClient {
+    fn connect(ws_url: String, auth_token: Option<String>) -> Result<Self> {
+        let mut request = ws_url
+            .clone()
+            .into_client_request()
+            .context("build websocket request")?;
+        if let Some(token) = auth_token.as_deref() {
+            let header_value = format!("Bearer {token}")
+                .parse()
+                .context("parse auth header for websocket request")?;
+            request.headers_mut().insert("Authorization", header_value);
+        }
+
+        let (socket, _response) = connect(request).context("connect websocket app-server")?;
+        let mut client = Self {
+            ws_url,
+            auth_token,
+            socket,
+            next_request_id: 1,
+            next_sequence: 1,
+            buffered_events: VecDeque::new(),
+        };
+        client.initialize()?;
+        Ok(client)
+    }
+
+    fn matches(&self, ws_url: &str, auth_token: Option<&str>) -> bool {
+        self.ws_url == ws_url && self.auth_token.as_deref() == auth_token
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let _ = self.request(
+            "initialize",
+            json!({
+                "clientInfo": {
+                    "name": "crabbot_tui",
+                    "title": "Crabbot TUI",
+                    "version": "0.1.0",
+                }
+            }),
+        )?;
+        self.send_json(&json!({ "method": "initialized" }))
+    }
+
+    fn send_json(&mut self, payload: &Value) -> Result<()> {
+        self.socket
+            .send(WsMessage::Text(payload.to_string().into()))
+            .context("send websocket app-server json payload")
+    }
+
+    fn read_text_with_timeout(&mut self, timeout: Duration) -> Result<Option<String>> {
+        // Non-plain transports (e.g. TLS) may ignore this fast-poll timeout.
+        if let MaybeTlsStream::Plain(stream) = self.socket.get_mut() {
+            let _ = stream.set_read_timeout(Some(timeout));
+        }
+
+        loop {
+            match self.socket.read() {
+                Ok(WsMessage::Text(text)) => return Ok(Some(text.to_string())),
+                Ok(WsMessage::Binary(_)) => continue,
+                Ok(WsMessage::Ping(payload)) => {
+                    self.socket
+                        .send(WsMessage::Pong(payload))
+                        .context("reply websocket ping")?;
+                }
+                Ok(WsMessage::Pong(_)) => {}
+                Ok(WsMessage::Frame(_)) => {}
+                Ok(WsMessage::Close(frame)) => {
+                    let reason = frame
+                        .as_ref()
+                        .map(|f| f.reason.to_string())
+                        .unwrap_or_else(|| "no reason".to_string());
+                    bail!("websocket app-server closed connection: {reason}");
+                }
+                Err(WsError::Io(err))
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    return Ok(None);
+                }
+                Err(WsError::ConnectionClosed | WsError::AlreadyClosed) => {
+                    bail!("websocket app-server connection closed")
+                }
+                Err(err) => bail!("read websocket app-server message: {err}"),
+            }
+        }
+    }
+
+    fn ingest_wire_line(&mut self, raw_line: &str) -> Result<()> {
+        if let Some(envelope) =
+            crate::core_compat::decode_app_server_wire_line(raw_line, self.next_sequence)?
+        {
+            self.next_sequence = self.next_sequence.max(envelope.sequence.saturating_add(1));
+            self.buffered_events.push_back(envelope);
+        }
+        Ok(())
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<DaemonRpcRequestResponse> {
+        let request_id = json!(self.next_request_id);
+        self.next_request_id += 1;
+        self.send_json(&json!({
+            "id": request_id,
+            "method": method,
+            "params": params,
+        }))?;
+
+        let deadline = Instant::now() + DAEMON_PROMPT_REQUEST_TIMEOUT;
+        while Instant::now() < deadline {
+            let Some(raw_line) = self.read_text_with_timeout(Duration::from_millis(200))? else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&raw_line)
+                .with_context(|| "parse websocket app-server message while waiting response")?;
+            let is_matching_id = value.get("id") == Some(&request_id);
+            if is_matching_id && value.get("result").is_some() {
+                return Ok(DaemonRpcRequestResponse {
+                    request_id,
+                    result: value.get("result").cloned().unwrap_or(Value::Null),
+                });
+            }
+            if is_matching_id && value.get("error").is_some() {
+                bail!("websocket app-server rpc error: {}", value["error"]);
+            }
+            self.ingest_wire_line(&raw_line)?;
+        }
+
+        bail!("timed out waiting for websocket app-server rpc response")
+    }
+
+    fn respond(&mut self, request_id: Value, result: Value) -> Result<()> {
+        self.send_json(&json!({
+            "id": request_id,
+            "result": result,
+        }))
+    }
+
+    fn drain_stream_events(&mut self, since_sequence: u64) -> Result<Vec<DaemonRpcStreamEnvelope>> {
+        // Pull currently available messages without blocking the UI loop for long.
+        for _ in 0..64 {
+            let Some(raw_line) = self.read_text_with_timeout(Duration::from_millis(10))? else {
+                break;
+            };
+            self.ingest_wire_line(&raw_line)?;
+        }
+
+        let mut out = Vec::new();
+        while let Some(envelope) = self.buffered_events.pop_front() {
+            if envelope.sequence > since_sequence {
+                out.push(envelope);
+            }
+        }
+        Ok(out)
+    }
+}
+
+fn app_server_ws_url(daemon_endpoint: &str) -> Result<String> {
+    if let Ok(value) = env::var("CODEX_APP_SERVER_WS_URL")
+        && !value.trim().is_empty()
+    {
+        return Ok(value);
+    }
+    if daemon_endpoint.starts_with("ws://") || daemon_endpoint.starts_with("wss://") {
+        return Ok(daemon_endpoint.to_string());
+    }
+    let mut url = Url::parse(daemon_endpoint).context("parse daemon endpoint for websocket")?;
+    match url.scheme() {
+        "http" => {
+            let _ = url.set_scheme("ws");
+        }
+        "https" => {
+            let _ = url.set_scheme("wss");
+        }
+        other => bail!("unsupported daemon endpoint scheme for websocket: {other}"),
+    }
+    Ok(url.to_string())
+}
+
+fn with_app_server_ws_client<T, F>(
+    daemon_endpoint: &str,
+    auth_token: Option<&str>,
+    f: F,
+) -> Result<T>
+where
+    F: FnOnce(&mut AppServerWsClient) -> Result<T>,
+{
+    let ws_url = app_server_ws_url(daemon_endpoint)?;
+    let mut guard = APP_SERVER_WS_CLIENT
+        .lock()
+        .map_err(|_| anyhow!("app-server websocket client mutex poisoned"))?;
+    if guard
+        .as_ref()
+        .is_none_or(|client| !client.matches(&ws_url, auth_token))
+    {
+        *guard = Some(AppServerWsClient::connect(
+            ws_url,
+            auth_token.map(ToString::to_string),
+        )?);
+    }
+    let result = f(guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("websocket client missing after connect"))?);
+    if result.is_err() {
+        *guard = None;
+    }
+    result
+}
+
 fn daemon_app_server_rpc_request(
     daemon_endpoint: &str,
     auth_token: Option<&str>,
     method: &str,
     params: Value,
 ) -> Result<DaemonRpcRequestResponse> {
-    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
-    let url = endpoint_url(daemon_endpoint, "/v2/app-server/request");
-    let response = apply_auth(client.post(url), auth_token)
-        .json(&DaemonRpcRequest {
-            method: method.to_string(),
-            params,
-        })
-        .send()
-        .context("request daemon app-server rpc")?
-        .error_for_status()
-        .context("daemon app-server rpc returned error status")?;
-    response
-        .json::<DaemonRpcRequestResponse>()
-        .context("parse daemon app-server rpc response")
+    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+        client.request(method, params)
+    })
 }
 
 fn daemon_app_server_rpc_respond(
@@ -835,15 +1471,9 @@ fn daemon_app_server_rpc_respond(
     request_id: Value,
     result: Value,
 ) -> Result<()> {
-    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
-    let url = endpoint_url(daemon_endpoint, "/v2/app-server/respond");
-    apply_auth(client.post(url), auth_token)
-        .json(&DaemonRpcRespondRequest { request_id, result })
-        .send()
-        .context("respond daemon app-server request")?
-        .error_for_status()
-        .context("daemon app-server respond returned error status")?;
-    Ok(())
+    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+        client.respond(request_id, result)
+    })
 }
 
 fn fetch_daemon_app_server_stream(
@@ -851,27 +1481,9 @@ fn fetch_daemon_app_server_stream(
     auth_token: Option<&str>,
     since_sequence: Option<u64>,
 ) -> Result<Vec<DaemonRpcStreamEnvelope>> {
-    let client = http_client_with_timeout(TUI_STREAM_REQUEST_TIMEOUT)?;
-    let mut path = "/v2/app-server/stream".to_string();
-    if let Some(since_sequence) = since_sequence {
-        path.push_str(&format!("?since_sequence={since_sequence}"));
-    }
-    let url = endpoint_url(daemon_endpoint, &path);
-    let response = apply_auth(client.get(url), auth_token)
-        .send()
-        .context("request daemon app-server stream")?;
-    let body = response
-        .error_for_status()
-        .context("daemon app-server stream returned error status")?
-        .text()
-        .context("read daemon app-server stream body")?;
-    body.lines()
-        .filter(|line| !line.trim().is_empty())
-        .map(|line| {
-            serde_json::from_str::<DaemonRpcStreamEnvelope>(line)
-                .context("parse daemon app-server stream line")
-        })
-        .collect::<Result<Vec<_>>>()
+    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+        client.drain_stream_events(since_sequence.unwrap_or_default())
+    })
 }
 
 fn request_id_key_for_cli(request_id: &Value) -> String {

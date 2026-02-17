@@ -398,6 +398,94 @@ pub(crate) fn stream_events(
     )
 }
 
+/// Decode a single app-server wire message line into the UI stream envelope.
+///
+/// Accepts both:
+/// - Crabbot daemon stream envelopes (`DaemonRpcStreamEnvelope`)
+/// - Raw app-server JSON-RPC websocket messages (request/notification/response)
+///
+/// Responses for in-flight client requests are ignored (`Ok(None)`) because
+/// they are handled synchronously by the caller that initiated the request.
+pub(crate) fn decode_app_server_wire_line(
+    line: &str,
+    fallback_sequence: u64,
+) -> Result<Option<DaemonRpcStreamEnvelope>> {
+    #[derive(Debug, Deserialize)]
+    struct JsonRpcErrorPayload {
+        code: i64,
+        message: String,
+    }
+
+    #[derive(Debug, Deserialize)]
+    #[serde(untagged)]
+    enum WireMessage {
+        StreamEnvelope(DaemonRpcStreamEnvelope),
+        JsonRpcRequest {
+            id: Value,
+            method: String,
+            #[serde(default)]
+            params: Value,
+        },
+        JsonRpcNotification {
+            method: String,
+            #[serde(default)]
+            params: Value,
+        },
+        JsonRpcResponse {
+            id: Value,
+            #[serde(default)]
+            result: Value,
+        },
+        JsonRpcError {
+            id: Value,
+            error: JsonRpcErrorPayload,
+        },
+    }
+
+    let message = serde_json::from_str::<WireMessage>(line)
+        .with_context(|| "parse app-server wire line (daemon envelope or json-rpc)")?;
+
+    let event = match message {
+        WireMessage::StreamEnvelope(envelope) => return Ok(Some(envelope)),
+        WireMessage::JsonRpcRequest { id, method, params } => {
+            DaemonRpcStreamEvent::ServerRequest(DaemonRpcServerRequest {
+                request_id: id,
+                method,
+                params,
+            })
+        }
+        WireMessage::JsonRpcNotification { method, params } => {
+            DaemonRpcStreamEvent::Notification(DaemonRpcNotification { method, params })
+        }
+        WireMessage::JsonRpcResponse { id, result } => {
+            tracing::debug!(
+                request_id = %request_id_key_for_cli(&id),
+                has_result = !result.is_null(),
+                "ignoring app-server json-rpc response in stream adapter"
+            );
+            return Ok(None);
+        }
+        WireMessage::JsonRpcError { id, error } => {
+            tracing::warn!(
+                request_id = %request_id_key_for_cli(&id),
+                code = error.code,
+                message = %error.message,
+                "received app-server json-rpc error"
+            );
+            DaemonRpcStreamEvent::DecodeError(crabbot_protocol::DaemonRpcDecodeError {
+                raw: line.to_string(),
+                message: format!("json-rpc error {}: {}", error.code, error.message),
+            })
+        }
+    };
+
+    Ok(Some(DaemonRpcStreamEnvelope {
+        schema_version: crabbot_protocol::DAEMON_RPC_STREAM_SCHEMA_VERSION,
+        sequence: fallback_sequence,
+        event,
+    }))
+}
+
 // ---------------------------------------------------------------------------
 // Application-level event types — mirrors upstream `app_event.rs`
 // ---------------------------------------------------------------------------
@@ -488,5 +576,68 @@ impl AppEventSender {
         if let Err(e) = self.tx.send(event) {
             tracing::error!("failed to send AppEvent: {e}");
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_app_server_wire_line;
+    use super::*;
+
+    #[test]
+    fn decode_wire_line_accepts_daemon_stream_envelope() {
+        let line = r#"{"schema_version":1,"sequence":7,"event":{"type":"notification","payload":{"method":"turn/started","params":{"turn":{"id":"t_1"}}}}}"#;
+        let envelope = decode_app_server_wire_line(line, 99)
+            .expect("decode should succeed")
+            .expect("envelope should be returned");
+
+        assert_eq!(envelope.sequence, 7);
+        match envelope.event {
+            DaemonRpcStreamEvent::Notification(notification) => {
+                assert_eq!(notification.method, "turn/started");
+            }
+            _ => panic!("expected notification event"),
+        }
+    }
+
+    #[test]
+    fn decode_wire_line_maps_jsonrpc_notification() {
+        let line = r#"{"method":"item/agentMessage/delta","params":{"delta":"hello"}}"#;
+        let envelope = decode_app_server_wire_line(line, 12)
+            .expect("decode should succeed")
+            .expect("envelope should be returned");
+
+        assert_eq!(envelope.sequence, 12);
+        match envelope.event {
+            DaemonRpcStreamEvent::Notification(notification) => {
+                assert_eq!(notification.method, "item/agentMessage/delta");
+                assert_eq!(notification.params["delta"], "hello");
+            }
+            _ => panic!("expected notification event"),
+        }
+    }
+
+    #[test]
+    fn decode_wire_line_maps_jsonrpc_server_request() {
+        let line = r#"{"id":42,"method":"item/commandExecution/requestApproval","params":{"command":["ls","-la"]}}"#;
+        let envelope = decode_app_server_wire_line(line, 13)
+            .expect("decode should succeed")
+            .expect("envelope should be returned");
+
+        assert_eq!(envelope.sequence, 13);
+        match envelope.event {
+            DaemonRpcStreamEvent::ServerRequest(request) => {
+                assert_eq!(request.request_id, json!(42));
+                assert_eq!(request.method, "item/commandExecution/requestApproval");
+            }
+            _ => panic!("expected server request event"),
+        }
+    }
+
+    #[test]
+    fn decode_wire_line_ignores_jsonrpc_response() {
+        let line = r#"{"id":1,"result":{"ok":true}}"#;
+        let envelope = decode_app_server_wire_line(line, 14).expect("decode should succeed");
+        assert!(envelope.is_none());
     }
 }
