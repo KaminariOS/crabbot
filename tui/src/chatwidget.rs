@@ -648,53 +648,53 @@ impl LiveAttachTui {
     }
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let mut lines = if self.transcript.trim().is_empty() {
-            let header = SessionHeaderHistoryCell::new(
-                "gpt-5.3-codex".to_string(),
-                None,
-                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-                CODEX_CLI_VERSION,
+        let header = SessionHeaderHistoryCell::new(
+            "gpt-5.3-codex".to_string(),
+            None,
+            env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+            CODEX_CLI_VERSION,
+        );
+        let mut lines = HistoryCell::display_lines(&header, width);
+        lines.push(Line::from(""));
+        lines.push(
+            "  To get started, describe a task or try one of these commands:"
+                .dim()
+                .into(),
+        );
+        lines.push(Line::from(""));
+        lines.push(Line::from(vec![
+            "  ".into(),
+            "/init".into(),
+            " - create an AGENTS.md file with instructions for Codex".dim(),
+        ]));
+        lines.push(Line::from(vec![
+            "  ".into(),
+            "/status".into(),
+            " - show current session configuration".dim(),
+        ]));
+        lines.push(Line::from(vec![
+            "  ".into(),
+            "/permissions".into(),
+            " - choose what Codex is allowed to do".dim(),
+        ]));
+        lines.push(Line::from(vec![
+            "  ".into(),
+            "/model".into(),
+            " - choose what model and reasoning effort to use".dim(),
+        ]));
+        lines.push(Line::from(vec![
+            "  ".into(),
+            "/review".into(),
+            " - review any changes and find issues".dim(),
+        ]));
+        if !self.transcript.trim().is_empty() {
+            lines.push(Line::from(""));
+            lines.extend(
+                self.transcript
+                    .lines()
+                    .map(|line| Line::from(line.to_string())),
             );
-            let mut header_lines = HistoryCell::display_lines(&header, width);
-            header_lines.push(Line::from(""));
-            header_lines.push(
-                "  To get started, describe a task or try one of these commands:"
-                    .dim()
-                    .into(),
-            );
-            header_lines.push(Line::from(""));
-            header_lines.push(Line::from(vec![
-                "  ".into(),
-                "/init".into(),
-                " - create an AGENTS.md file with instructions for Codex".dim(),
-            ]));
-            header_lines.push(Line::from(vec![
-                "  ".into(),
-                "/status".into(),
-                " - show current session configuration".dim(),
-            ]));
-            header_lines.push(Line::from(vec![
-                "  ".into(),
-                "/permissions".into(),
-                " - choose what Codex is allowed to do".dim(),
-            ]));
-            header_lines.push(Line::from(vec![
-                "  ".into(),
-                "/model".into(),
-                " - choose what model and reasoning effort to use".dim(),
-            ]));
-            header_lines.push(Line::from(vec![
-                "  ".into(),
-                "/review".into(),
-                " - review any changes and find issues".dim(),
-            ]));
-            header_lines
-        } else {
-            self.transcript
-                .lines()
-                .map(|line| Line::from(line.to_string()))
-                .collect()
-        };
+        }
         if lines.is_empty() {
             lines.push(Line::from(""));
         }
@@ -1058,20 +1058,6 @@ fn byte_index_for_display_col(
     line_end
 }
 
-fn display_cwd_for_welcome() -> String {
-    let cwd = env::current_dir()
-        .ok()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "~".to_string());
-    let home = env::var("HOME").ok();
-    if let Some(home) = home
-        && cwd == home
-    {
-        return "~".to_string();
-    }
-    cwd
-}
-
 pub(crate) struct ChatWidget {
     ui: LiveAttachTui,
 }
@@ -1128,21 +1114,31 @@ mod tests {
     use super::LiveAttachTui;
 
     #[test]
-    fn history_view_text_shows_welcome_card_when_empty() {
+    fn history_view_lines_shows_welcome_card_when_empty() {
         let ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
-        let text = ui.history_view_text();
-        assert!(text.contains("OpenAI Codex"));
-        assert!(text.contains("model:"));
-        assert!(text.contains("directory:"));
+        let lines = ui.history_view_lines(100);
+        let rendered = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("OpenAI Codex"));
+        assert!(rendered.contains("model:"));
+        assert!(rendered.contains("directory:"));
     }
 
     #[test]
-    fn history_view_text_prefers_transcript_when_non_empty() {
+    fn history_view_lines_includes_transcript_when_non_empty() {
         let mut ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
         ui.push_line("hello");
-        let text = ui.history_view_text();
-        assert!(text.contains("hello"));
-        assert!(!text.contains("OpenAI Codex"));
+        let lines = ui.history_view_lines(100);
+        let rendered = lines
+            .into_iter()
+            .map(|line| line.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(rendered.contains("hello"));
+        assert!(rendered.contains("OpenAI Codex"));
     }
 
     #[test]
