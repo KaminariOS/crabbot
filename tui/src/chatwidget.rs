@@ -36,6 +36,7 @@ pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     transcript: String,
     history_cells: Vec<Box<dyn HistoryCell>>,
+    assistant_header_emitted: bool,
     pub(crate) input: String,
     input_cursor: usize,
     command_history: Vec<String>,
@@ -71,6 +72,7 @@ impl LiveAttachTui {
             session_id,
             transcript: String::new(),
             history_cells: Vec::new(),
+            assistant_header_emitted: false,
             input: String::new(),
             input_cursor: 0,
             command_history: Vec::new(),
@@ -153,6 +155,7 @@ impl LiveAttachTui {
             }
             UiEvent::TurnStarted(turn_id) => {
                 self.active_turn_id = Some(turn_id);
+                self.assistant_header_emitted = false;
                 self.status_message = Some("running turn...".to_string());
             }
             UiEvent::AssistantDelta { turn_id, delta } => {
@@ -174,6 +177,7 @@ impl LiveAttachTui {
             }
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
+                self.assistant_header_emitted = false;
                 self.active_turn_id = None;
                 if let Some(status) = status
                     && status != "completed"
@@ -221,6 +225,7 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn push_user_prompt(&mut self, prompt: &str) {
+        self.assistant_header_emitted = false;
         let decoded = mention_codec::decode_history_mentions(prompt);
         let display_prompt = decoded.text;
         self.history_cells.push(Box::new(new_user_prompt(
@@ -249,8 +254,10 @@ impl LiveAttachTui {
         if lines.is_empty() {
             lines.push(self.transcript.clone().into());
         }
+        let is_first_line = !self.assistant_header_emitted;
+        self.assistant_header_emitted = true;
         self.history_cells
-            .push(Box::new(AgentMessageCell::new(lines, true)));
+            .push(Box::new(AgentMessageCell::new(lines, is_first_line)));
         self.transcript.clear();
     }
 
@@ -747,7 +754,10 @@ impl LiveAttachTui {
             lines.push(Line::from(""));
             let mut live_lines = Vec::new();
             append_markdown(&self.transcript, None, &mut live_lines);
-            lines.extend(AgentMessageCell::new(live_lines, true).display_lines(width));
+            lines.extend(
+                AgentMessageCell::new(live_lines, !self.assistant_header_emitted)
+                    .display_lines(width),
+            );
         }
         if lines.is_empty() {
             lines.push(Line::from(""));
