@@ -50,11 +50,18 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::any::TypeId;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
     submitted_at: Instant,
     pub(crate) handle: thread::JoinHandle<Result<DaemonPromptResponse>>,
+}
+
+struct RunningCommand {
+    command: Vec<String>,
+    parsed_cmd: Vec<codex_protocol::parse_command::ParsedCommand>,
+    source: codex_core::protocol::ExecCommandSource,
 }
 
 struct TranscriptRenderable<'a> {
@@ -129,6 +136,7 @@ pub(crate) struct LiveAttachTui {
     token_info: Option<codex_core::protocol::TokenUsageInfo>,
     total_token_usage: codex_core::protocol::TokenUsage,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
+    running_commands: HashMap<String, RunningCommand>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
     reasoning_buffer: String,
@@ -194,6 +202,7 @@ impl LiveAttachTui {
             token_info: None,
             total_token_usage: codex_core::protocol::TokenUsage::default(),
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
+            running_commands: HashMap::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
             reasoning_buffer: String::new(),
@@ -535,6 +544,14 @@ impl LiveAttachTui {
         source: codex_core::protocol::ExecCommandSource,
     ) {
         self.flush_assistant_message();
+        self.running_commands.insert(
+            call_id.clone(),
+            RunningCommand {
+                command: command.clone(),
+                parsed_cmd: parsed.clone(),
+                source,
+            },
+        );
         if let Some(exec_cell) = self
             .active_cell
             .as_mut()
@@ -580,6 +597,7 @@ impl LiveAttachTui {
         aggregated_output: String,
         duration: Duration,
     ) {
+        let running = self.running_commands.remove(call_id);
         if let Some(exec_cell) = self
             .active_cell
             .as_mut()
@@ -614,15 +632,17 @@ impl LiveAttachTui {
             return;
         }
 
+        let (command, parsed_cmd, source) = match running {
+            Some(rc) => (rc.command, rc.parsed_cmd, rc.source),
+            None => (
+                Vec::new(),
+                Vec::new(),
+                codex_core::protocol::ExecCommandSource::Agent,
+            ),
+        };
         self.flush_active_cell();
-        let mut cell = new_active_exec_command(
-            call_id.to_string(),
-            Vec::new(),
-            Vec::new(),
-            codex_core::protocol::ExecCommandSource::Agent,
-            None,
-            true,
-        );
+        let mut cell =
+            new_active_exec_command(call_id.to_string(), command, parsed_cmd, source, None, true);
         cell.complete_call(
             call_id,
             CommandOutput {
@@ -1793,6 +1813,7 @@ impl LiveAttachTui {
         self.token_info = None;
         self.total_token_usage = codex_core::protocol::TokenUsage::default();
         self.rate_limit_snapshots_by_limit_id.clear();
+        self.running_commands.clear();
         self.agent_turn_running = false;
         self.mcp_startup_running = false;
         self.reasoning_buffer.clear();
