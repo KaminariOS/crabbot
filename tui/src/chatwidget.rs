@@ -268,6 +268,7 @@ pub(crate) struct LiveAttachTui {
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     pending_interrupts: VecDeque<QueuedUiInterrupt>,
+    local_user_message_echoes: VecDeque<String>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
     had_work_activity: bool,
@@ -348,6 +349,7 @@ impl LiveAttachTui {
             unified_exec_wait_streak: None,
             unified_exec_processes: Vec::new(),
             pending_interrupts: VecDeque::new(),
+            local_user_message_echoes: VecDeque::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
             had_work_activity: false,
@@ -652,7 +654,7 @@ impl LiveAttachTui {
                 text,
                 text_elements,
             } => {
-                if from_replay {
+                if self.should_render_user_message_event(&text, &text_elements, from_replay) {
                     self.push_user_prompt(&text, text_elements);
                 }
             }
@@ -1000,6 +1002,40 @@ impl LiveAttachTui {
             Vec::new(),
             Vec::new(),
         )));
+    }
+
+    pub(crate) fn register_local_user_message_echo(
+        &mut self,
+        text: &str,
+        text_elements: &[codex_protocol::user_input::TextElement],
+    ) {
+        const MAX_RECENT_LOCAL_ECHOES: usize = 16;
+        self.local_user_message_echoes
+            .push_back(user_message_fingerprint(text, text_elements));
+        if self.local_user_message_echoes.len() > MAX_RECENT_LOCAL_ECHOES {
+            let _ = self.local_user_message_echoes.pop_front();
+        }
+    }
+
+    fn should_render_user_message_event(
+        &mut self,
+        text: &str,
+        text_elements: &[codex_protocol::user_input::TextElement],
+        from_replay: bool,
+    ) -> bool {
+        if from_replay {
+            return true;
+        }
+        let fp = user_message_fingerprint(text, text_elements);
+        if let Some(idx) = self
+            .local_user_message_echoes
+            .iter()
+            .position(|item| *item == fp)
+        {
+            self.local_user_message_echoes.remove(idx);
+            return false;
+        }
+        true
     }
 
     pub(crate) fn append_assistant_delta(&mut self, delta: &str) {
@@ -2809,6 +2845,7 @@ impl LiveAttachTui {
         self.active_cell = None;
         self.unified_exec_wait_streak = None;
         self.clear_unified_exec_processes();
+        self.local_user_message_echoes.clear();
         self.history_cells_flushed_to_scrollback = 0;
         self.assistant_stream = StreamController::new(None);
         self.adaptive_chunking.reset();
@@ -3804,6 +3841,14 @@ fn runtime_metrics_merge(
         .responses_api_engine_service_tbt_ms
         .saturating_add(delta.responses_api_engine_service_tbt_ms);
     into
+}
+
+fn user_message_fingerprint(
+    text: &str,
+    text_elements: &[codex_protocol::user_input::TextElement],
+) -> String {
+    let elements = serde_json::to_string(text_elements).unwrap_or_default();
+    format!("{text}\n{elements}")
 }
 
 #[cfg(test)]

@@ -456,6 +456,7 @@ impl App {
                 let collaboration_mode =
                     collaboration_mode_from_mask(selected_mask, session_model, session_effort);
                 let ui = self.widget.ui_mut();
+                ui.register_local_user_message_echo(&text, &text_elements);
                 ui.push_user_prompt(&text, text_elements.clone());
                 if let Some(turn_id) = start_turn_with_elements_and_collaboration(
                     &self.state,
@@ -817,6 +818,7 @@ impl App {
                     session_effort,
                 );
                 let ui = self.widget.ui_mut();
+                ui.register_local_user_message_echo(&text, &[]);
                 ui.push_user_prompt(&text, Vec::new());
                 if let Some(turn_id) = start_turn_with_elements_and_collaboration(
                     &self.state,
