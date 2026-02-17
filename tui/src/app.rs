@@ -833,21 +833,16 @@ impl App {
             WidgetAppEvent::LaunchExternalEditor => {
                 self.launch_external_editor()?;
             }
-            WidgetAppEvent::StatusLineBranchUpdated { cwd: _, branch } => {
-                self.widget.ui_mut().set_status_message(Some(format!(
-                    "status line branch updated: {}",
-                    branch.unwrap_or_else(|| "(none)".to_string())
-                )));
+            WidgetAppEvent::StatusLineBranchUpdated { cwd, branch } => {
+                let ui = self.widget.ui_mut();
+                ui.set_status_line_branch(cwd, branch);
+                ui.refresh_status_line();
             }
-            WidgetAppEvent::StatusLineSetup { .. } => {
-                self.widget
-                    .ui_mut()
-                    .set_status_message(Some("status line updated".to_string()));
+            WidgetAppEvent::StatusLineSetup { items } => {
+                self.widget.ui_mut().setup_status_line(items);
             }
             WidgetAppEvent::StatusLineSetupCancelled => {
-                self.widget
-                    .ui_mut()
-                    .set_status_message(Some("status line setup cancelled".to_string()));
+                self.widget.ui_mut().cancel_status_line_setup();
             }
             WidgetAppEvent::FullScreenApprovalRequest(request) => {
                 self.widget
@@ -882,7 +877,7 @@ impl App {
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
             SlashCommand::Resume => self.open_resume_picker()?,
             SlashCommand::Status => self.emit_status_summary(),
-            SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(None),
+            SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(),
             SlashCommand::DebugConfig => self
                 .widget
                 .ui_mut()

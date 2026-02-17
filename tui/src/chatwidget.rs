@@ -36,12 +36,16 @@ use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
 use crate::status::RateLimitSnapshotDisplay;
+use crate::status::RateLimitWindowDisplay;
+use crate::status::format_directory_display;
+use crate::status::format_tokens_compact;
 use crate::status::rate_limit_snapshot_display_for_limit;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
 use crate::streaming::commit_tick::CommitTickScope;
 use crate::streaming::commit_tick::run_commit_tick;
 use crate::streaming::controller::StreamController;
 use crate::text_formatting;
+use crate::version::CODEX_CLI_VERSION;
 use crate::*;
 use codex_file_search::FileMatch;
 use codex_utils_fuzzy_match::fuzzy_match;
@@ -55,6 +59,8 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
+use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RateLimitErrorKind {
@@ -266,6 +272,12 @@ pub(crate) struct LiveAttachTui {
     reasoning_buffer: String,
     full_reasoning_buffer: String,
     current_rollout_path: Option<std::path::PathBuf>,
+    status_line_items: Option<Vec<String>>,
+    status_line_invalid_items_warned: bool,
+    status_line_branch: Option<String>,
+    status_line_branch_cwd: Option<PathBuf>,
+    status_line_branch_pending: bool,
+    status_line_branch_lookup_complete: bool,
 }
 
 pub(crate) struct ReviewCommitPickerEntry {
@@ -340,6 +352,12 @@ impl LiveAttachTui {
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
             current_rollout_path: None,
+            status_line_items: None,
+            status_line_invalid_items_warned: false,
+            status_line_branch: None,
+            status_line_branch_cwd: None,
+            status_line_branch_pending: false,
+            status_line_branch_lookup_complete: false,
         }
     }
 
@@ -1317,6 +1335,7 @@ impl LiveAttachTui {
         self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+        self.request_status_line_branch_refresh();
     }
 
     fn on_task_started(&mut self, turn_id: String) {
@@ -1387,6 +1406,7 @@ impl LiveAttachTui {
         self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+        self.request_status_line_branch_refresh();
 
         if let Some(status) = status
             && status != "completed"
@@ -2110,8 +2130,9 @@ impl LiveAttachTui {
         self.bottom_pane.insert_str(text);
     }
 
-    pub(crate) fn open_status_line_setup(&mut self, status_line_items: Option<&[String]>) {
-        self.bottom_pane.open_status_line_setup(status_line_items);
+    pub(crate) fn open_status_line_setup(&mut self) {
+        self.bottom_pane
+            .open_status_line_setup(self.status_line_items.as_deref());
     }
 
     pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
@@ -2690,8 +2711,13 @@ impl LiveAttachTui {
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
         self.current_rollout_path = None;
+        self.status_line_branch = None;
+        self.status_line_branch_cwd = None;
+        self.status_line_branch_pending = false;
+        self.status_line_branch_lookup_complete = false;
         self.bottom_pane.set_context_window(None, None);
         self.clear_input();
+        self.refresh_status_line();
     }
 
     pub(crate) fn take_new_history_lines_for_scrollback(
@@ -2740,6 +2766,81 @@ impl LiveAttachTui {
             .push_approval_request(request, &codex_core::features::Features::default());
     }
 
+    pub(crate) fn cancel_status_line_setup(&mut self) {
+        self.status_message = Some("status line setup cancelled".to_string());
+    }
+
+    pub(crate) fn setup_status_line(&mut self, items: Vec<crate::bottom_pane::StatusLineItem>) {
+        let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+        self.status_line_items = if ids.is_empty() { None } else { Some(ids) };
+        self.status_line_invalid_items_warned = false;
+        self.refresh_status_line();
+        self.status_message = Some("status line updated".to_string());
+    }
+
+    pub(crate) fn set_status_line_branch(&mut self, cwd: PathBuf, branch: Option<String>) {
+        if self.status_line_branch_cwd.as_ref() != Some(&cwd) {
+            self.status_line_branch_pending = false;
+            return;
+        }
+        self.status_line_branch = branch;
+        self.status_line_branch_pending = false;
+        self.status_line_branch_lookup_complete = true;
+    }
+
+    pub(crate) fn refresh_status_line(&mut self) {
+        let (items, invalid_items) = self.status_line_items_with_invalids();
+        if !invalid_items.is_empty() && !self.status_line_invalid_items_warned {
+            self.on_warning(format!(
+                "Ignored invalid status line {}.",
+                invalid_items.join(", ")
+            ));
+            self.status_line_invalid_items_warned = true;
+        }
+
+        let enabled = !items.is_empty();
+        self.bottom_pane.set_status_line_enabled(enabled);
+        if !enabled {
+            self.bottom_pane.set_status_line(None);
+            self.status_line_branch = None;
+            self.status_line_branch_pending = false;
+            self.status_line_branch_lookup_complete = false;
+            return;
+        }
+
+        let cwd = self.status_line_cwd().to_path_buf();
+        self.sync_status_line_branch_state(&cwd);
+        if items.contains(&crate::bottom_pane::StatusLineItem::GitBranch)
+            && !self.status_line_branch_lookup_complete
+        {
+            self.request_status_line_branch(cwd);
+        }
+
+        let mut parts = Vec::new();
+        for item in items {
+            if let Some(value) = self.status_line_value_for_item(&item) {
+                parts.push(value);
+            }
+        }
+
+        let line = if parts.is_empty() {
+            None
+        } else {
+            Some(Line::from(parts.join(" · ")))
+        };
+        self.bottom_pane.set_status_line(line);
+    }
+
+    fn request_status_line_branch_refresh(&mut self) {
+        let (items, _) = self.status_line_items_with_invalids();
+        if items.is_empty() || !items.contains(&crate::bottom_pane::StatusLineItem::GitBranch) {
+            return;
+        }
+        let cwd = self.status_line_cwd();
+        self.sync_status_line_branch_state(&cwd);
+        self.request_status_line_branch(cwd);
+    }
+
     fn update_task_running_state(&mut self) {
         let running = self.agent_turn_running || self.mcp_startup_running;
         self.bottom_pane.set_task_running(running);
@@ -2753,6 +2854,7 @@ impl LiveAttachTui {
             None => {
                 self.bottom_pane.set_context_window(None, None);
                 self.token_info = None;
+                self.refresh_status_line();
             }
         }
     }
@@ -2762,6 +2864,7 @@ impl LiveAttachTui {
         let used_tokens = self.context_used_tokens(&info, percent.is_some());
         self.bottom_pane.set_context_window(percent, used_tokens);
         self.token_info = Some(info);
+        self.refresh_status_line();
     }
 
     fn context_remaining_percent(
@@ -2816,6 +2919,7 @@ impl LiveAttachTui {
         } else {
             self.rate_limit_snapshots_by_limit_id.clear();
         }
+        self.refresh_status_line();
     }
 
     fn sync_bottom_pane_status(&mut self) {
@@ -2888,6 +2992,183 @@ impl LiveAttachTui {
         }
 
         Line::from(format!("{TUI_COMPOSER_PROMPT}{visible_input}"))
+    }
+
+    fn status_line_items_with_invalids(
+        &self,
+    ) -> (Vec<crate::bottom_pane::StatusLineItem>, Vec<String>) {
+        let mut items = Vec::new();
+        let mut invalid = Vec::new();
+        let Some(config_items) = self.status_line_items.as_ref() else {
+            return (items, invalid);
+        };
+        for item_id in config_items {
+            match item_id.parse::<crate::bottom_pane::StatusLineItem>() {
+                Ok(item) => items.push(item),
+                Err(_) => invalid.push(item_id.clone()),
+            }
+        }
+        (items, invalid)
+    }
+
+    fn status_line_cwd(&self) -> PathBuf {
+        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+    }
+
+    fn status_line_project_root(&self) -> Option<PathBuf> {
+        let cwd = self.status_line_cwd();
+        codex_core::git_info::get_git_repo_root(&cwd)
+    }
+
+    fn status_line_project_root_name(&self) -> Option<String> {
+        self.status_line_project_root().map(|root| {
+            root.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| root.display().to_string())
+        })
+    }
+
+    fn sync_status_line_branch_state(&mut self, cwd: &Path) {
+        if self
+            .status_line_branch_cwd
+            .as_ref()
+            .is_some_and(|cached| cached == cwd)
+        {
+            return;
+        }
+        self.status_line_branch_cwd = Some(cwd.to_path_buf());
+        self.status_line_branch = None;
+        self.status_line_branch_pending = false;
+        self.status_line_branch_lookup_complete = false;
+    }
+
+    fn request_status_line_branch(&mut self, cwd: PathBuf) {
+        if self.status_line_branch_pending {
+            return;
+        }
+        self.status_line_branch_pending = true;
+        let sender = self.bottom_pane_event_tx.clone();
+        std::thread::spawn(move || {
+            let branch = std::process::Command::new("git")
+                .args(["branch", "--show-current"])
+                .current_dir(&cwd)
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if !out.status.success() {
+                        return None;
+                    }
+                    String::from_utf8(out.stdout).ok()
+                })
+                .map(|s| s.trim().to_string())
+                .filter(|name| !name.is_empty());
+            sender.send(UiAppEvent::StatusLineBranchUpdated { cwd, branch });
+        });
+    }
+
+    fn status_line_value_for_item(
+        &self,
+        item: &crate::bottom_pane::StatusLineItem,
+    ) -> Option<String> {
+        use crate::bottom_pane::StatusLineItem;
+        match item {
+            StatusLineItem::ModelName => self
+                .active_collaboration_mask
+                .as_ref()
+                .and_then(|m| m.model.clone())
+                .or_else(|| Some("gpt-5.3-codex".to_string())),
+            StatusLineItem::ModelWithReasoning => {
+                let model = self
+                    .active_collaboration_mask
+                    .as_ref()
+                    .and_then(|m| m.model.clone())
+                    .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+                let effort = self
+                    .active_collaboration_mask
+                    .as_ref()
+                    .and_then(|m| m.reasoning_effort)
+                    .flatten()
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "none".to_string());
+                Some(format!("{model} {effort}"))
+            }
+            StatusLineItem::CurrentDir => {
+                Some(format_directory_display(&self.status_line_cwd(), None))
+            }
+            StatusLineItem::ProjectRoot => self.status_line_project_root_name(),
+            StatusLineItem::GitBranch => self.status_line_branch.clone(),
+            StatusLineItem::ContextRemaining => self
+                .status_line_context_remaining_percent()
+                .map(|v| format!("{v}% left")),
+            StatusLineItem::ContextUsed => self
+                .status_line_context_used_percent()
+                .map(|v| format!("{v}% used")),
+            StatusLineItem::FiveHourLimit => self
+                .rate_limit_snapshots_by_limit_id
+                .get("codex")
+                .or_else(|| self.rate_limit_snapshots_by_limit_id.values().next())
+                .and_then(|display| display.primary.as_ref())
+                .and_then(|window| self.status_line_limit_display(window, "5h")),
+            StatusLineItem::WeeklyLimit => self
+                .rate_limit_snapshots_by_limit_id
+                .get("codex")
+                .or_else(|| self.rate_limit_snapshots_by_limit_id.values().next())
+                .and_then(|display| display.secondary.as_ref())
+                .and_then(|window| self.status_line_limit_display(window, "weekly")),
+            StatusLineItem::CodexVersion => Some(format!("v{CODEX_CLI_VERSION}")),
+            StatusLineItem::ContextWindowSize => self
+                .status_line_context_window_size()
+                .map(|window| format!("{} window", format_tokens_compact(window))),
+            StatusLineItem::UsedTokens => Some(format!(
+                "{} used",
+                format_tokens_compact(self.status_line_total_usage().total_tokens)
+            )),
+            StatusLineItem::TotalInputTokens => Some(format!(
+                "{} in",
+                format_tokens_compact(self.status_line_total_usage().input_tokens)
+            )),
+            StatusLineItem::TotalOutputTokens => Some(format!(
+                "{} out",
+                format_tokens_compact(self.status_line_total_usage().output_tokens)
+            )),
+            StatusLineItem::SessionId => Some(self.session_id.clone()),
+        }
+    }
+
+    fn status_line_context_window_size(&self) -> Option<i64> {
+        self.token_info
+            .as_ref()
+            .and_then(|info| info.model_context_window)
+    }
+
+    fn status_line_context_remaining_percent(&self) -> Option<i64> {
+        let info = self.token_info.as_ref()?;
+        let context_window = info.model_context_window?;
+        Some(
+            info.last_token_usage
+                .percent_of_context_window_remaining(context_window),
+        )
+    }
+
+    fn status_line_context_used_percent(&self) -> Option<i64> {
+        let remaining = self.status_line_context_remaining_percent()?;
+        Some((100 - remaining).clamp(0, 100))
+    }
+
+    fn status_line_total_usage(&self) -> codex_core::protocol::TokenUsage {
+        self.total_token_usage
+    }
+
+    fn status_line_limit_display(
+        &self,
+        window: &RateLimitWindowDisplay,
+        label: &str,
+    ) -> Option<String> {
+        let left = (100.0 - window.used_percent).round().clamp(0.0, 100.0) as i64;
+        if left <= 0 {
+            return None;
+        }
+        Some(format!("{label} {left}%"))
     }
 
     pub(crate) fn footer_line_text(&self, width: usize) -> String {
