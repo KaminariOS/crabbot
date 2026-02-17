@@ -624,14 +624,17 @@ impl LiveAttachTui {
                     Some(message),
                 )));
             }
-            UiEvent::ReviewModeEntered => {
+            UiEvent::ReviewModeEntered { hint } => {
+                let banner = hint
+                    .map(|hint| format!(">> Code review started: {hint} <<"))
+                    .unwrap_or_else(|| ">> Code review started <<".to_string());
                 self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
-                    "Entered review mode".to_string(),
+                    banner,
                 )));
             }
             UiEvent::ReviewModeExited => {
                 self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
-                    "Exited review mode".to_string(),
+                    "<< Code review finished >>".to_string(),
                 )));
             }
             UiEvent::UserMessage {
@@ -657,7 +660,8 @@ impl LiveAttachTui {
                 ));
             }
             UiEvent::ShutdownComplete => {
-                self.status_message = Some("shutdown complete".to_string());
+                self.bottom_pane_event_tx
+                    .send(UiAppEvent::Exit(crate::app_event::ExitMode::Immediate));
             }
             UiEvent::TranscriptLine(line) => {
                 self.push_line(&line);

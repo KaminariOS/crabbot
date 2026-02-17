@@ -157,7 +157,9 @@ pub(crate) enum UiEvent {
     BackgroundEvent {
         message: String,
     },
-    ReviewModeEntered,
+    ReviewModeEntered {
+        hint: Option<String>,
+    },
     ReviewModeExited,
     UserMessage {
         text: String,
@@ -622,7 +624,10 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 last_agent_message,
             }]
         }
-        "thread/compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "thread/compacted" => vec![UiEvent::AssistantDelta {
+            turn_id: None,
+            delta: "Context compacted".to_string(),
+        }],
         "thread/rolledBack" | "thread/rolled_back" => notification
             .params
             .get("rollback")
@@ -1079,7 +1084,13 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 .to_string();
             vec![UiEvent::TerminalInteraction { process_id, stdin }]
         }
-        "entered_review_mode" => vec![UiEvent::ReviewModeEntered],
+        "entered_review_mode" => vec![UiEvent::ReviewModeEntered {
+            hint: msg
+                .get("user_facing_hint")
+                .or_else(|| msg.get("userFacingHint"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        }],
         "exited_review_mode" => vec![UiEvent::ReviewModeExited],
         "undo_started" => vec![UiEvent::UndoStarted { message: None }],
         "undo_completed" => vec![UiEvent::UndoCompleted { message: None }],
@@ -1111,7 +1122,10 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
         "get_history_entry_response" => parse_history_entry_response(msg)
             .map(|event| vec![event])
             .unwrap_or_default(),
-        "context_compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
+        "context_compacted" => vec![UiEvent::AssistantDelta {
+            turn_id: None,
+            delta: "Context compacted".to_string(),
+        }],
         "list_custom_prompts_response" => parse_custom_prompts_list(msg)
             .map(UiEvent::CustomPromptsListed)
             .map(|event| vec![event])
