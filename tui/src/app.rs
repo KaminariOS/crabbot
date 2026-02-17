@@ -259,6 +259,8 @@ impl App {
         match event {
             AppEvent::Key(key_event) => self.handle_key_event(key_event),
             AppEvent::Paste(pasted) => {
+                // Mirror upstream textarea behavior: normalize CR to LF for pasted text.
+                let pasted = pasted.replace('\r', "\n");
                 self.widget.ui_mut().handle_bottom_pane_paste(pasted);
                 Ok(LiveTuiAction::Continue)
             }

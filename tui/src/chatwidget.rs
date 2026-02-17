@@ -12,6 +12,7 @@ use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell::new_info_event;
 use crate::history_cell::new_user_prompt;
 use crate::key_hint;
 use crate::markdown::append_markdown;
@@ -137,12 +138,18 @@ impl LiveAttachTui {
                 if changed {
                     self.active_turn_id = None;
                     self.pending_approvals.clear();
-                    self.push_line(&format!("[thread switched] {thread_id}"));
+                    self.history_cells.push(Box::new(new_info_event(
+                        format!("[thread switched] {thread_id}"),
+                        None,
+                    )));
                 }
                 self.status_message = Some("thread started".to_string());
             }
             UiEvent::ThreadRenamed(name) => {
-                self.push_line(&format!("[thread renamed] {name}"));
+                self.history_cells.push(Box::new(new_info_event(
+                    format!("[thread renamed] {name}"),
+                    None,
+                )));
             }
             UiEvent::TurnStarted(turn_id) => {
                 self.active_turn_id = Some(turn_id);
@@ -188,12 +195,18 @@ impl LiveAttachTui {
             UiEvent::ApprovalRequired(request) => {
                 let key = request.key.clone();
                 self.pending_approvals.insert(key.clone(), request.clone());
-                self.push_line(&format!(
-                    "[approval required] request_id={key} method={}",
-                    request.method
-                ));
+                self.history_cells.push(Box::new(new_info_event(
+                    format!(
+                        "[approval required] request_id={key} method={}",
+                        request.method
+                    ),
+                    None,
+                )));
                 if let Some(reason) = &request.reason {
-                    self.push_line(&format!("reason: {reason}"));
+                    self.history_cells.push(Box::new(new_info_event(
+                        "reason".to_string(),
+                        Some(reason.clone()),
+                    )));
                 }
             }
         }
