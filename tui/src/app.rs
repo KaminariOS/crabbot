@@ -1148,9 +1148,10 @@ impl StatusRuntime {
             return (crate::AuthManager::default(), None);
         };
 
-        let Some(account) = response.result.get("account") else {
+        let account = response.result.get("account").unwrap_or(&response.result);
+        if !account.is_object() {
             return (crate::AuthManager::default(), None);
-        };
+        }
 
         let account_type = account
             .get("type")
@@ -1159,10 +1160,17 @@ impl StatusRuntime {
         if account_type.eq_ignore_ascii_case("chatgpt") {
             let email = account
                 .get("email")
+                .or_else(|| account.get("allegedUserEmail"))
+                .or_else(|| account.get("alleged_user_email"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            let plan_type =
-                parse_plan_type(account.get("planType").or_else(|| account.get("plan_type")));
+            let plan_type = parse_plan_type(
+                account
+                    .get("planType")
+                    .or_else(|| account.get("plan_type"))
+                    .or_else(|| account.get("chatgptPlanType"))
+                    .or_else(|| account.get("chatgpt_plan_type")),
+            );
             (crate::AuthManager::from_chatgpt_email(email), plan_type)
         } else if account_type.eq_ignore_ascii_case("apikey")
             || account_type.eq_ignore_ascii_case("api_key")
