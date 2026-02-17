@@ -4,6 +4,7 @@ use crate::app_event_sender::AppEventSender as UiAppEventSender;
 use crate::bottom_pane::BottomPane;
 use crate::bottom_pane::BottomPaneParams;
 use crate::bottom_pane::InputResult;
+use crate::bottom_pane::MentionBinding;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
@@ -928,6 +929,14 @@ impl LiveAttachTui {
 
     pub(crate) fn bottom_pane_composer_text(&self) -> String {
         self.bottom_pane.composer_text()
+    }
+
+    pub(crate) fn bottom_pane_insert_str(&mut self, text: &str) {
+        self.bottom_pane.insert_str(text);
+    }
+
+    pub(crate) fn take_recent_submission_mention_bindings(&mut self) -> Vec<MentionBinding> {
+        self.bottom_pane.take_recent_submission_mention_bindings()
     }
 
     fn sync_bottom_pane_status(&mut self) {

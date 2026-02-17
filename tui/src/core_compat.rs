@@ -679,6 +679,15 @@ pub(crate) fn start_thread(state: &CliState) -> Result<String> {
 }
 
 pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Result<Option<String>> {
+    start_turn_with_elements(state, thread_id, text, Vec::new())
+}
+
+pub(crate) fn start_turn_with_elements(
+    state: &CliState,
+    thread_id: &str,
+    text: &str,
+    text_elements: Vec<codex_protocol::user_input::TextElement>,
+) -> Result<Option<String>> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
@@ -689,7 +698,7 @@ pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Resul
                 {
                     "type": "text",
                     "text": text,
-                    "text_elements": []
+                    "text_elements": text_elements
                 }
             ]
         }),
@@ -882,10 +891,16 @@ pub(crate) enum AppEvent {
     StreamUpdate(Vec<DaemonRpcStreamEnvelope>),
 
     /// User submitted input from the composer.
-    SubmitInput(String),
+    SubmitInput {
+        text: String,
+        text_elements: Vec<codex_protocol::user_input::TextElement>,
+    },
 
     /// Request to start a turn for the active thread with plain text input.
-    StartTurn(String),
+    StartTurn {
+        text: String,
+        text_elements: Vec<codex_protocol::user_input::TextElement>,
+    },
 
     /// Request to start a new session / thread.
     NewSession,
