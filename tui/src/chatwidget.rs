@@ -1836,15 +1836,17 @@ impl LiveAttachTui {
     }
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
-        let header = SessionHeaderHistoryCell::new(
-            "gpt-5.3-codex".to_string(),
-            None,
-            env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            CODEX_CLI_VERSION,
-        );
-        let mut lines = HistoryCell::display_lines(&header, width);
-        let has_content = !self.history_cells.is_empty();
-        if !has_content {
+        let mut lines = Vec::new();
+        let show_welcome =
+            self.history_cells.is_empty() && self.history_cells_flushed_to_scrollback == 0;
+        if show_welcome {
+            let header = SessionHeaderHistoryCell::new(
+                "gpt-5.3-codex".to_string(),
+                None,
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                CODEX_CLI_VERSION,
+            );
+            lines.extend(HistoryCell::display_lines(&header, width));
             lines.push(Line::from(""));
             lines.push(
                 "  To get started, describe a task or try one of these commands:"
