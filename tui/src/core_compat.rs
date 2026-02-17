@@ -66,11 +66,15 @@ pub(crate) enum UiEvent {
     AgentReasoningSectionBreak,
     TurnCompleted {
         status: Option<String>,
+        last_agent_message: Option<String>,
     },
     TurnAborted {
         reason: Option<String>,
     },
     Error {
+        message: String,
+    },
+    Warning {
         message: String,
     },
     StreamError {
@@ -127,6 +131,7 @@ pub(crate) enum UiEvent {
         total_usage: codex_core::protocol::TokenUsage,
     },
     RateLimitUpdated(codex_core::protocol::RateLimitSnapshot),
+    RuntimeMetricsUpdated(codex_otel::RuntimeMetricsSummary),
     McpStartupUpdate {
         server: String,
         status: String,
@@ -173,6 +178,7 @@ pub(crate) fn map_legacy_stream_events(stream_events: &[DaemonStreamEnvelope]) -
             DaemonStreamEvent::TurnCompleted(payload) => {
                 events.push(UiEvent::TurnCompleted {
                     status: Some("completed".to_string()),
+                    last_agent_message: None,
                 });
                 if !payload.output_summary.trim().is_empty() {
                     events.push(UiEvent::TranscriptLine(format!(
@@ -518,7 +524,19 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .and_then(|turn| turn.get("status"))
                 .and_then(Value::as_str)
                 .map(ToString::to_string);
-            vec![UiEvent::TurnCompleted { status }]
+            let last_agent_message = notification
+                .params
+                .get("turn")
+                .and_then(|turn| {
+                    turn.get("lastAgentMessage")
+                        .or_else(|| turn.get("last_agent_message"))
+                })
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            vec![UiEvent::TurnCompleted {
+                status,
+                last_agent_message,
+            }]
         }
         "thread/compacted" => vec![UiEvent::TranscriptLine("Context compacted".to_string())],
         "thread/rolledBack" | "thread/rolled_back" => notification
@@ -547,6 +565,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
         }],
         "turn/failed" => vec![UiEvent::TurnCompleted {
             status: Some("failed".to_string()),
+            last_agent_message: None,
         }],
         "turn/diff/updated" => notification
             .params
@@ -574,6 +593,19 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .and_then(parse_rate_limit_snapshot)
             .map(|snapshot| vec![UiEvent::RateLimitUpdated(snapshot)])
             .unwrap_or_default(),
+        "thread/runtimeMetrics/updated" | "thread/runtime_metrics/updated" => {
+            parse_runtime_metrics_summary(
+                notification
+                    .params
+                    .get("runtimeMetrics")
+                    .or_else(|| notification.params.get("runtime_metrics"))
+                    .or_else(|| notification.params.get("summary"))
+                    .or_else(|| notification.params.get("delta"))
+                    .unwrap_or(&notification.params),
+            )
+            .map(|summary| vec![UiEvent::RuntimeMetricsUpdated(summary)])
+            .unwrap_or_default()
+        }
         "mcp/startup/update" => {
             let server = notification
                 .params
@@ -816,7 +848,11 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
         "warning" => msg
             .get("message")
             .and_then(Value::as_str)
-            .map(|message| vec![UiEvent::TranscriptLine(format!("[warning] {message}"))])
+            .map(|message| {
+                vec![UiEvent::Warning {
+                    message: message.to_string(),
+                }]
+            })
             .unwrap_or_default(),
         "error" => vec![UiEvent::Error {
             message: msg
@@ -853,7 +889,17 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
                 .and_then(Value::as_str)
                 .map(ToString::to_string)
                 .or(Some("completed".to_string())),
+            last_agent_message: msg
+                .get("last_agent_message")
+                .or_else(|| msg.get("lastAgentMessage"))
+                .or_else(|| msg.get("last_agent_response"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }],
+        "token_count" => map_codex_token_count_notification(msg),
+        "runtime_metrics_updated" | "runtime_metrics_update" => parse_runtime_metrics_summary(msg)
+            .map(|summary| vec![UiEvent::RuntimeMetricsUpdated(summary)])
+            .unwrap_or_default(),
         "turn_aborted" => vec![UiEvent::TurnAborted {
             reason: msg
                 .get("reason")
@@ -1025,6 +1071,59 @@ fn parse_token_usage_breakdown(value: &Value) -> codex_core::protocol::TokenUsag
             .and_then(Value::as_i64)
             .unwrap_or_default(),
     }
+}
+
+fn parse_runtime_metrics_summary(value: &Value) -> Option<codex_otel::RuntimeMetricsSummary> {
+    serde_json::from_value(value.clone()).ok()
+}
+
+fn map_codex_token_count_notification(msg: &Value) -> Vec<UiEvent> {
+    let info_value = msg.get("info").or_else(|| msg.get("token_usage_info"));
+    let rate_limits_value = msg.get("rate_limits").or_else(|| msg.get("rateLimits"));
+    let mut events = Vec::new();
+    if let Some(info_value) = info_value
+        && let Some((token_info, total_usage)) = parse_token_usage_updated_from_info(info_value)
+    {
+        events.push(UiEvent::TokenUsageUpdated {
+            token_info,
+            total_usage,
+        });
+    }
+    if let Some(snapshot) = rate_limits_value.and_then(parse_rate_limit_snapshot) {
+        events.push(UiEvent::RateLimitUpdated(snapshot));
+    }
+    events
+}
+
+fn parse_token_usage_updated_from_info(
+    value: &Value,
+) -> Option<(
+    codex_core::protocol::TokenUsageInfo,
+    codex_core::protocol::TokenUsage,
+)> {
+    if let Some((info, total)) = parse_token_usage_updated(value) {
+        return Some((info, total));
+    }
+    let last = value
+        .get("last_token_usage")
+        .or_else(|| value.get("lastTokenUsage"))
+        .or_else(|| value.get("last"))?;
+    let total = value
+        .get("total_token_usage")
+        .or_else(|| value.get("totalTokenUsage"))
+        .or_else(|| value.get("total"))
+        .unwrap_or(last);
+    let model_context_window = value
+        .get("model_context_window")
+        .or_else(|| value.get("modelContextWindow"))
+        .and_then(Value::as_i64);
+    Some((
+        codex_core::protocol::TokenUsageInfo {
+            last_token_usage: parse_token_usage_breakdown(last),
+            model_context_window,
+        },
+        parse_token_usage_breakdown(total),
+    ))
 }
 
 fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::RateLimitSnapshot> {

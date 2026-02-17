@@ -56,6 +56,27 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RateLimitErrorKind {
+    ServerOverloaded,
+    UsageLimit,
+    Generic,
+}
+
+fn rate_limit_error_kind(message: &str) -> Option<RateLimitErrorKind> {
+    let msg = message.to_ascii_lowercase();
+    if msg.contains("server overloaded") || msg.contains("high load") {
+        return Some(RateLimitErrorKind::ServerOverloaded);
+    }
+    if msg.contains("rate limit") || msg.contains("usage limit") {
+        return Some(RateLimitErrorKind::UsageLimit);
+    }
+    if msg.contains("limit") || msg.contains("overload") {
+        return Some(RateLimitErrorKind::Generic);
+    }
+    None
+}
+
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
     submitted_at: Instant,
@@ -240,6 +261,8 @@ pub(crate) struct LiveAttachTui {
     pending_interrupts: VecDeque<QueuedUiInterrupt>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
+    had_work_activity: bool,
+    turn_runtime_metrics: codex_otel::RuntimeMetricsSummary,
     reasoning_buffer: String,
     full_reasoning_buffer: String,
     current_rollout_path: Option<std::path::PathBuf>,
@@ -312,6 +335,8 @@ impl LiveAttachTui {
             pending_interrupts: VecDeque::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
+            had_work_activity: false,
+            turn_runtime_metrics: codex_otel::RuntimeMetricsSummary::default(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
             current_rollout_path: None,
@@ -405,14 +430,7 @@ impl LiveAttachTui {
                 )));
             }
             UiEvent::TurnStarted(turn_id) => {
-                self.active_turn_id = Some(turn_id);
-                self.adaptive_chunking.reset();
-                self.assistant_stream = StreamController::new(None);
-                self.agent_turn_running = true;
-                self.update_task_running_state();
-                self.status_message = Some("Working".to_string());
-                self.reasoning_buffer.clear();
-                self.full_reasoning_buffer.clear();
+                self.on_task_started(turn_id);
             }
             UiEvent::AssistantDelta { turn_id, delta } => {
                 let is_new_turn = if let Some(turn_id) = turn_id {
@@ -440,45 +458,25 @@ impl LiveAttachTui {
             UiEvent::AgentReasoningSectionBreak => {
                 self.on_reasoning_section_break();
             }
-            UiEvent::TurnCompleted { status } => {
-                let failed_like = status
-                    .as_deref()
-                    .is_some_and(|s| matches!(s, "failed" | "aborted" | "interrupted"));
-                if failed_like {
-                    self.finalize_turn_as_failed();
-                    if let Some(status) = status {
-                        self.status_message = Some(format!(
-                            "turn {}",
-                            text_formatting::capitalize_first(&status)
-                        ));
-                    }
-                } else {
-                    self.flush_assistant_message();
-                    self.flush_active_cell();
-                    self.flush_unified_exec_wait_streak();
-                    self.clear_unified_exec_processes();
-                    self.active_turn_id = None;
-                    self.agent_turn_running = false;
-                    self.update_task_running_state();
-                    self.reasoning_buffer.clear();
-                    self.full_reasoning_buffer.clear();
-                    if let Some(status) = status
-                        && status != "completed"
-                    {
-                        self.status_message = Some(format!(
-                            "turn {}",
-                            text_formatting::capitalize_first(&status)
-                        ));
-                    } else {
-                        self.status_message = None;
-                    }
-                }
+            UiEvent::TurnCompleted {
+                status,
+                last_agent_message,
+            } => {
+                self.on_task_complete(status, last_agent_message, from_replay);
             }
             UiEvent::TurnAborted { reason } => {
                 self.on_interrupted_turn(reason, from_replay);
             }
-            UiEvent::Error { message } => {
-                self.on_error(message);
+            UiEvent::Error { message } => match rate_limit_error_kind(&message) {
+                Some(RateLimitErrorKind::ServerOverloaded) => {
+                    self.on_server_overloaded_error(message);
+                }
+                Some(RateLimitErrorKind::UsageLimit | RateLimitErrorKind::Generic) | None => {
+                    self.on_error(message);
+                }
+            },
+            UiEvent::Warning { message } => {
+                self.on_warning(message);
             }
             UiEvent::StreamError {
                 message,
@@ -566,6 +564,9 @@ impl LiveAttachTui {
             UiEvent::RateLimitUpdated(snapshot) => {
                 self.on_rate_limit_snapshot(Some(snapshot));
             }
+            UiEvent::RuntimeMetricsUpdated(summary) => {
+                self.apply_runtime_metrics_delta(summary);
+            }
             UiEvent::McpStartupUpdate { server, status } => {
                 self.mcp_startup_running = true;
                 self.update_task_running_state();
@@ -627,6 +628,9 @@ impl LiveAttachTui {
             }
         }
         self.sync_bottom_pane_status();
+        if !from_replay && self.agent_turn_running {
+            self.refresh_runtime_metrics();
+        }
     }
 
     fn on_exec_approval_request_deferred(
@@ -881,6 +885,7 @@ impl LiveAttachTui {
         source: codex_core::protocol::ExecCommandSource,
     ) {
         self.flush_assistant_message();
+        self.had_work_activity = true;
         self.running_commands.insert(
             call_id.clone(),
             RunningCommand {
@@ -1106,6 +1111,7 @@ impl LiveAttachTui {
         invocation: codex_core::protocol::McpInvocation,
     ) {
         self.flush_assistant_message();
+        self.had_work_activity = true;
         self.flush_active_cell();
         self.active_cell = Some(Box::new(new_active_mcp_tool_call(
             call_id, invocation, true,
@@ -1143,6 +1149,7 @@ impl LiveAttachTui {
 
     fn on_web_search_begin(&mut self, call_id: String, query: String) {
         self.flush_assistant_message();
+        self.had_work_activity = true;
         self.flush_active_cell();
         self.active_cell = Some(Box::new(new_active_web_search_call(call_id, query, true)));
         self.bump_active_cell_revision();
@@ -1301,13 +1308,112 @@ impl LiveAttachTui {
         self.running_commands.clear();
         self.suppressed_exec_calls.clear();
         self.last_unified_wait = None;
+        self.had_work_activity = false;
+        self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+    }
+
+    fn on_task_started(&mut self, turn_id: String) {
+        if !turn_id.is_empty() {
+            self.active_turn_id = Some(turn_id);
+        }
+        self.adaptive_chunking.reset();
+        self.assistant_stream = StreamController::new(None);
+        self.agent_turn_running = true;
+        self.had_work_activity = false;
+        self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
+        self.update_task_running_state();
+        self.status_message = Some("Working".to_string());
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+    }
+
+    fn on_task_complete(
+        &mut self,
+        status: Option<String>,
+        _last_agent_message: Option<String>,
+        from_replay: bool,
+    ) {
+        let failed_like = status
+            .as_deref()
+            .is_some_and(|s| matches!(s, "failed" | "aborted" | "interrupted"));
+        if failed_like {
+            self.finalize_turn_as_failed();
+            if let Some(status) = status {
+                self.status_message = Some(format!(
+                    "turn {}",
+                    text_formatting::capitalize_first(&status)
+                ));
+            }
+            return;
+        }
+
+        self.flush_assistant_message();
+        self.flush_active_cell();
+        self.flush_unified_exec_wait_streak();
+        self.clear_unified_exec_processes();
+
+        if !from_replay {
+            let runtime_metrics = (!runtime_metrics_is_empty(&self.turn_runtime_metrics))
+                .then_some(self.turn_runtime_metrics);
+            if self.had_work_activity || runtime_metrics.is_some() {
+                let elapsed_seconds = if self.had_work_activity {
+                    self.bottom_pane
+                        .status_widget()
+                        .map(|status| status.elapsed_seconds())
+                } else {
+                    None
+                };
+                self.add_boxed_history(Box::new(crate::history_cell::FinalMessageSeparator::new(
+                    elapsed_seconds,
+                    runtime_metrics,
+                )));
+            }
+        }
+
+        self.active_turn_id = None;
+        self.agent_turn_running = false;
+        self.update_task_running_state();
+        self.running_commands.clear();
+        self.suppressed_exec_calls.clear();
+        self.last_unified_wait = None;
+        self.had_work_activity = false;
+        self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+
+        if let Some(status) = status
+            && status != "completed"
+        {
+            self.status_message = Some(format!(
+                "turn {}",
+                text_formatting::capitalize_first(&status)
+            ));
+        } else {
+            self.status_message = None;
+        }
+    }
+
+    fn on_server_overloaded_error(&mut self, message: String) {
+        self.finalize_turn_as_failed();
+        let message = if message.trim().is_empty() {
+            "Codex is currently experiencing high load.".to_string()
+        } else {
+            message
+        };
+        self.add_boxed_history(Box::new(crate::history_cell::new_warning_event(message)));
     }
 
     fn on_error(&mut self, message: String) {
         self.finalize_turn_as_failed();
         self.add_boxed_history(Box::new(new_error_event(message)));
+    }
+
+    fn on_warning(&mut self, message: impl Into<String>) {
+        self.add_boxed_history(Box::new(crate::history_cell::new_warning_event(
+            message.into(),
+        )));
     }
 
     fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
@@ -1482,6 +1588,26 @@ impl LiveAttachTui {
     pub(crate) fn on_commit_tick(&mut self) {
         self.commit_assistant_stream_tick();
     }
+
+    fn apply_runtime_metrics_delta(&mut self, delta: codex_otel::RuntimeMetricsSummary) {
+        self.turn_runtime_metrics = runtime_metrics_merge(self.turn_runtime_metrics, delta);
+        let websocket_timing_only = codex_otel::RuntimeMetricsSummary {
+            responses_api_overhead_ms: delta.responses_api_overhead_ms,
+            responses_api_inference_time_ms: delta.responses_api_inference_time_ms,
+            responses_api_engine_iapi_ttft_ms: delta.responses_api_engine_iapi_ttft_ms,
+            responses_api_engine_service_ttft_ms: delta.responses_api_engine_service_ttft_ms,
+            responses_api_engine_iapi_tbt_ms: delta.responses_api_engine_iapi_tbt_ms,
+            responses_api_engine_service_tbt_ms: delta.responses_api_engine_service_tbt_ms,
+            ..codex_otel::RuntimeMetricsSummary::default()
+        };
+        if let Some(label) = crate::history_cell::runtime_metrics_label(websocket_timing_only) {
+            self.add_boxed_history(Box::new(PlainHistoryCell::new(vec![
+                format!("• WebSocket timing: {label}").into(),
+            ])));
+        }
+    }
+
+    fn refresh_runtime_metrics(&mut self) {}
 
     pub(crate) fn apply_non_pending_thread_rollback(&mut self, num_turns: u32) -> bool {
         if num_turns == 0 {
@@ -2554,6 +2680,8 @@ impl LiveAttachTui {
         self.running_commands.clear();
         self.agent_turn_running = false;
         self.mcp_startup_running = false;
+        self.had_work_activity = false;
+        self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
         self.current_rollout_path = None;
@@ -3181,6 +3309,84 @@ fn extract_first_bold(s: &str) -> Option<String> {
         i += 1;
     }
     None
+}
+
+fn runtime_metrics_is_empty(summary: &codex_otel::RuntimeMetricsSummary) -> bool {
+    summary.tool_calls.count == 0
+        && summary.tool_calls.duration_ms == 0
+        && summary.api_calls.count == 0
+        && summary.api_calls.duration_ms == 0
+        && summary.websocket_calls.count == 0
+        && summary.websocket_calls.duration_ms == 0
+        && summary.streaming_events.count == 0
+        && summary.streaming_events.duration_ms == 0
+        && summary.websocket_events.count == 0
+        && summary.websocket_events.duration_ms == 0
+        && summary.responses_api_overhead_ms == 0
+        && summary.responses_api_inference_time_ms == 0
+        && summary.responses_api_engine_iapi_ttft_ms == 0
+        && summary.responses_api_engine_service_ttft_ms == 0
+        && summary.responses_api_engine_iapi_tbt_ms == 0
+        && summary.responses_api_engine_service_tbt_ms == 0
+}
+
+fn runtime_metrics_merge(
+    mut into: codex_otel::RuntimeMetricsSummary,
+    delta: codex_otel::RuntimeMetricsSummary,
+) -> codex_otel::RuntimeMetricsSummary {
+    into.tool_calls.count = into.tool_calls.count.saturating_add(delta.tool_calls.count);
+    into.tool_calls.duration_ms = into
+        .tool_calls
+        .duration_ms
+        .saturating_add(delta.tool_calls.duration_ms);
+    into.api_calls.count = into.api_calls.count.saturating_add(delta.api_calls.count);
+    into.api_calls.duration_ms = into
+        .api_calls
+        .duration_ms
+        .saturating_add(delta.api_calls.duration_ms);
+    into.websocket_calls.count = into
+        .websocket_calls
+        .count
+        .saturating_add(delta.websocket_calls.count);
+    into.websocket_calls.duration_ms = into
+        .websocket_calls
+        .duration_ms
+        .saturating_add(delta.websocket_calls.duration_ms);
+    into.streaming_events.count = into
+        .streaming_events
+        .count
+        .saturating_add(delta.streaming_events.count);
+    into.streaming_events.duration_ms = into
+        .streaming_events
+        .duration_ms
+        .saturating_add(delta.streaming_events.duration_ms);
+    into.websocket_events.count = into
+        .websocket_events
+        .count
+        .saturating_add(delta.websocket_events.count);
+    into.websocket_events.duration_ms = into
+        .websocket_events
+        .duration_ms
+        .saturating_add(delta.websocket_events.duration_ms);
+    into.responses_api_overhead_ms = into
+        .responses_api_overhead_ms
+        .saturating_add(delta.responses_api_overhead_ms);
+    into.responses_api_inference_time_ms = into
+        .responses_api_inference_time_ms
+        .saturating_add(delta.responses_api_inference_time_ms);
+    into.responses_api_engine_iapi_ttft_ms = into
+        .responses_api_engine_iapi_ttft_ms
+        .saturating_add(delta.responses_api_engine_iapi_ttft_ms);
+    into.responses_api_engine_service_ttft_ms = into
+        .responses_api_engine_service_ttft_ms
+        .saturating_add(delta.responses_api_engine_service_ttft_ms);
+    into.responses_api_engine_iapi_tbt_ms = into
+        .responses_api_engine_iapi_tbt_ms
+        .saturating_add(delta.responses_api_engine_iapi_tbt_ms);
+    into.responses_api_engine_service_tbt_ms = into
+        .responses_api_engine_service_tbt_ms
+        .saturating_add(delta.responses_api_engine_service_tbt_ms);
+    into
 }
 
 #[cfg(test)]
