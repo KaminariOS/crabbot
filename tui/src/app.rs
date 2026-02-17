@@ -828,8 +828,10 @@ impl App {
     fn emit_status_summary(&mut self) {
         let mut config = crate::config::Config::default();
         config.cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+        config.model = Some("gpt-5.3-codex".to_string());
+        config.model_reasoning_summary = codex_core::config::ReasoningSummary::Auto;
 
-        let auth_manager = crate::AuthManager::default();
+        let auth_manager = crate::AuthManager::from_chatgpt_email(None);
         let token_usage = codex_core::protocol::TokenUsage::default();
         let rate_limits: Vec<crate::status::RateLimitSnapshotDisplay> = Vec::new();
         let thread_id =
@@ -851,11 +853,11 @@ impl App {
             None,
             None,
             rate_limits.as_slice(),
-            None,
+            Some(codex_protocol::account::PlanType::Team),
             chrono::Local::now(),
             &model_name,
-            None,
-            None,
+            Some("Default"),
+            Some(Some(codex_protocol::openai_models::ReasoningEffort::Medium)),
         );
         self.widget.ui_mut().add_history_cell(Box::new(cell));
     }

@@ -303,14 +303,38 @@ impl AuthManager {
     pub fn auth_cached(&self) -> Option<CachedAuth> {
         self.auth.clone()
     }
+
+    pub fn from_chatgpt_email(email: Option<String>) -> Self {
+        Self {
+            auth: Some(CachedAuth {
+                mode: auth::AuthMode::Chatgpt,
+                email,
+            }),
+        }
+    }
 }
 
 pub mod project_doc {
     use crate::config::Config;
+    use std::path::Path;
     use std::path::PathBuf;
 
-    pub fn discover_project_doc_paths(_config: &Config) -> Result<Vec<PathBuf>, std::io::Error> {
-        Ok(Vec::new())
+    pub fn discover_project_doc_paths(config: &Config) -> Result<Vec<PathBuf>, std::io::Error> {
+        let mut found = Vec::new();
+        let mut current = Some(config.cwd.as_path());
+        while let Some(dir) = current {
+            let candidate = dir.join("AGENTS.md");
+            if candidate.exists() {
+                found.push(candidate);
+            }
+            current = parent(dir);
+        }
+        found.reverse();
+        Ok(found)
+    }
+
+    fn parent(path: &Path) -> Option<&Path> {
+        path.parent()
     }
 }
 
