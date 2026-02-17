@@ -1004,6 +1004,10 @@ impl LiveAttachTui {
         self.bottom_pane.take_recent_submission_mention_bindings()
     }
 
+    pub(crate) fn drain_pending_submission_state(&mut self) {
+        self.bottom_pane.drain_pending_submission_state();
+    }
+
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
     }

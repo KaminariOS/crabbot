@@ -624,6 +624,17 @@ impl App {
         args: Option<String>,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
     ) -> Result<()> {
+        if !cmd.available_during_task() && self.widget.ui_mut().bottom_pane_is_task_running() {
+            self.widget
+                .ui_mut()
+                .add_history_cell(Box::new(crate::history_cell::new_error_event(format!(
+                    "'/{}' is disabled while a task is in progress.",
+                    cmd.command()
+                ))));
+            self.widget.ui_mut().drain_pending_submission_state();
+            return Ok(());
+        }
+
         let arg = args.unwrap_or_default();
         match cmd {
             SlashCommand::Model => self.open_model_picker()?,
@@ -769,6 +780,9 @@ impl App {
             }
             SlashCommand::Clean => {
                 let thread_id = self.widget.ui_mut().session_id.clone();
+                self.widget
+                    .ui_mut()
+                    .push_line("Stopping all background terminals.");
                 match clean_background_terminals(&self.state, &thread_id) {
                     Ok(()) => self
                         .widget
