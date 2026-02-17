@@ -721,15 +721,11 @@ impl App {
                 }
             }
             SlashCommand::SandboxReadRoot => {
-                if arg.trim().is_empty() {
-                    self.widget
-                        .ui_mut()
-                        .push_line("Usage: /sandbox-add-read-dir <absolute-directory-path>");
-                } else {
-                    self.widget.ui_mut().push_line(
-                        "[info] /sandbox-add-read-dir is not yet ported in app-server tui",
-                    );
-                }
+                self.widget.ui_mut().add_history_cell(Box::new(
+                    crate::history_cell::new_error_event(
+                        "Usage: /sandbox-add-read-dir <absolute-directory-path>".to_string(),
+                    ),
+                ));
             }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
