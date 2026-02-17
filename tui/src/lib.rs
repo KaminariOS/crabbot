@@ -304,6 +304,15 @@ impl AuthManager {
         self.auth.clone()
     }
 
+    pub fn from_api_key() -> Self {
+        Self {
+            auth: Some(CachedAuth {
+                mode: auth::AuthMode::ApiKey,
+                email: None,
+            }),
+        }
+    }
+
     pub fn from_chatgpt_email(email: Option<String>) -> Self {
         Self {
             auth: Some(CachedAuth {

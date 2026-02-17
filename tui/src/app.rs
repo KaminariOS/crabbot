@@ -50,6 +50,19 @@ pub(crate) struct App {
     widget_event_rx: tokio::sync::mpsc::UnboundedReceiver<WidgetAppEvent>,
     /// Upstream-style @file search manager.
     file_search: FileSearchManager,
+    /// Runtime status data used by `/status` card rendering.
+    status_runtime: StatusRuntime,
+}
+
+#[derive(Default)]
+struct StatusRuntime {
+    token_info: Option<codex_core::protocol::TokenUsageInfo>,
+    total_token_usage: codex_core::protocol::TokenUsage,
+    rate_limit_snapshots_by_limit_id:
+        std::collections::BTreeMap<String, crate::status::RateLimitSnapshotDisplay>,
+    thread_name: Option<String>,
+    session_model: Option<String>,
+    session_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
 }
 
 struct DrainResult {
@@ -69,10 +82,12 @@ impl App {
         state.last_thread_id = Some(thread_id.clone());
 
         let mut widget = ChatWidget::new(thread_id.clone());
+        let mut status_runtime = StatusRuntime::default();
         widget.ui_mut().set_status_message(Some(status_message));
         match stream_events(&state, widget.ui_mut().last_sequence) {
             Ok(events) => {
                 if !events.is_empty() {
+                    status_runtime.apply_stream_events(&events);
                     widget.ui_mut().apply_rpc_stream_events(&events);
                 }
             }
@@ -107,6 +122,7 @@ impl App {
             app_event_rx: rx,
             widget_event_rx: widget_rx,
             file_search,
+            status_runtime,
         })
     }
 
@@ -117,6 +133,7 @@ impl App {
         mut state: CliState,
     ) -> Result<Self> {
         let mut widget = ChatWidget::new(session_id.clone());
+        let status_runtime = StatusRuntime::default();
         {
             let ui = widget.ui_mut();
             ui.latest_state = cached_session_state_label(&state, &session_id)
@@ -150,6 +167,7 @@ impl App {
             app_event_rx: rx,
             widget_event_rx: widget_rx,
             file_search,
+            status_runtime,
         })
     }
 
@@ -401,6 +419,7 @@ impl App {
             }
             AppEvent::Exit(_mode) => Ok(LiveTuiAction::Detach),
             AppEvent::StreamUpdate(envelopes) => {
+                self.status_runtime.apply_stream_events(&envelopes);
                 self.widget.ui_mut().apply_rpc_stream_events(&envelopes);
                 Ok(LiveTuiAction::Continue)
             }
@@ -828,12 +847,17 @@ impl App {
     fn emit_status_summary(&mut self) {
         let mut config = crate::config::Config::default();
         config.cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        config.model = Some("gpt-5.3-codex".to_string());
-        config.model_reasoning_summary = codex_core::config::ReasoningSummary::Auto;
-
-        let auth_manager = crate::AuthManager::from_chatgpt_email(None);
-        let token_usage = codex_core::protocol::TokenUsage::default();
-        let rate_limits: Vec<crate::status::RateLimitSnapshotDisplay> = Vec::new();
+        self.status_runtime
+            .refresh_from_server(&self.state, &mut config);
+        let (auth_manager, plan_type) = self.status_runtime.read_account(&self.state);
+        let token_info = self.status_runtime.token_info.as_ref();
+        let token_usage = &self.status_runtime.total_token_usage;
+        let rate_limits: Vec<crate::status::RateLimitSnapshotDisplay> = self
+            .status_runtime
+            .rate_limit_snapshots_by_limit_id
+            .values()
+            .cloned()
+            .collect();
         let thread_id =
             codex_protocol::ThreadId::from_string(self.widget.ui_mut().session_id.clone())
                 .ok()
@@ -842,24 +866,364 @@ impl App {
         let model_name = config
             .model
             .clone()
+            .or_else(|| self.status_runtime.session_model.clone())
             .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+        let reasoning_effort_override = Some(self.status_runtime.session_reasoning_effort);
 
         let cell = crate::status::new_status_output_with_rate_limits(
             &config,
             &auth_manager,
-            None,
-            &token_usage,
+            token_info,
+            token_usage,
             &thread_id,
-            None,
+            self.status_runtime.thread_name.clone(),
             None,
             rate_limits.as_slice(),
-            Some(codex_protocol::account::PlanType::Team),
+            plan_type,
             chrono::Local::now(),
             &model_name,
             Some("Default"),
-            Some(Some(codex_protocol::openai_models::ReasoningEffort::Medium)),
+            reasoning_effort_override,
         );
         self.widget.ui_mut().add_history_cell(Box::new(cell));
+    }
+}
+
+impl StatusRuntime {
+    fn apply_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
+        for envelope in stream_events {
+            let DaemonRpcStreamEvent::Notification(notification) = &envelope.event else {
+                continue;
+            };
+            match notification.method.as_str() {
+                "thread/name/updated" => {
+                    self.thread_name = notification
+                        .params
+                        .get("thread")
+                        .and_then(|thread| thread.get("name").or_else(|| thread.get("threadName")))
+                        .or_else(|| notification.params.get("threadName"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                }
+                "thread/tokenUsage/updated" => {
+                    if let Some((token_info, total_usage)) =
+                        parse_token_usage_updated(&notification.params)
+                    {
+                        self.token_info = Some(token_info);
+                        self.total_token_usage = total_usage;
+                    }
+                }
+                "account/rateLimits/updated" => {
+                    if let Some(snapshot) = notification
+                        .params
+                        .get("rateLimits")
+                        .or_else(|| notification.params.get("rate_limits"))
+                    {
+                        self.apply_rate_limit_snapshot(snapshot);
+                    }
+                }
+                "codex/event/session_configured" | "session/configured" => {
+                    self.session_model = notification
+                        .params
+                        .get("model")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    self.session_reasoning_effort = parse_reasoning_effort(
+                        notification
+                            .params
+                            .get("reasoningEffort")
+                            .or_else(|| notification.params.get("reasoning_effort")),
+                    );
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn refresh_from_server(&mut self, state: &CliState, config: &mut crate::config::Config) {
+        if let Ok(response) = app_server_rpc_request(
+            &state.config.app_server_endpoint,
+            state.config.auth_token.as_deref(),
+            "config/read",
+            json!({
+                "includeLayers": false,
+                "cwd": config.cwd.display().to_string(),
+            }),
+        ) {
+            if let Some(model) = response
+                .result
+                .get("config")
+                .and_then(|cfg| cfg.get("model"))
+                .and_then(Value::as_str)
+            {
+                config.model = Some(model.to_string());
+            }
+            if let Some(summary) = response
+                .result
+                .get("config")
+                .and_then(|cfg| cfg.get("modelReasoningSummary"))
+                .and_then(Value::as_str)
+            {
+                config.model_reasoning_summary = match summary.to_ascii_lowercase().as_str() {
+                    "auto" => codex_core::config::ReasoningSummary::Auto,
+                    "concise" => codex_core::config::ReasoningSummary::Concise,
+                    "detailed" => codex_core::config::ReasoningSummary::Detailed,
+                    _ => codex_core::config::ReasoningSummary::None,
+                };
+            }
+            if let Some(reasoning_effort) = parse_reasoning_effort(
+                response
+                    .result
+                    .get("config")
+                    .and_then(|cfg| cfg.get("modelReasoningEffort")),
+            ) {
+                self.session_reasoning_effort = Some(reasoning_effort);
+            }
+        }
+
+        if let Ok(response) = app_server_rpc_request(
+            &state.config.app_server_endpoint,
+            state.config.auth_token.as_deref(),
+            "account/rateLimits/read",
+            json!({}),
+        ) {
+            if let Some(by_limit_id) = response
+                .result
+                .get("rateLimitsByLimitId")
+                .and_then(Value::as_object)
+            {
+                for snapshot in by_limit_id.values() {
+                    self.apply_rate_limit_snapshot(snapshot);
+                }
+            } else if let Some(snapshot) = response
+                .result
+                .get("rateLimits")
+                .or_else(|| response.result.get("rate_limits"))
+            {
+                self.apply_rate_limit_snapshot(snapshot);
+            }
+        }
+    }
+
+    fn read_account(
+        &self,
+        state: &CliState,
+    ) -> (
+        crate::AuthManager,
+        Option<codex_protocol::account::PlanType>,
+    ) {
+        let Ok(response) = app_server_rpc_request(
+            &state.config.app_server_endpoint,
+            state.config.auth_token.as_deref(),
+            "account/read",
+            json!({
+                "refreshToken": false
+            }),
+        ) else {
+            return (crate::AuthManager::default(), None);
+        };
+
+        let Some(account) = response.result.get("account") else {
+            return (crate::AuthManager::default(), None);
+        };
+
+        let account_type = account
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        if account_type.eq_ignore_ascii_case("chatgpt") {
+            let email = account
+                .get("email")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let plan_type =
+                parse_plan_type(account.get("planType").or_else(|| account.get("plan_type")));
+            (crate::AuthManager::from_chatgpt_email(email), plan_type)
+        } else if account_type.eq_ignore_ascii_case("apikey")
+            || account_type.eq_ignore_ascii_case("api_key")
+            || account_type.eq_ignore_ascii_case("apiKey")
+        {
+            (crate::AuthManager::from_api_key(), None)
+        } else {
+            (crate::AuthManager::default(), None)
+        }
+    }
+
+    fn apply_rate_limit_snapshot(&mut self, snapshot: &Value) {
+        let Some(parsed) = parse_rate_limit_snapshot(snapshot) else {
+            return;
+        };
+        let limit_id = parsed
+            .limit_id
+            .clone()
+            .unwrap_or_else(|| "codex".to_string());
+        let limit_label = parsed
+            .limit_name
+            .clone()
+            .unwrap_or_else(|| limit_id.clone());
+        let display = crate::status::rate_limit_snapshot_display_for_limit(
+            &parsed,
+            limit_label,
+            chrono::Local::now(),
+        );
+        self.rate_limit_snapshots_by_limit_id
+            .insert(limit_id, display);
+    }
+}
+
+fn parse_token_usage_updated(
+    params: &Value,
+) -> Option<(
+    codex_core::protocol::TokenUsageInfo,
+    codex_core::protocol::TokenUsage,
+)> {
+    let token_usage = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))?;
+    let total = token_usage.get("total")?;
+    let last = token_usage.get("last")?;
+
+    let total_usage = parse_token_usage_breakdown(total);
+    let last_usage = parse_token_usage_breakdown(last);
+    let model_context_window = token_usage
+        .get("modelContextWindow")
+        .or_else(|| token_usage.get("model_context_window"))
+        .and_then(Value::as_i64);
+
+    Some((
+        codex_core::protocol::TokenUsageInfo {
+            last_token_usage: last_usage,
+            model_context_window,
+        },
+        total_usage,
+    ))
+}
+
+fn parse_token_usage_breakdown(value: &Value) -> codex_core::protocol::TokenUsage {
+    codex_core::protocol::TokenUsage {
+        total_tokens: value
+            .get("totalTokens")
+            .or_else(|| value.get("total_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        input_tokens: value
+            .get("inputTokens")
+            .or_else(|| value.get("input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        cached_input_tokens: value
+            .get("cachedInputTokens")
+            .or_else(|| value.get("cached_input_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        output_tokens: value
+            .get("outputTokens")
+            .or_else(|| value.get("output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+        reasoning_output_tokens: value
+            .get("reasoningOutputTokens")
+            .or_else(|| value.get("reasoning_output_tokens"))
+            .and_then(Value::as_i64)
+            .unwrap_or_default(),
+    }
+}
+
+fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::RateLimitSnapshot> {
+    let primary = parse_rate_limit_window(value.get("primary"));
+    let secondary = parse_rate_limit_window(value.get("secondary"));
+    let credits = value.get("credits").and_then(|credits| {
+        Some(codex_core::protocol::CreditsSnapshot {
+            has_credits: credits
+                .get("hasCredits")
+                .or_else(|| credits.get("has_credits"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            unlimited: credits
+                .get("unlimited")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            balance: credits
+                .get("balance")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        })
+    });
+
+    Some(codex_core::protocol::RateLimitSnapshot {
+        limit_id: value
+            .get("limitId")
+            .or_else(|| value.get("limit_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        limit_name: value
+            .get("limitName")
+            .or_else(|| value.get("limit_name"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        primary,
+        secondary,
+        credits,
+    })
+}
+
+fn parse_rate_limit_window(value: Option<&Value>) -> Option<codex_core::protocol::RateLimitWindow> {
+    let value = value?;
+    let used_percent = value
+        .get("usedPercent")
+        .or_else(|| value.get("used_percent"))
+        .and_then(Value::as_f64)
+        .or_else(|| {
+            value
+                .get("usedPercent")
+                .or_else(|| value.get("used_percent"))
+                .and_then(Value::as_i64)
+                .map(|v| v as f64)
+        })
+        .unwrap_or_default();
+
+    Some(codex_core::protocol::RateLimitWindow {
+        used_percent,
+        resets_at: value
+            .get("resetsAt")
+            .or_else(|| value.get("resets_at"))
+            .and_then(Value::as_i64),
+        window_minutes: value
+            .get("windowDurationMins")
+            .or_else(|| value.get("windowMinutes"))
+            .or_else(|| value.get("window_minutes"))
+            .and_then(Value::as_i64),
+    })
+}
+
+fn parse_reasoning_effort(
+    value: Option<&Value>,
+) -> Option<codex_protocol::openai_models::ReasoningEffort> {
+    let raw = value.and_then(Value::as_str)?.to_ascii_lowercase();
+    match raw.as_str() {
+        "none" => Some(codex_protocol::openai_models::ReasoningEffort::None),
+        "minimal" => Some(codex_protocol::openai_models::ReasoningEffort::Minimal),
+        "low" => Some(codex_protocol::openai_models::ReasoningEffort::Low),
+        "medium" => Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+        "high" => Some(codex_protocol::openai_models::ReasoningEffort::High),
+        "xhigh" | "x_high" | "x-high" => {
+            Some(codex_protocol::openai_models::ReasoningEffort::XHigh)
+        }
+        _ => None,
+    }
+}
+
+fn parse_plan_type(value: Option<&Value>) -> Option<codex_protocol::account::PlanType> {
+    let raw = value.and_then(Value::as_str)?.to_ascii_lowercase();
+    match raw.as_str() {
+        "free" => Some(codex_protocol::account::PlanType::Free),
+        "go" => Some(codex_protocol::account::PlanType::Go),
+        "plus" => Some(codex_protocol::account::PlanType::Plus),
+        "pro" => Some(codex_protocol::account::PlanType::Pro),
+        "team" => Some(codex_protocol::account::PlanType::Team),
+        "business" => Some(codex_protocol::account::PlanType::Business),
+        "enterprise" => Some(codex_protocol::account::PlanType::Enterprise),
+        _ => None,
     }
 }
 
