@@ -425,25 +425,50 @@ impl LiveAttachTui {
                 self.on_reasoning_section_break();
             }
             UiEvent::TurnCompleted { status } => {
-                self.flush_assistant_message();
-                self.flush_active_cell();
-                self.flush_unified_exec_wait_streak();
-                self.clear_unified_exec_processes();
-                self.active_turn_id = None;
-                self.agent_turn_running = false;
-                self.update_task_running_state();
-                self.reasoning_buffer.clear();
-                self.full_reasoning_buffer.clear();
-                if let Some(status) = status
-                    && status != "completed"
-                {
-                    self.status_message = Some(format!(
-                        "turn {}",
-                        text_formatting::capitalize_first(&status)
-                    ));
+                let failed_like = status
+                    .as_deref()
+                    .is_some_and(|s| matches!(s, "failed" | "aborted" | "interrupted"));
+                if failed_like {
+                    self.finalize_turn_as_failed();
+                    if let Some(status) = status {
+                        self.status_message = Some(format!(
+                            "turn {}",
+                            text_formatting::capitalize_first(&status)
+                        ));
+                    }
                 } else {
-                    self.status_message = None;
+                    self.flush_assistant_message();
+                    self.flush_active_cell();
+                    self.flush_unified_exec_wait_streak();
+                    self.clear_unified_exec_processes();
+                    self.active_turn_id = None;
+                    self.agent_turn_running = false;
+                    self.update_task_running_state();
+                    self.reasoning_buffer.clear();
+                    self.full_reasoning_buffer.clear();
+                    if let Some(status) = status
+                        && status != "completed"
+                    {
+                        self.status_message = Some(format!(
+                            "turn {}",
+                            text_formatting::capitalize_first(&status)
+                        ));
+                    } else {
+                        self.status_message = None;
+                    }
                 }
+            }
+            UiEvent::TurnAborted { reason } => {
+                self.on_interrupted_turn(reason);
+            }
+            UiEvent::Error { message } => {
+                self.on_error(message);
+            }
+            UiEvent::StreamError {
+                message,
+                additional_details,
+            } => {
+                self.on_stream_error(message, additional_details);
             }
             UiEvent::ExecCommandBegin {
                 call_id,
@@ -1234,6 +1259,59 @@ impl LiveAttachTui {
         }
         self.unified_exec_processes.clear();
         self.sync_unified_exec_footer();
+    }
+
+    fn finalize_active_cell_as_failed(&mut self) {
+        if let Some(mut cell) = self.active_cell.take() {
+            if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
+                exec.mark_failed();
+            } else if let Some(tool) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() {
+                tool.mark_failed();
+            }
+            self.add_boxed_history(cell);
+            self.bump_active_cell_revision();
+        }
+    }
+
+    fn finalize_turn_as_failed(&mut self) {
+        self.finalize_active_cell_as_failed();
+        self.assistant_stream = StreamController::new(None);
+        self.adaptive_chunking.reset();
+        self.flush_unified_exec_wait_streak();
+        self.clear_unified_exec_processes();
+        self.active_turn_id = None;
+        self.agent_turn_running = false;
+        self.update_task_running_state();
+        self.running_commands.clear();
+        self.suppressed_exec_calls.clear();
+        self.last_unified_wait = None;
+        self.reasoning_buffer.clear();
+        self.full_reasoning_buffer.clear();
+    }
+
+    fn on_error(&mut self, message: String) {
+        self.finalize_turn_as_failed();
+        self.add_boxed_history(Box::new(new_error_event(message)));
+    }
+
+    fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
+        self.status_message = Some(match additional_details {
+            Some(details) if !details.trim().is_empty() => format!("{message} ({details})"),
+            _ => message,
+        });
+    }
+
+    fn on_interrupted_turn(&mut self, reason: Option<String>) {
+        self.finalize_turn_as_failed();
+        let interrupted = reason
+            .as_deref()
+            .map(|r| r.eq_ignore_ascii_case("interrupted"))
+            .unwrap_or(true);
+        if interrupted {
+            self.add_boxed_history(Box::new(new_error_event(
+                "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string(),
+            )));
+        }
     }
 
     fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) -> bool {

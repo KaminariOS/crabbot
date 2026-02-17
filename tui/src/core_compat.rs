@@ -67,6 +67,16 @@ pub(crate) enum UiEvent {
     TurnCompleted {
         status: Option<String>,
     },
+    TurnAborted {
+        reason: Option<String>,
+    },
+    Error {
+        message: String,
+    },
+    StreamError {
+        message: String,
+        additional_details: Option<String>,
+    },
     ExecCommandBegin {
         call_id: String,
         process_id: Option<String>,
@@ -526,8 +536,14 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 ))]
             })
             .unwrap_or_else(|| vec![UiEvent::TranscriptLine("[thread rolled back]".to_string())]),
-        "turn/aborted" => vec![UiEvent::TurnCompleted {
-            status: Some("aborted".to_string()),
+        "turn/aborted" => vec![UiEvent::TurnAborted {
+            reason: notification
+                .params
+                .get("turn")
+                .and_then(|turn| turn.get("reason"))
+                .or_else(|| notification.params.get("reason"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }],
         "turn/failed" => vec![UiEvent::TurnCompleted {
             status: Some("failed".to_string()),
@@ -802,26 +818,28 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
             .and_then(Value::as_str)
             .map(|message| vec![UiEvent::TranscriptLine(format!("[warning] {message}"))])
             .unwrap_or_default(),
-        "error" => {
-            let message = msg
+        "error" => vec![UiEvent::Error {
+            message: msg
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("unknown error")
-                .to_string();
-            vec![
-                UiEvent::TranscriptLine(format!("[error] {message}")),
-                UiEvent::TurnCompleted {
-                    status: Some("failed".to_string()),
-                },
-            ]
-        }
+                .to_string(),
+        }],
         "stream_error" => {
             let message = msg
                 .get("message")
                 .and_then(Value::as_str)
                 .unwrap_or("stream error")
                 .to_string();
-            vec![UiEvent::TranscriptLine(format!("[stream error] {message}"))]
+            let additional_details = msg
+                .get("additional_details")
+                .or_else(|| msg.get("additionalDetails"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            vec![UiEvent::StreamError {
+                message,
+                additional_details,
+            }]
         }
         "turn_started" => msg
             .get("turn_id")
@@ -830,10 +848,17 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
             .map(|turn_id| vec![UiEvent::TurnStarted(turn_id.to_string())])
             .unwrap_or_default(),
         "turn_complete" | "task_complete" => vec![UiEvent::TurnCompleted {
-            status: Some("completed".to_string()),
+            status: msg
+                .get("status")
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or(Some("completed".to_string())),
         }],
-        "turn_aborted" => vec![UiEvent::TurnCompleted {
-            status: Some("aborted".to_string()),
+        "turn_aborted" => vec![UiEvent::TurnAborted {
+            reason: msg
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
         }],
         "agent_message" => msg
             .get("message")
