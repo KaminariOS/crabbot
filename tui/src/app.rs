@@ -623,16 +623,17 @@ impl App {
             return Ok(LiveTuiAction::Continue);
         }
 
-        let _ = find_builtin_command(
-            trimmed
-                .strip_prefix('/')
-                .and_then(|value| value.split_whitespace().next())
-                .unwrap_or_default(),
-            true,
-            true,
-            true,
-            true,
-        );
+        if let Some(stripped) = trimmed.strip_prefix('/') {
+            let mut parts = stripped.splitn(2, char::is_whitespace);
+            let command = parts.next().unwrap_or_default();
+            let args = parts.next().unwrap_or_default().trim().to_string();
+            if let Some(cmd) = find_builtin_command(command, true, true, true, true) {
+                let args = if args.is_empty() { None } else { Some(args) };
+                self.dispatch_slash_command(cmd, args, text_elements)?;
+                return Ok(LiveTuiAction::Continue);
+            }
+        }
+
         self.app_event_tx.send(AppEvent::StartTurn {
             text: input.to_string(),
             text_elements,
