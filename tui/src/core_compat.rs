@@ -679,7 +679,7 @@ pub(crate) fn start_thread(state: &CliState) -> Result<String> {
 }
 
 pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Result<Option<String>> {
-    start_turn_with_elements(state, thread_id, text, Vec::new())
+    start_turn_with_elements(state, thread_id, text, Vec::new(), Vec::new())
 }
 
 pub(crate) fn start_turn_with_elements(
@@ -687,20 +687,44 @@ pub(crate) fn start_turn_with_elements(
     thread_id: &str,
     text: &str,
     text_elements: Vec<codex_protocol::user_input::TextElement>,
+    mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
 ) -> Result<Option<String>> {
+    let mut input_items = vec![json!({
+        "type": "text",
+        "text": text,
+        "text_elements": text_elements
+    })];
+    for binding in mention_bindings {
+        if let Some(app_id) = binding.path.strip_prefix("app://") {
+            if !app_id.is_empty() {
+                input_items.push(json!({
+                    "type": "mention",
+                    "name": binding.mention,
+                    "path": binding.path,
+                }));
+            }
+            continue;
+        }
+        let skill_path = binding
+            .path
+            .strip_prefix("skill://")
+            .unwrap_or(binding.path.as_str())
+            .to_string();
+        if skill_path.ends_with("SKILL.md") {
+            input_items.push(json!({
+                "type": "skill",
+                "name": binding.mention,
+                "path": skill_path,
+            }));
+        }
+    }
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "turn/start",
         json!({
             "threadId": thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": text,
-                    "text_elements": text_elements
-                }
-            ]
+            "input": input_items
         }),
     )?;
     Ok(response
@@ -894,12 +918,14 @@ pub(crate) enum AppEvent {
     SubmitInput {
         text: String,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
+        mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
     },
 
     /// Request to start a turn for the active thread with plain text input.
     StartTurn {
         text: String,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
+        mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
     },
 
     /// Request to start a new session / thread.

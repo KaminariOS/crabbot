@@ -16,7 +16,6 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements;
 pub(super) use crate::core_compat::stream_events;
-use crate::mention_codec::LinkedMention;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
@@ -292,16 +291,22 @@ impl App {
             AppEvent::SubmitInput {
                 text,
                 text_elements,
-            } => self.handle_submit(&text, text_elements),
+                mention_bindings,
+            } => self.handle_submit(&text, text_elements, mention_bindings),
             AppEvent::StartTurn {
                 text,
                 text_elements,
+                mention_bindings,
             } => {
                 let ui = self.widget.ui_mut();
                 ui.push_user_prompt(&text);
-                if let Some(turn_id) =
-                    start_turn_with_elements(&self.state, &ui.session_id, &text, text_elements)?
-                {
+                if let Some(turn_id) = start_turn_with_elements(
+                    &self.state,
+                    &ui.session_id,
+                    &text,
+                    text_elements,
+                    mention_bindings,
+                )? {
                     ui.active_turn_id = Some(turn_id);
                 }
                 ui.status_message = Some("waiting for response...".to_string());
@@ -447,39 +452,52 @@ impl App {
         }
 
         if let Some((cmd, args, text_elements)) = queued_command {
-            if cmd == SlashCommand::Mention {
-                self.widget.ui_mut().bottom_pane_insert_str("@");
-                return Ok(LiveTuiAction::Continue);
-            }
-            let text = match args {
-                Some(args) if !args.trim().is_empty() => format!("/{} {}", cmd.command(), args),
-                _ => format!("/{}", cmd.command()),
-            };
-            self.app_event_tx.send(AppEvent::SubmitInput {
-                text,
-                text_elements,
-            });
+            self.dispatch_slash_command(cmd, args, text_elements)?;
         } else if let Some((input, text_elements)) = queued_submit {
             let mention_bindings = self
                 .widget
                 .ui_mut()
                 .take_recent_submission_mention_bindings();
-            let encoded = crate::mention_codec::encode_history_mentions(
-                &input,
-                &mention_bindings
-                    .into_iter()
-                    .map(|binding| LinkedMention {
-                        mention: binding.mention,
-                        path: binding.path,
-                    })
-                    .collect::<Vec<_>>(),
-            );
             self.app_event_tx.send(AppEvent::SubmitInput {
-                text: encoded,
+                text: input,
                 text_elements,
+                mention_bindings,
             });
         }
         Ok(LiveTuiAction::Continue)
+    }
+
+    fn dispatch_slash_command(
+        &mut self,
+        cmd: SlashCommand,
+        args: Option<String>,
+        text_elements: Vec<codex_protocol::user_input::TextElement>,
+    ) -> Result<()> {
+        let arg = args.unwrap_or_default();
+        match cmd {
+            SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
+            SlashCommand::Resume => self.app_event_tx.send(AppEvent::ResumeSession),
+            SlashCommand::Status => self.app_event_tx.send(AppEvent::ShowStatus),
+            SlashCommand::Quit | SlashCommand::Exit => {
+                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
+            }
+            SlashCommand::Mention => {
+                self.widget.ui_mut().bottom_pane_insert_str("@");
+            }
+            _ => {
+                let text = if arg.trim().is_empty() {
+                    format!("/{}", cmd.command())
+                } else {
+                    format!("/{} {}", cmd.command(), arg)
+                };
+                self.app_event_tx.send(AppEvent::SubmitInput {
+                    text,
+                    text_elements,
+                    mention_bindings: Vec::new(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Handle submitted user input (from Enter key or programmatic submit).
@@ -487,6 +505,7 @@ impl App {
         &mut self,
         input: &str,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
+        mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
     ) -> Result<LiveTuiAction> {
         let trimmed = input.trim();
         if trimmed.is_empty() {
@@ -550,8 +569,9 @@ impl App {
             true,
         );
         self.app_event_tx.send(AppEvent::StartTurn {
-            text: trimmed.to_string(),
+            text: input.to_string(),
             text_elements,
+            mention_bindings,
         });
         Ok(LiveTuiAction::Continue)
     }
