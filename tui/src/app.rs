@@ -539,6 +539,23 @@ impl App {
                 .ui_mut()
                 .push_line("[info] /debug-config is not yet ported in app-server tui"),
             SlashCommand::Fork => self.app_event_tx.send(AppEvent::NewSession),
+            SlashCommand::Init => {
+                let init_target = std::env::current_dir()
+                    .unwrap_or_else(|_| std::env::temp_dir())
+                    .join("AGENTS.md");
+                if init_target.exists() {
+                    self.widget.ui_mut().push_line(
+                        "AGENTS.md already exists here. Skipping /init to avoid overwriting it.",
+                    );
+                } else {
+                    const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
+                    self.app_event_tx.send(AppEvent::StartTurn {
+                        text: INIT_PROMPT.to_string(),
+                        text_elements: Vec::new(),
+                        mention_bindings: Vec::new(),
+                    });
+                }
+            }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
             }
