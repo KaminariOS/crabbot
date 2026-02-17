@@ -361,7 +361,7 @@ impl App {
                 mention_bindings,
             } => {
                 let ui = self.widget.ui_mut();
-                ui.push_user_prompt(&text);
+                ui.push_user_prompt(&text, text_elements.clone());
                 if let Some(turn_id) = start_turn_with_elements(
                     &self.state,
                     &ui.session_id,

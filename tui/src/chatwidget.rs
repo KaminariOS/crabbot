@@ -283,13 +283,17 @@ impl LiveAttachTui {
         }
     }
 
-    pub(crate) fn push_user_prompt(&mut self, prompt: &str) {
+    pub(crate) fn push_user_prompt(
+        &mut self,
+        prompt: &str,
+        text_elements: Vec<codex_protocol::user_input::TextElement>,
+    ) {
         self.assistant_stream = StreamController::new(None);
         let decoded = mention_codec::decode_history_mentions(prompt);
         let display_prompt = decoded.text;
         self.history_cells.push(Box::new(new_user_prompt(
             display_prompt,
-            Vec::new(),
+            text_elements,
             Vec::new(),
             Vec::new(),
         )));
