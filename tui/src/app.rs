@@ -674,6 +674,11 @@ impl App {
                         .ui_mut()
                         .set_status_message(Some("status line setup cancelled".to_string()));
                 }
+                WidgetAppEvent::FullScreenApprovalRequest(request) => {
+                    self.widget
+                        .ui_mut()
+                        .push_fullscreen_approval_request(request);
+                }
                 _ => {}
             }
         }
@@ -945,6 +950,97 @@ impl App {
             }
             codex_core::protocol::Op::Compact => {
                 self.start_compaction()?;
+            }
+            codex_core::protocol::Op::ExecApproval { id, decision, .. } => {
+                let Some(request) = self.widget.ui_mut().take_pending_approval_for_operation(
+                    &id,
+                    &[
+                        "item/commandExecution/requestApproval",
+                        "execCommandApproval",
+                    ],
+                ) else {
+                    self.widget
+                        .ui_mut()
+                        .push_line(&format!("No pending exec approval found for {id}."));
+                    return Ok(());
+                };
+                let approve = matches!(
+                    decision,
+                    codex_core::protocol::ReviewDecision::Approved
+                        | codex_core::protocol::ReviewDecision::ApprovedForSession
+                        | codex_core::protocol::ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                );
+                respond_to_approval(&self.state, request.request_id, &request.method, approve)?;
+            }
+            codex_core::protocol::Op::PatchApproval { id, decision } => {
+                let Some(request) = self.widget.ui_mut().take_pending_approval_for_operation(
+                    &id,
+                    &["item/fileChange/requestApproval", "applyPatchApproval"],
+                ) else {
+                    self.widget
+                        .ui_mut()
+                        .push_line(&format!("No pending patch approval found for {id}."));
+                    return Ok(());
+                };
+                let approve = matches!(
+                    decision,
+                    codex_core::protocol::ReviewDecision::Approved
+                        | codex_core::protocol::ReviewDecision::ApprovedForSession
+                        | codex_core::protocol::ReviewDecision::ApprovedExecpolicyAmendment { .. }
+                );
+                respond_to_approval(&self.state, request.request_id, &request.method, approve)?;
+            }
+            codex_core::protocol::Op::ResolveElicitation {
+                server_name: _,
+                request_id: _,
+                decision,
+            } => {
+                let Some((key, request)) = self
+                    .widget
+                    .ui_mut()
+                    .pending_approvals
+                    .iter()
+                    .find(|(_, request)| {
+                        request.method == "item/tool/elicit"
+                            || request.method == "item/mcpToolCall/requestApproval"
+                    })
+                    .map(|(key, request)| (key.clone(), request.clone()))
+                else {
+                    self.widget
+                        .ui_mut()
+                        .push_line("No pending MCP elicitation request found.");
+                    return Ok(());
+                };
+                self.widget.ui_mut().pending_approvals.remove(&key);
+                let decision_text = match decision {
+                    codex_core::protocol::ElicitationAction::Accept => "accept",
+                    codex_core::protocol::ElicitationAction::Decline => "decline",
+                    codex_core::protocol::ElicitationAction::Cancel => "cancel",
+                };
+                app_server_rpc_respond(
+                    &self.state.config.app_server_endpoint,
+                    self.state.config.auth_token.as_deref(),
+                    request.request_id,
+                    json!({ "decision": decision_text }),
+                )?;
+            }
+            codex_core::protocol::Op::UserInputAnswer { id, response } => {
+                let Some(request) = self
+                    .widget
+                    .ui_mut()
+                    .take_pending_request_user_input_for_turn(&id)
+                else {
+                    self.widget
+                        .ui_mut()
+                        .push_line("No pending request_user_input request found.");
+                    return Ok(());
+                };
+                app_server_rpc_respond(
+                    &self.state.config.app_server_endpoint,
+                    self.state.config.auth_token.as_deref(),
+                    request.request_id,
+                    serde_json::to_value(response)?,
+                )?;
             }
             codex_core::protocol::Op::DropMemories | codex_core::protocol::Op::UpdateMemories => {
                 self.widget

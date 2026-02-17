@@ -41,6 +41,9 @@ pub(crate) struct UiApprovalRequest {
     pub(crate) request_id: Value,
     pub(crate) method: String,
     pub(crate) reason: Option<String>,
+    pub(crate) operation_id: Option<String>,
+    pub(crate) turn_id: Option<String>,
+    pub(crate) server_name: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +110,24 @@ pub(crate) enum UiEvent {
         cancelled: Vec<String>,
     },
     CollabEvent(String),
+    ExecApprovalRequest {
+        id: String,
+        command: Vec<String>,
+        reason: Option<String>,
+        network_approval_context: Option<codex_core::protocol::NetworkApprovalContext>,
+    },
+    PatchApprovalRequest {
+        id: String,
+        reason: Option<String>,
+        cwd: std::path::PathBuf,
+        changes: std::collections::HashMap<std::path::PathBuf, codex_core::protocol::FileChange>,
+    },
+    ElicitationRequest {
+        server_name: String,
+        request_id: codex_protocol::mcp::RequestId,
+        message: String,
+    },
+    RequestUserInputRequest(codex_protocol::request_user_input::RequestUserInputEvent),
 }
 
 pub(crate) fn map_legacy_stream_events(stream_events: &[DaemonStreamEnvelope]) -> Vec<UiEvent> {
@@ -168,9 +189,32 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
                         | "item/fileChange/requestApproval"
                         | "execCommandApproval"
                         | "applyPatchApproval"
+                        | "item/tool/elicit"
+                        | "item/mcpToolCall/requestApproval"
+                        | "item/tool/requestUserInput"
                 ) {
+                    let request_key = request_id_key_for_cli(&request.request_id);
+                    let operation_id = request
+                        .params
+                        .get("id")
+                        .or_else(|| request.params.get("callId"))
+                        .or_else(|| request.params.get("itemId"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    let turn_id = request
+                        .params
+                        .get("turnId")
+                        .or_else(|| request.params.get("turn_id"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    let server_name = request
+                        .params
+                        .get("serverName")
+                        .or_else(|| request.params.get("server_name"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
                     events.push(UiEvent::ApprovalRequired(UiApprovalRequest {
-                        key: request_id_key_for_cli(&request.request_id),
+                        key: request_key.clone(),
                         request_id: request.request_id.clone(),
                         method: request.method.clone(),
                         reason: request
@@ -178,7 +222,14 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
                             .get("reason")
                             .and_then(Value::as_str)
                             .map(ToString::to_string),
+                        operation_id,
+                        turn_id,
+                        server_name,
                     }));
+                    if let Some(mapped) = map_rpc_server_request_to_ui_event(request, &request_key)
+                    {
+                        events.push(mapped);
+                    }
                 }
                 events.push(UiEvent::TranscriptLine(summary));
             }
@@ -470,6 +521,153 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
         }
         "codex/event" => map_codex_event_notification(&notification.params),
         _ => Vec::new(),
+    }
+}
+
+fn map_rpc_server_request_to_ui_event(
+    request: &DaemonRpcServerRequest,
+    request_key: &str,
+) -> Option<UiEvent> {
+    match request.method.as_str() {
+        "item/commandExecution/requestApproval" | "execCommandApproval" => {
+            let id = request
+                .params
+                .get("id")
+                .or_else(|| request.params.get("callId"))
+                .or_else(|| request.params.get("itemId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let command = command_vec_from_value(
+                request
+                    .params
+                    .get("command")
+                    .or_else(|| request.params.get("cmd")),
+            );
+            let reason = request
+                .params
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let network_approval_context = request
+                .params
+                .get("networkApprovalContext")
+                .or_else(|| request.params.get("network_approval_context"))
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok());
+            Some(UiEvent::ExecApprovalRequest {
+                id,
+                command,
+                reason,
+                network_approval_context,
+            })
+        }
+        "item/fileChange/requestApproval" | "applyPatchApproval" => {
+            let id = request
+                .params
+                .get("id")
+                .or_else(|| request.params.get("callId"))
+                .or_else(|| request.params.get("itemId"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let reason = request
+                .params
+                .get("reason")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let cwd = request
+                .params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| {
+                    std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+                });
+            let changes = request
+                .params
+                .get("changes")
+                .or_else(|| request.params.get("fileChanges"))
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<
+                        std::collections::HashMap<
+                            std::path::PathBuf,
+                            codex_core::protocol::FileChange,
+                        >,
+                    >(value)
+                    .ok()
+                })
+                .unwrap_or_default();
+            Some(UiEvent::PatchApprovalRequest {
+                id,
+                reason,
+                cwd,
+                changes,
+            })
+        }
+        "item/tool/elicit" | "item/mcpToolCall/requestApproval" => {
+            let server_name = request
+                .params
+                .get("serverName")
+                .or_else(|| request.params.get("server_name"))
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let request_id = request
+                .params
+                .get("requestId")
+                .or_else(|| request.params.get("request_id"))
+                .and_then(Value::as_str)
+                .map(|s| codex_protocol::mcp::RequestId::String(s.to_string()))
+                .unwrap_or_else(|| codex_protocol::mcp::RequestId::String(request_key.to_string()));
+            let message = request
+                .params
+                .get("message")
+                .or_else(|| request.params.get("prompt"))
+                .and_then(Value::as_str)
+                .unwrap_or("MCP tool needs your approval.")
+                .to_string();
+            Some(UiEvent::ElicitationRequest {
+                server_name,
+                request_id,
+                message,
+            })
+        }
+        "item/tool/requestUserInput" => {
+            let mut event = codex_protocol::request_user_input::RequestUserInputEvent {
+                call_id: request
+                    .params
+                    .get("itemId")
+                    .or_else(|| request.params.get("item_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                turn_id: request
+                    .params
+                    .get("turnId")
+                    .or_else(|| request.params.get("turn_id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                request_id: request_key.to_string(),
+                prompt: request
+                    .params
+                    .get("prompt")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                questions: Vec::new(),
+            };
+            if let Some(questions) = request.params.get("questions").cloned()
+                && let Ok(decoded) = serde_json::from_value::<
+                    Vec<codex_protocol::request_user_input::RequestUserInputQuestion>,
+                >(questions)
+            {
+                event.questions = decoded;
+            }
+            Some(UiEvent::RequestUserInputRequest(event))
+        }
+        _ => None,
     }
 }
 

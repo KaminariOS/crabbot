@@ -390,6 +390,56 @@ impl LiveAttachTui {
                 self.history_cells
                     .push(Box::new(new_info_event(message, None)));
             }
+            UiEvent::ExecApprovalRequest {
+                id,
+                command,
+                reason,
+                network_approval_context,
+            } => {
+                self.bottom_pane.push_approval_request(
+                    crate::bottom_pane::ApprovalRequest::Exec {
+                        id,
+                        command,
+                        reason,
+                        network_approval_context,
+                        proposed_execpolicy_amendment: None,
+                    },
+                    &codex_core::features::Features::default(),
+                );
+            }
+            UiEvent::PatchApprovalRequest {
+                id,
+                reason,
+                cwd,
+                changes,
+            } => {
+                self.bottom_pane.push_approval_request(
+                    crate::bottom_pane::ApprovalRequest::ApplyPatch {
+                        id,
+                        reason,
+                        cwd,
+                        changes,
+                    },
+                    &codex_core::features::Features::default(),
+                );
+            }
+            UiEvent::ElicitationRequest {
+                server_name,
+                request_id,
+                message,
+            } => {
+                self.bottom_pane.push_approval_request(
+                    crate::bottom_pane::ApprovalRequest::McpElicitation {
+                        server_name,
+                        request_id,
+                        message,
+                    },
+                    &codex_core::features::Features::default(),
+                );
+            }
+            UiEvent::RequestUserInputRequest(request) => {
+                self.bottom_pane.push_user_input_request(request);
+            }
         }
         self.sync_bottom_pane_status();
     }
@@ -1400,6 +1450,42 @@ impl LiveAttachTui {
         self.bottom_pane.drain_pending_submission_state();
     }
 
+    pub(crate) fn take_pending_approval_for_operation(
+        &mut self,
+        operation_id: &str,
+        methods: &[&str],
+    ) -> Option<UiApprovalRequest> {
+        let key = self.pending_approvals.iter().find_map(|(key, req)| {
+            if req
+                .operation_id
+                .as_deref()
+                .is_some_and(|op| op == operation_id)
+                && methods.iter().any(|method| req.method == *method)
+            {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })?;
+        self.pending_approvals.remove(&key)
+    }
+
+    pub(crate) fn take_pending_request_user_input_for_turn(
+        &mut self,
+        turn_id: &str,
+    ) -> Option<UiApprovalRequest> {
+        let key = self.pending_approvals.iter().find_map(|(key, req)| {
+            if req.method == "item/tool/requestUserInput"
+                && req.turn_id.as_deref().is_some_and(|id| id == turn_id)
+            {
+                Some(key.clone())
+            } else {
+                None
+            }
+        })?;
+        self.pending_approvals.remove(&key)
+    }
+
     pub(crate) fn apply_file_search_result(&mut self, query: String, matches: Vec<FileMatch>) {
         self.bottom_pane.on_file_search_result(query, matches);
     }
@@ -1464,6 +1550,14 @@ impl LiveAttachTui {
         snapshot: Option<crate::app_event::ConnectorsSnapshot>,
     ) {
         self.bottom_pane.set_connectors_snapshot(snapshot);
+    }
+
+    pub(crate) fn push_fullscreen_approval_request(
+        &mut self,
+        request: crate::bottom_pane::ApprovalRequest,
+    ) {
+        self.bottom_pane
+            .push_approval_request(request, &codex_core::features::Features::default());
     }
 
     fn update_task_running_state(&mut self) {
