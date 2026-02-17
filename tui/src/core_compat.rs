@@ -11,6 +11,7 @@
 use super::*;
 use crabbot_protocol::DaemonRpcServerRequest;
 use std::sync::mpsc;
+use std::time::Duration;
 
 pub mod config {
     pub mod types {
@@ -54,6 +55,31 @@ pub(crate) enum UiEvent {
     },
     TurnCompleted {
         status: Option<String>,
+    },
+    ExecCommandBegin {
+        call_id: String,
+        command: Vec<String>,
+        parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
+        source: codex_core::protocol::ExecCommandSource,
+    },
+    ExecCommandOutputDelta {
+        call_id: String,
+        delta: String,
+    },
+    ExecCommandEnd {
+        call_id: String,
+        exit_code: i32,
+        aggregated_output: String,
+        duration: Duration,
+    },
+    McpToolCallBegin {
+        call_id: String,
+        invocation: codex_core::protocol::McpInvocation,
+    },
+    McpToolCallEnd {
+        call_id: String,
+        duration: Duration,
+        result: Result<codex_protocol::mcp::CallToolResult, String>,
     },
     TranscriptLine(String),
     StatusMessage(String),
@@ -177,13 +203,21 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .unwrap_or_default(),
         "item/reasoning/summaryTextDelta" | "item/reasoning/textDelta" => Vec::new(),
         "item/commandExecution/outputDelta" | "item/fileChange/outputDelta" => {
-            delta_from_params(&notification.params)
-                .map(|delta| vec![UiEvent::TranscriptLine(delta.to_string())])
-                .unwrap_or_default()
+            let Some(delta) = delta_from_params(&notification.params) else {
+                return Vec::new();
+            };
+            let Some(call_id) = item_id_from_params(&notification.params) else {
+                return vec![UiEvent::TranscriptLine(delta.to_string())];
+            };
+            vec![UiEvent::ExecCommandOutputDelta {
+                call_id,
+                delta: delta.to_string(),
+            }]
         }
         "item/commandExecution/terminalInteraction" => notification
             .params
             .get("prompt")
+            .or_else(|| notification.params.get("stdin"))
             .and_then(Value::as_str)
             .map(|prompt| {
                 vec![UiEvent::TranscriptLine(format!(
@@ -196,12 +230,17 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .get("command")
             .and_then(Value::as_array)
             .map(|parts| {
-                let joined = parts
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(" ");
-                vec![UiEvent::TranscriptLine(format!("[exec start] {joined}"))]
+                vec![UiEvent::ExecCommandBegin {
+                    call_id: item_id_from_params(&notification.params)
+                        .unwrap_or_else(|| "exec".to_string()),
+                    command: parts
+                        .iter()
+                        .filter_map(Value::as_str)
+                        .map(ToString::to_string)
+                        .collect(),
+                    parsed: Vec::new(),
+                    source: parse_exec_source(notification.params.get("source")),
+                }]
             })
             .unwrap_or_else(|| vec![UiEvent::StatusMessage("running command...".to_string())]),
         "item/commandExecution/end" => {
@@ -210,28 +249,103 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 .get("exitCode")
                 .and_then(Value::as_i64)
                 .unwrap_or_default();
-            vec![UiEvent::TranscriptLine(format!(
-                "[exec done] exit_code={exit_code}"
-            ))]
+            let Some(call_id) = item_id_from_params(&notification.params) else {
+                return vec![UiEvent::TranscriptLine(format!(
+                    "[exec done] exit_code={exit_code}"
+                ))];
+            };
+            vec![UiEvent::ExecCommandEnd {
+                call_id,
+                exit_code: exit_code as i32,
+                aggregated_output: notification
+                    .params
+                    .get("aggregatedOutput")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                duration: duration_ms_to_duration(
+                    notification
+                        .params
+                        .get("durationMs")
+                        .and_then(Value::as_i64)
+                        .unwrap_or_default(),
+                ),
+            }]
         }
         "item/fileChange/begin" => Vec::new(),
         "item/fileChange/end" => Vec::new(),
         "item/mcpToolCall/begin" => {
-            let label = notification
+            let call_id =
+                item_id_from_params(&notification.params).unwrap_or_else(|| "mcp".to_string());
+            let server = notification
+                .params
+                .get("serverName")
+                .or_else(|| notification.params.get("server"))
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let tool = notification
                 .params
                 .get("toolName")
                 .or_else(|| notification.params.get("tool"))
                 .and_then(Value::as_str)
-                .unwrap_or("tool");
-            vec![UiEvent::TranscriptLine(format!("[mcp call] {label}"))]
+                .unwrap_or("tool")
+                .to_string();
+            vec![UiEvent::McpToolCallBegin {
+                call_id,
+                invocation: codex_core::protocol::McpInvocation {
+                    server: server.clone(),
+                    tool: tool.clone(),
+                    arguments: notification.params.get("arguments").cloned(),
+                    server_name: server,
+                    tool_name: tool,
+                },
+            }]
         }
-        "item/mcpToolCall/end" => Vec::new(),
+        "item/mcpToolCall/end" => {
+            let Some(call_id) = item_id_from_params(&notification.params) else {
+                return Vec::new();
+            };
+            let duration_ms = notification
+                .params
+                .get("durationMs")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let result = if let Some(error) = notification
+                .params
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+            {
+                Err(error.to_string())
+            } else {
+                let content = notification
+                    .params
+                    .get("result")
+                    .and_then(|result| result.get("content"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                let is_error = notification
+                    .params
+                    .get("result")
+                    .and_then(|result| result.get("isError"))
+                    .and_then(Value::as_bool);
+                Ok(codex_protocol::mcp::CallToolResult { content, is_error })
+            };
+            vec![UiEvent::McpToolCallEnd {
+                call_id,
+                duration: duration_ms_to_duration(duration_ms),
+                result,
+            }]
+        }
+        "item/started" => map_item_started_notification(&notification.params),
         "item/completed" => notification
             .params
             .get("item")
             .and_then(|item| item.get("type"))
             .and_then(Value::as_str)
-            .filter(|item_type| *item_type == "agent_message")
+            .filter(|item_type| *item_type == "agent_message" || *item_type == "agentMessage")
             .and_then(|_| {
                 notification
                     .params
@@ -246,7 +360,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                     delta: text,
                 }]
             })
-            .unwrap_or_default(),
+            .unwrap_or_else(|| map_item_completed_notification(&notification.params)),
         "turn/completed" => {
             let status = notification
                 .params
@@ -273,6 +387,203 @@ fn delta_from_params(params: &Value) -> Option<&str> {
         .get("delta")
         .or_else(|| params.get("outputDelta"))
         .and_then(Value::as_str)
+}
+
+fn item_id_from_params(params: &Value) -> Option<String> {
+    params
+        .get("itemId")
+        .or_else(|| params.get("callId"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn command_vec_from_value(value: Option<&Value>) -> Vec<String> {
+    match value {
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(Value::as_str)
+            .map(ToString::to_string)
+            .collect(),
+        Some(Value::String(command)) => {
+            shlex::split(command).unwrap_or_else(|| vec![command.clone()])
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn parse_exec_source(source: Option<&Value>) -> codex_core::protocol::ExecCommandSource {
+    match source.and_then(Value::as_str).unwrap_or("agent") {
+        "user" => codex_core::protocol::ExecCommandSource::User,
+        "user_shell" => codex_core::protocol::ExecCommandSource::UserShell,
+        "unified_exec_startup" => codex_core::protocol::ExecCommandSource::UnifiedExecStartup,
+        "unified_exec_interaction" => {
+            codex_core::protocol::ExecCommandSource::UnifiedExecInteraction
+        }
+        _ => codex_core::protocol::ExecCommandSource::Agent,
+    }
+}
+
+fn parsed_command_vec_from_value(
+    value: Option<&Value>,
+) -> Vec<codex_protocol::parse_command::ParsedCommand> {
+    value
+        .and_then(|v| serde_json::from_value(v.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn duration_ms_to_duration(duration_ms: i64) -> Duration {
+    Duration::from_millis(duration_ms.max(0) as u64)
+}
+
+fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
+    let Some(item) = params.get("item") else {
+        return Vec::new();
+    };
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    match item_type {
+        "command_execution" | "commandExecution" => {
+            let call_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("exec")
+                .to_string();
+            let command = command_vec_from_value(item.get("command"));
+            vec![UiEvent::ExecCommandBegin {
+                call_id,
+                command: if command.is_empty() {
+                    vec!["command".to_string()]
+                } else {
+                    command
+                },
+                parsed: parsed_command_vec_from_value(
+                    item.get("parsedCommand")
+                        .or_else(|| item.get("commandActions")),
+                ),
+                source: parse_exec_source(item.get("source")),
+            }]
+        }
+        "mcp_tool_call" | "mcpToolCall" => {
+            let call_id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let server = item
+                .get("server")
+                .or_else(|| item.get("serverName"))
+                .and_then(Value::as_str)
+                .unwrap_or("mcp")
+                .to_string();
+            let tool = item
+                .get("tool")
+                .or_else(|| item.get("toolName"))
+                .and_then(Value::as_str)
+                .unwrap_or("tool")
+                .to_string();
+            let invocation = codex_core::protocol::McpInvocation {
+                server: server.clone(),
+                tool: tool.clone(),
+                arguments: item.get("arguments").cloned(),
+                server_name: server,
+                tool_name: tool,
+            };
+            vec![UiEvent::McpToolCallBegin {
+                call_id,
+                invocation,
+            }]
+        }
+        "web_search" | "webSearch" => {
+            let query = item
+                .get("query")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            if query.is_empty() {
+                Vec::new()
+            } else {
+                vec![UiEvent::TranscriptLine(format!("[web search] {query}"))]
+            }
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
+    let Some(item) = params.get("item") else {
+        return Vec::new();
+    };
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    match item_type {
+        "command_execution" | "commandExecution" => {
+            let Some(call_id) = item.get("id").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let exit_code = item
+                .get("exitCode")
+                .or_else(|| item.get("exit_code"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default() as i32;
+            let aggregated_output = item
+                .get("aggregatedOutput")
+                .or_else(|| item.get("aggregated_output"))
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let duration_ms = item
+                .get("durationMs")
+                .or_else(|| item.get("duration_ms"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            vec![UiEvent::ExecCommandEnd {
+                call_id: call_id.to_string(),
+                exit_code,
+                aggregated_output,
+                duration: duration_ms_to_duration(duration_ms),
+            }]
+        }
+        "mcp_tool_call" | "mcpToolCall" => {
+            let Some(call_id) = item.get("id").and_then(Value::as_str) else {
+                return Vec::new();
+            };
+            let duration_ms = item
+                .get("durationMs")
+                .or_else(|| item.get("duration_ms"))
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            let result = if let Some(error_msg) = item
+                .get("error")
+                .and_then(|err| err.get("message"))
+                .and_then(Value::as_str)
+            {
+                Err(error_msg.to_string())
+            } else if let Some(result_value) = item.get("result") {
+                let call_result =
+                    serde_json::from_value(result_value.clone()).unwrap_or_else(|_| {
+                        codex_protocol::mcp::CallToolResult {
+                            content: result_value
+                                .get("content")
+                                .and_then(Value::as_array)
+                                .cloned()
+                                .unwrap_or_default(),
+                            is_error: result_value.get("isError").and_then(Value::as_bool),
+                        }
+                    });
+                Ok(call_result)
+            } else {
+                Ok(codex_protocol::mcp::CallToolResult::default())
+            };
+            vec![UiEvent::McpToolCallEnd {
+                call_id: call_id.to_string(),
+                duration: duration_ms_to_duration(duration_ms),
+                result,
+            }]
+        }
+        _ => Vec::new(),
+    }
 }
 
 fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {

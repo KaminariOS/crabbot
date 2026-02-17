@@ -8,9 +8,14 @@ use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
 use crate::core_compat::map_rpc_stream_events;
+use crate::exec_cell::CommandOutput;
+use crate::exec_cell::ExecCell;
+use crate::exec_cell::new_active_exec_command;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell::new_active_mcp_tool_call;
 use crate::history_cell::new_error_event;
 use crate::history_cell::new_info_event;
 use crate::history_cell::new_user_prompt;
@@ -199,6 +204,30 @@ impl LiveAttachTui {
                     self.status_message = None;
                 }
             }
+            UiEvent::ExecCommandBegin {
+                call_id,
+                command,
+                parsed,
+                source,
+            } => self.on_exec_command_begin(call_id, command, parsed, source),
+            UiEvent::ExecCommandOutputDelta { call_id, delta } => {
+                self.on_exec_command_output_delta(&call_id, &delta);
+            }
+            UiEvent::ExecCommandEnd {
+                call_id,
+                exit_code,
+                aggregated_output,
+                duration,
+            } => self.on_exec_command_end(&call_id, exit_code, aggregated_output, duration),
+            UiEvent::McpToolCallBegin {
+                call_id,
+                invocation,
+            } => self.on_mcp_tool_call_begin(call_id, invocation),
+            UiEvent::McpToolCallEnd {
+                call_id,
+                duration,
+                result,
+            } => self.on_mcp_tool_call_end(&call_id, duration, result),
             UiEvent::TranscriptLine(line) => {
                 self.push_line(&line);
             }
@@ -265,6 +294,130 @@ impl LiveAttachTui {
         if let Some(cell) = self.assistant_stream.finalize() {
             self.history_cells.push(cell);
         }
+    }
+
+    fn on_exec_command_begin(
+        &mut self,
+        call_id: String,
+        command: Vec<String>,
+        parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
+        source: codex_core::protocol::ExecCommandSource,
+    ) {
+        self.flush_assistant_message();
+        if let Some(last) = self.history_cells.last_mut()
+            && let Some(exec_cell) = last.as_any_mut().downcast_mut::<ExecCell>()
+            && let Some(updated) = exec_cell.with_added_call(
+                call_id.clone(),
+                command.clone(),
+                parsed.clone(),
+                source,
+                None,
+            )
+        {
+            *exec_cell = updated;
+            return;
+        }
+
+        self.history_cells.push(Box::new(new_active_exec_command(
+            call_id, command, parsed, source, None, true,
+        )));
+    }
+
+    fn on_exec_command_output_delta(&mut self, call_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        for cell in self.history_cells.iter_mut().rev() {
+            let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() else {
+                continue;
+            };
+            if exec_cell.append_output(call_id, delta) {
+                return;
+            }
+        }
+
+        self.push_line(delta);
+    }
+
+    fn on_exec_command_end(
+        &mut self,
+        call_id: &str,
+        exit_code: i32,
+        aggregated_output: String,
+        duration: Duration,
+    ) {
+        for cell in self.history_cells.iter_mut().rev() {
+            let Some(exec_cell) = cell.as_any_mut().downcast_mut::<ExecCell>() else {
+                continue;
+            };
+            if !exec_cell.iter_calls().any(|call| call.call_id == call_id) {
+                continue;
+            }
+
+            let mut output_text = exec_cell
+                .calls
+                .iter()
+                .rev()
+                .find(|call| call.call_id == call_id)
+                .and_then(|call| call.output.as_ref())
+                .map(|output| output.aggregated_output.clone())
+                .unwrap_or_default();
+            if !aggregated_output.is_empty() {
+                output_text = aggregated_output;
+            }
+
+            exec_cell.complete_call(
+                call_id,
+                CommandOutput {
+                    exit_code,
+                    aggregated_output: output_text.clone(),
+                    formatted_output: output_text,
+                },
+                duration,
+            );
+            return;
+        }
+
+        self.history_cells.push(Box::new(new_info_event(
+            format!("[exec done] {call_id}"),
+            None,
+        )));
+    }
+
+    fn on_mcp_tool_call_begin(
+        &mut self,
+        call_id: String,
+        invocation: codex_core::protocol::McpInvocation,
+    ) {
+        self.flush_assistant_message();
+        self.history_cells.push(Box::new(new_active_mcp_tool_call(
+            call_id, invocation, true,
+        )));
+    }
+
+    fn on_mcp_tool_call_end(
+        &mut self,
+        call_id: &str,
+        duration: Duration,
+        result: Result<codex_protocol::mcp::CallToolResult, String>,
+    ) {
+        for cell in self.history_cells.iter_mut().rev() {
+            let Some(mcp_cell) = cell.as_any_mut().downcast_mut::<McpToolCallCell>() else {
+                continue;
+            };
+            if mcp_cell.call_id() != call_id {
+                continue;
+            }
+            if let Some(image_cell) = mcp_cell.complete(duration, result) {
+                self.history_cells.push(image_cell);
+            }
+            return;
+        }
+
+        self.history_cells.push(Box::new(new_info_event(
+            format!("[mcp done] {call_id}"),
+            None,
+        )));
     }
 
     pub(crate) fn commit_assistant_stream_tick(&mut self) -> bool {
