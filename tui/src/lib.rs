@@ -6,6 +6,7 @@ use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
 use crabbot_protocol::DaemonRpcNotification;
 use crabbot_protocol::DaemonRpcRequestResponse;
+use crabbot_protocol::DaemonRpcServerRequest;
 use crabbot_protocol::DaemonRpcStreamEnvelope;
 use crabbot_protocol::DaemonRpcStreamEvent;
 use crabbot_protocol::DaemonSessionStatusResponse;
@@ -1496,10 +1497,57 @@ impl AppServerWsClient {
         if let Some(envelope) =
             crate::core_compat::decode_app_server_wire_line(raw_line, self.next_sequence)?
         {
+            if let DaemonRpcStreamEvent::ServerRequest(request) = &envelope.event {
+                self.respond_to_server_request(request)?;
+            }
             self.next_sequence = self.next_sequence.max(envelope.sequence.saturating_add(1));
             self.buffered_events.push_back(envelope);
         }
         Ok(())
+    }
+
+    fn send_rpc_error(&mut self, request_id: &Value, code: i64, message: &str) -> Result<()> {
+        self.send_json(&json!({
+            "id": request_id,
+            "error": {
+                "code": code,
+                "message": message,
+            }
+        }))
+    }
+
+    fn respond_to_server_request(&mut self, request: &DaemonRpcServerRequest) -> Result<()> {
+        match request.method.as_str() {
+            // Approvals are handled by the TUI and explicitly responded later.
+            "item/commandExecution/requestApproval"
+            | "item/fileChange/requestApproval"
+            | "execCommandApproval"
+            | "applyPatchApproval" => Ok(()),
+            // We don't support dynamic tool execution yet; decline gracefully.
+            "item/tool/call" => self.send_json(&json!({
+                "id": request.request_id,
+                "result": {
+                    "success": false,
+                    "contentItems": [
+                        {
+                            "type": "inputText",
+                            "text": "Dynamic tool calls are not supported by this client."
+                        }
+                    ]
+                }
+            })),
+            // Keep protocol unblocked with a schema-compliant empty answer map.
+            "item/tool/requestUserInput" => self.send_json(&json!({
+                "id": request.request_id,
+                "result": { "answers": {} }
+            })),
+            // Unknown server-initiated request: reply with standard JSON-RPC method-not-found.
+            _ => self.send_rpc_error(
+                &request.request_id,
+                -32601,
+                &format!("Unhandled server request method: {}", request.method),
+            ),
+        }
     }
 
     fn request(&mut self, method: &str, params: Value) -> Result<DaemonRpcRequestResponse> {

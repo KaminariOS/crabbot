@@ -555,7 +555,7 @@ fn handle_app_server_approval_decision(
     let Some(request) = ui.pending_approvals.remove(&approval_key) else {
         bail!("pending approval id not found: {approval_key}");
     };
-    respond_to_approval(state, request.request_id, approve)?;
+    respond_to_approval(state, request.request_id, &request.method, approve)?;
     ui.status_message = Some(format!(
         "{} request {}",
         if approve { "approved" } else { "denied" },

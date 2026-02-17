@@ -113,16 +113,24 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
             }
             DaemonRpcStreamEvent::ServerRequest(request) => {
                 let summary = summarize_server_request(request);
-                events.push(UiEvent::ApprovalRequired(UiApprovalRequest {
-                    key: request_id_key_for_cli(&request.request_id),
-                    request_id: request.request_id.clone(),
-                    method: request.method.clone(),
-                    reason: request
-                        .params
-                        .get("reason")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string),
-                }));
+                if matches!(
+                    request.method.as_str(),
+                    "item/commandExecution/requestApproval"
+                        | "item/fileChange/requestApproval"
+                        | "execCommandApproval"
+                        | "applyPatchApproval"
+                ) {
+                    events.push(UiEvent::ApprovalRequired(UiApprovalRequest {
+                        key: request_id_key_for_cli(&request.request_id),
+                        request_id: request.request_id.clone(),
+                        method: request.method.clone(),
+                        reason: request
+                            .params
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .map(ToString::to_string),
+                    }));
+                }
                 events.push(UiEvent::TranscriptLine(summary));
             }
             DaemonRpcStreamEvent::DecodeError(error) => {
@@ -302,8 +310,19 @@ fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {
                 .unwrap_or("file change");
             format!("[approval required] request_id={key} file_change={reason}")
         }
+        "item/tool/call" => {
+            let tool = request
+                .params
+                .get("tool")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            format!("[tool call requested] request_id={key} tool={tool}")
+        }
+        "item/tool/requestUserInput" => {
+            format!("[tool user input requested] request_id={key}")
+        }
         _ => format!(
-            "[approval required] request_id={key} method={}",
+            "[server request] request_id={key} method={}",
             request.method
         ),
     }
@@ -333,7 +352,7 @@ pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Resul
                 {
                     "type": "text",
                     "text": text,
-                    "textElements": []
+                    "text_elements": []
                 }
             ]
         }),
@@ -374,14 +393,32 @@ pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<
 pub(crate) fn respond_to_approval(
     state: &CliState,
     request_id: Value,
+    method: &str,
     approve: bool,
 ) -> Result<()> {
+    let decision = match method {
+        "execCommandApproval" | "applyPatchApproval" => {
+            if approve {
+                "approved"
+            } else {
+                "denied"
+            }
+        }
+        _ => {
+            if approve {
+                "accept"
+            } else {
+                "decline"
+            }
+        }
+    };
+
     daemon_app_server_rpc_respond(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
         request_id,
         json!({
-            "decision": if approve { "accept" } else { "decline" }
+            "decision": decision
         }),
     )?;
     Ok(())
