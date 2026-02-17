@@ -161,7 +161,13 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
-            self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
+            if self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due() {
+                continue;
+            }
+            if self.widget.ui_mut().bottom_pane_is_in_paste_burst() {
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
             self.widget.draw(terminal)?;
             let mut should_redraw = false;
 
