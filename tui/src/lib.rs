@@ -77,6 +77,12 @@ extern crate self as codex_utils_cli;
 pub mod config {
     pub mod types {
         pub use crate::core_compat::config::types::NotificationMethod;
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum McpServerTransportConfig {
+            Stdio,
+            Sse,
+        }
     }
 
     /// Stub for `codex_core::config::Config` – only the fields that TUI modules
@@ -247,6 +253,8 @@ pub mod protocol {
     pub enum Op {
         Interrupt,
         UserInput { items: Vec<serde_json::Value> },
+        GetHistoryEntryRequest { offset: i32, log_id: Option<String> },
+        ListSkills { query: Option<String> },
         Shutdown,
     }
 
@@ -295,6 +303,41 @@ pub mod protocol {
     pub struct RateLimitSnapshot {
         pub limit_id: Option<String>,
         pub limit_name: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SessionSource {
+        Local,
+        Remote,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum ElicitationAction {
+        Accept,
+        Decline,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum McpAuthStatus {
+        Unknown,
+        Authorized,
+        Unauthorized,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct McpInvocation {
+        pub server_name: String,
+        pub tool_name: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SessionConfiguredEvent {
+        pub session_id: String,
+        #[serde(default)]
+        pub model: Option<String>,
     }
 
     /// MCP request identifier.
@@ -420,8 +463,32 @@ pub mod features {
         }
     }
 
+    #[derive(Debug, Clone, Default)]
+    pub struct Features;
+
+    impl Features {
+        pub fn with_defaults() -> Self {
+            Self
+        }
+
+        pub fn is_enabled(&self, _feature: Feature) -> bool {
+            false
+        }
+    }
+
     /// Static feature list (empty in stub — features are server-side in crabbot).
     pub static FEATURES: &[FeatureSpec] = &[];
+}
+
+pub mod skills {
+    pub mod model {
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub struct SkillMetadata {
+            pub name: String,
+            #[serde(default)]
+            pub description: Option<String>,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -627,6 +694,97 @@ mod codex_protocol_stub {
             Team,
             Business,
             Enterprise,
+        }
+    }
+
+    pub mod mcp {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        pub use crate::protocol::RequestId;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct Resource {
+            pub uri: String,
+            #[serde(default)]
+            pub name: Option<String>,
+            #[serde(default)]
+            pub description: Option<String>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct ResourceTemplate {
+            pub uri_template: String,
+            #[serde(default)]
+            pub name: Option<String>,
+            #[serde(default)]
+            pub description: Option<String>,
+        }
+    }
+
+    pub mod custom_prompts {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        pub const PROMPTS_CMD_PREFIX: &str = "prompts";
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct CustomPrompt {
+            pub name: String,
+            pub content: String,
+        }
+    }
+
+    pub mod user_input {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct ByteRange {
+            pub start: usize,
+            pub end: usize,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct TextElement {
+            pub kind: String,
+            pub range: ByteRange,
+        }
+    }
+
+    pub mod request_user_input {
+        use serde::Deserialize;
+        use serde::Serialize;
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct RequestUserInputAnswer {
+            pub value: String,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct RequestUserInputEvent {
+            pub request_id: String,
+            #[serde(default)]
+            pub prompt: Option<String>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct RequestUserInputResponse {
+            #[serde(default)]
+            pub answers: BTreeMap<String, RequestUserInputAnswer>,
+        }
+    }
+
+    pub mod models {
+        pub fn local_image_label_text() -> &'static str {
+            "local image"
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum WebSearchAction {
+            Requested,
+            Cached,
         }
     }
 }
