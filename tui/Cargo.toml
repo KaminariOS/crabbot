@@ -11,15 +11,19 @@ path = "src/lib.rs"
 
 [dependencies]
 anyhow.workspace = true
+base64 = "0.22"
 codex-utils-fuzzy-match = { path = "/home/kosumi/repos/codex/codex-rs/utils/fuzzy-match" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
+dunce = "1.0.5"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
 ratatui = { version = "0.29", features = [
     "scrolling-regions",
     "unstable-backend-writer",
     "unstable-rendered-line-info",
     "unstable-widget-ref",
 ] }
+ratatui-macros = "0.7"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
@@ -30,6 +34,7 @@ strum = "0.27.2"
 strum_macros = "0.27.2"
 tokio = { workspace = true, features = ["process"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["time"] }
 textwrap = "0.16"
 unicode-segmentation = "1"
 unicode-width = "0.2"
@@ -47,6 +52,9 @@ tempfile = "3"
 diffy = "0.4.2"
 pathdiff = "0.2.3"
 dirs = "6.0.0"
+lazy_static = "1.5.0"
+regex-lite = "0.1.6"
+toml = "0.8"
 uuid = { version = "1.21.0", features = ["v4"] }
 tungstenite = "0.28.0"
 url.workspace = true
@@ -54,7 +62,12 @@ url.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(not(target_os = "android"))'.dependencies]
+arboard = "3.6.1"
+
 [dev-dependencies]
 insta = "1.46.3"
 pretty_assertions = "1"
+serial_test = "3"
 tempfile = "3"
+vt100 = "0.15"

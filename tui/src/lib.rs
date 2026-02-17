@@ -60,10 +60,12 @@ use url::Url;
 
 extern crate self as codex_chatgpt;
 extern crate self as codex_core;
+extern crate self as codex_feedback;
 extern crate self as codex_file_search;
 extern crate self as codex_protocol;
 extern crate self as codex_utils_approval_presets;
 extern crate self as codex_utils_cli;
+extern crate self as codex_utils_sandbox_summary;
 
 pub mod config {
     pub mod types {
@@ -235,6 +237,18 @@ pub mod protocol {
     pub enum ExecCommandSource {
         Agent,
         User,
+        UserShell,
+        UnifiedExecStartup,
+        UnifiedExecInteraction,
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub enum SkillScope {
+        User,
+        Repo,
+        System,
+        Admin,
     }
 
     /// Stub for `codex_core::protocol::Op` – submission operation.
@@ -398,6 +412,32 @@ pub mod git_info {
 }
 
 pub mod parse_command {
+    use serde::Deserialize;
+    use serde::Serialize;
+    use std::path::PathBuf;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ParsedCommand {
+        Read {
+            cmd: String,
+            name: String,
+            path: PathBuf,
+        },
+        ListFiles {
+            cmd: String,
+            path: Option<String>,
+        },
+        Search {
+            cmd: String,
+            query: Option<String>,
+            path: Option<String>,
+        },
+        Unknown {
+            cmd: String,
+        },
+    }
+
     /// Extract shell name and script from a command like `["bash", "-lc", "echo hello"]`.
     pub fn extract_shell_command(command: &[String]) -> Option<(&str, &str)> {
         if command.len() >= 3 {
@@ -474,10 +514,20 @@ pub mod features {
 pub mod skills {
     pub mod model {
         #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+        pub struct SkillInterface {
+            #[serde(default)]
+            pub short_description: Option<String>,
+        }
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
         pub struct SkillMetadata {
             pub name: String,
             #[serde(default)]
             pub description: Option<String>,
+            #[serde(default)]
+            pub short_description: Option<String>,
+            #[serde(default)]
+            pub interface: Option<SkillInterface>,
         }
     }
 }
@@ -501,6 +551,31 @@ mod codex_chatgpt_stub {
             pub install_url: Option<String>,
             #[serde(default)]
             pub is_accessible: bool,
+        }
+
+        pub fn connector_display_label(connector: &AppInfo) -> String {
+            connector.name.clone()
+        }
+
+        pub fn connector_mention_slug(connector: &AppInfo) -> String {
+            connector_name_slug(&connector.name)
+        }
+
+        fn connector_name_slug(name: &str) -> String {
+            let mut normalized = String::with_capacity(name.len());
+            for character in name.chars() {
+                if character.is_ascii_alphanumeric() {
+                    normalized.push(character.to_ascii_lowercase());
+                } else {
+                    normalized.push('-');
+                }
+            }
+            let normalized = normalized.trim_matches('-');
+            if normalized.is_empty() {
+                "app".to_string()
+            } else {
+                normalized.to_string()
+            }
         }
     }
 }
@@ -749,15 +824,44 @@ mod codex_protocol_stub {
         use std::collections::BTreeMap;
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct RequestUserInputQuestionOption {
+            pub label: String,
+            pub description: String,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct RequestUserInputQuestion {
+            pub id: String,
+            pub header: String,
+            pub question: String,
+            #[serde(default, rename = "isOther")]
+            pub is_other: bool,
+            #[serde(default, rename = "isSecret")]
+            pub is_secret: bool,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub options: Option<Vec<RequestUserInputQuestionOption>>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct RequestUserInputAnswer {
+            #[serde(default)]
+            pub answers: Vec<String>,
+            #[serde(default)]
             pub value: String,
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct RequestUserInputEvent {
+            #[serde(default)]
+            pub call_id: String,
+            #[serde(default)]
+            pub turn_id: String,
+            #[serde(default)]
             pub request_id: String,
             #[serde(default)]
             pub prompt: Option<String>,
+            #[serde(default)]
+            pub questions: Vec<RequestUserInputQuestion>,
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -780,6 +884,13 @@ mod codex_protocol_stub {
     }
 }
 pub use codex_protocol_stub::*;
+
+#[derive(Debug, Clone, Default)]
+pub struct CodexLogSnapshot;
+
+pub fn summarize_sandbox_policy(policy: &protocol::SandboxPolicy) -> String {
+    policy.to_string()
+}
 
 /// Stub backing `codex_utils_approval_presets`.
 mod codex_utils_approval_presets_stub {
