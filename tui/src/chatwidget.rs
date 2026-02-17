@@ -24,7 +24,11 @@ use crate::history_cell::new_user_prompt;
 use crate::history_cell::new_web_search_call;
 use crate::key_hint;
 use crate::mention_codec;
+use crate::render::Insets;
+use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
+use crate::render::renderable::RenderableExt;
+use crate::render::renderable::RenderableItem;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
 use crate::streaming::chunking::AdaptiveChunkingPolicy;
@@ -46,6 +50,28 @@ pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
     submitted_at: Instant,
     pub(crate) handle: thread::JoinHandle<Result<DaemonPromptResponse>>,
+}
+
+struct TranscriptRenderable<'a> {
+    ui: &'a LiveAttachTui,
+}
+
+impl Renderable for TranscriptRenderable<'_> {
+    fn render(&self, area: Rect, buf: &mut Buffer) {
+        let history_lines_vec = self.ui.history_view_lines(area.width);
+        let history_lines = history_lines_vec.len().max(1) as u16;
+        let max_scroll = history_lines.saturating_sub(area.height);
+        let scroll = max_scroll.saturating_sub(self.ui.history_scroll_offset.min(max_scroll));
+        Paragraph::new(history_lines_vec)
+            .style(Style::default())
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
+            .render(area, buf);
+    }
+
+    fn desired_height(&self, width: u16) -> u16 {
+        self.ui.history_view_lines(width).len().max(1) as u16
+    }
 }
 
 pub(crate) struct LiveAttachTui {
@@ -865,64 +891,15 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn desired_height(&self, width: u16) -> u16 {
-        let history_height = self.history_view_lines(width).len().max(1) as u16;
-        let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
-        let bottom_pane_height = self.bottom_pane.desired_height(width).max(1);
-        history_height
-            .saturating_add(1)
-            .saturating_add(shortcuts_overlay_height)
-            .saturating_add(1)
-            .saturating_add(bottom_pane_height)
+        self.as_renderable().desired_height(width)
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
-        let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
-        let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
-        let bottom_pane_height = self.bottom_pane.desired_height(area.width).max(1);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(shortcuts_overlay_height),
-                Constraint::Length(1),
-                Constraint::Length(bottom_pane_height),
-            ])
-            .split(area);
-
-        let history_lines_vec = self.history_view_lines(chunks[1].width);
-        let history_lines = history_lines_vec.len().max(1) as u16;
-        let max_scroll = history_lines.saturating_sub(chunks[1].height);
-        self.history_scroll_offset = self.history_scroll_offset.min(max_scroll);
-        let scroll = max_scroll.saturating_sub(self.history_scroll_offset);
-        Paragraph::new(history_lines_vec)
-            .style(Style::default())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .render(chunks[1], buf);
-
-        if shortcuts_overlay_height > 0 {
-            Paragraph::new(shortcuts_overlay_lines)
-                .style(self.composer_row_style())
-                .render(chunks[2], buf);
-        }
-        self.bottom_pane.render(chunks[4], buf);
+        self.as_renderable().render(area, buf);
     }
 
     pub(crate) fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
-        let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
-        let bottom_pane_height = self.bottom_pane.desired_height(area.width).max(1);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Min(1),
-                Constraint::Length(shortcuts_overlay_height),
-                Constraint::Length(1),
-                Constraint::Length(bottom_pane_height),
-            ])
-            .split(area);
-        self.bottom_pane.cursor_pos(chunks[4])
+        self.as_renderable().cursor_pos(area)
     }
 
     pub(crate) fn scroll_history_page_up(&mut self) {
@@ -1034,6 +1011,18 @@ impl LiveAttachTui {
         } else {
             self.bottom_pane.hide_status_indicator();
         }
+    }
+
+    fn as_renderable(&self) -> RenderableItem<'_> {
+        let transcript = RenderableItem::Owned(Box::new(TranscriptRenderable { ui: self }))
+            .inset(Insets::tlbr(1, 0, 0, 0));
+        let mut flex = FlexRenderable::new();
+        flex.push(1, transcript);
+        flex.push(
+            0,
+            RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),
+        );
+        RenderableItem::Owned(Box::new(flex))
     }
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
