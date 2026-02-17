@@ -110,6 +110,7 @@ pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     history_cells: Vec<Box<dyn HistoryCell>>,
     active_cell: Option<Box<dyn HistoryCell>>,
+    active_cell_revision: u64,
     history_cells_flushed_to_scrollback: usize,
     adaptive_chunking: AdaptiveChunkingPolicy,
     assistant_stream: StreamController,
@@ -176,6 +177,7 @@ impl LiveAttachTui {
             session_id,
             history_cells: Vec::new(),
             active_cell: None,
+            active_cell_revision: 0,
             history_cells_flushed_to_scrollback: 0,
             adaptive_chunking: AdaptiveChunkingPolicy::default(),
             assistant_stream: StreamController::new(None),
@@ -569,6 +571,7 @@ impl LiveAttachTui {
             )
         {
             *exec_cell = updated;
+            self.bump_active_cell_revision();
             return;
         }
 
@@ -576,6 +579,7 @@ impl LiveAttachTui {
         self.active_cell = Some(Box::new(new_active_exec_command(
             call_id, command, parsed, source, None, true,
         )));
+        self.bump_active_cell_revision();
     }
 
     fn on_exec_command_output_delta(&mut self, call_id: &str, delta: &str) {
@@ -588,6 +592,7 @@ impl LiveAttachTui {
             .and_then(|cell| cell.as_any_mut().downcast_mut::<ExecCell>())
             && exec_cell.append_output(call_id, delta)
         {
+            self.bump_active_cell_revision();
             return;
         }
 
@@ -632,6 +637,8 @@ impl LiveAttachTui {
             );
             if exec_cell.should_flush() {
                 self.flush_active_cell();
+            } else {
+                self.bump_active_cell_revision();
             }
             return;
         }
@@ -657,6 +664,7 @@ impl LiveAttachTui {
             duration,
         );
         self.active_cell = Some(Box::new(cell));
+        self.bump_active_cell_revision();
         self.flush_active_cell();
     }
 
@@ -670,6 +678,7 @@ impl LiveAttachTui {
         self.active_cell = Some(Box::new(new_active_mcp_tool_call(
             call_id, invocation, true,
         )));
+        self.bump_active_cell_revision();
     }
 
     fn on_mcp_tool_call_end(
@@ -685,6 +694,7 @@ impl LiveAttachTui {
             && mcp_cell.call_id() == call_id
         {
             let image_cell = mcp_cell.complete(duration, result);
+            self.bump_active_cell_revision();
             self.flush_active_cell();
             if let Some(extra) = image_cell {
                 self.add_boxed_history(extra);
@@ -703,6 +713,7 @@ impl LiveAttachTui {
         self.flush_assistant_message();
         self.flush_active_cell();
         self.active_cell = Some(Box::new(new_active_web_search_call(call_id, query, true)));
+        self.bump_active_cell_revision();
     }
 
     fn on_web_search_end(
@@ -718,6 +729,7 @@ impl LiveAttachTui {
         {
             web_cell.update(action.clone(), query.clone());
             web_cell.complete();
+            self.bump_active_cell_revision();
             self.flush_active_cell();
             return;
         }
@@ -1815,7 +1827,27 @@ impl LiveAttachTui {
     fn flush_active_cell(&mut self) {
         if let Some(cell) = self.active_cell.take() {
             self.add_boxed_history(cell);
+            self.bump_active_cell_revision();
         }
+    }
+
+    fn bump_active_cell_revision(&mut self) {
+        self.active_cell_revision = self.active_cell_revision.wrapping_add(1);
+    }
+
+    pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
+        let cell = self.active_cell.as_ref()?;
+        Some(ActiveCellTranscriptKey {
+            revision: self.active_cell_revision,
+            is_stream_continuation: cell.is_stream_continuation(),
+            animation_tick: cell.transcript_animation_tick(),
+        })
+    }
+
+    pub(crate) fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
+        self.active_cell
+            .as_ref()
+            .map(|cell| cell.transcript_lines(width))
     }
 
     pub(crate) fn reset_for_thread_switch(&mut self, thread_id: String) {
@@ -2372,6 +2404,13 @@ pub(crate) struct ChatWidget {
     ui: LiveAttachTui,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ActiveCellTranscriptKey {
+    pub(crate) revision: u64,
+    pub(crate) is_stream_continuation: bool,
+    pub(crate) animation_tick: Option<u64>,
+}
+
 impl ChatWidget {
     pub(crate) fn new(thread_id: String) -> Self {
         Self {
@@ -2397,6 +2436,14 @@ impl ChatWidget {
 
     pub(crate) fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
         self.ui.cursor_pos(area)
+    }
+
+    pub(crate) fn active_cell_transcript_key(&self) -> Option<ActiveCellTranscriptKey> {
+        self.ui.active_cell_transcript_key()
+    }
+
+    pub(crate) fn active_cell_transcript_lines(&self, width: u16) -> Option<Vec<Line<'static>>> {
+        self.ui.active_cell_transcript_lines(width)
     }
 }
 
