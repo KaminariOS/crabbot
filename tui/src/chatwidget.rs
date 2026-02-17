@@ -127,6 +127,13 @@ pub(crate) struct ReviewCommitPickerEntry {
     pub(crate) subject: String,
 }
 
+pub(crate) struct SkillsToggleEntry {
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) enabled: bool,
+}
+
 impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
         let (ui_event_tx_raw, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
@@ -1140,6 +1147,62 @@ impl LiveAttachTui {
         let params =
             crate::bottom_pane::feedback_selection_params(self.bottom_pane_event_tx.clone());
         self.bottom_pane.show_selection_view(params);
+    }
+
+    pub(crate) fn open_skills_menu(&mut self) {
+        let items = vec![
+            crate::bottom_pane::SelectionItem {
+                name: "List skills".to_string(),
+                description: Some("Tip: press $ to open this list directly.".to_string()),
+                actions: vec![Box::new(|sender| {
+                    sender.send(UiAppEvent::OpenSkillsList);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+            crate::bottom_pane::SelectionItem {
+                name: "Enable/Disable Skills".to_string(),
+                description: Some("Enable or disable skills.".to_string()),
+                actions: vec![Box::new(|sender| {
+                    sender.send(UiAppEvent::OpenManageSkillsPopup);
+                })],
+                dismiss_on_select: true,
+                ..Default::default()
+            },
+        ];
+        self.bottom_pane
+            .show_selection_view(crate::bottom_pane::SelectionViewParams {
+                title: Some("Skills".to_string()),
+                subtitle: Some("Choose an action".to_string()),
+                footer_hint: Some(crate::bottom_pane::popup_consts::standard_popup_hint_line()),
+                items,
+                ..Default::default()
+            });
+    }
+
+    pub(crate) fn open_manage_skills_popup(&mut self, entries: Vec<SkillsToggleEntry>) {
+        if entries.is_empty() {
+            self.add_history_cell(Box::new(new_info_event(
+                "No skills available.".to_string(),
+                None,
+            )));
+            return;
+        }
+
+        let items = entries
+            .into_iter()
+            .map(|entry| crate::bottom_pane::SkillsToggleItem {
+                name: entry.name,
+                skill_name: String::new(),
+                description: entry.description,
+                enabled: entry.enabled,
+                path: entry.path,
+            })
+            .collect::<Vec<_>>();
+
+        let view =
+            crate::bottom_pane::SkillsToggleView::new(items, self.bottom_pane_event_tx.clone());
+        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn open_feedback_consent(

@@ -550,6 +550,12 @@ impl App {
                 WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
                     self.open_permissions_picker()?;
                 }
+                WidgetAppEvent::OpenSkillsList => {
+                    self.widget.ui_mut().bottom_pane_insert_str("$");
+                }
+                WidgetAppEvent::OpenManageSkillsPopup => {
+                    self.open_manage_skills_popup()?;
+                }
                 WidgetAppEvent::OpenReviewBranchPicker(cwd) => {
                     self.open_review_branch_picker(&cwd);
                 }
@@ -604,6 +610,17 @@ impl App {
                 }
                 WidgetAppEvent::UpdatePersonality(personality) => {
                     self.apply_personality_selection(personality)?;
+                }
+                WidgetAppEvent::SetSkillEnabled { path, enabled } => {
+                    self.apply_skill_enabled(path, enabled)?;
+                }
+                WidgetAppEvent::SetAppEnabled { id, enabled } => {
+                    self.apply_app_enabled(id, enabled)?;
+                }
+                WidgetAppEvent::ManageSkillsClosed => {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("skill settings updated".to_string()));
                 }
                 WidgetAppEvent::OpenFeedbackConsent { category } => {
                     let thread_id = self.widget.ui_mut().session_id.clone();
@@ -768,29 +785,7 @@ impl App {
                 let diff_text = run_diff_now();
                 self.widget.ui_mut().push_line(&diff_text);
             }
-            SlashCommand::Skills => match fetch_skills_for_cwd(&self.state) {
-                Ok(skills) if skills.is_empty() => {
-                    self.widget.ui_mut().push_line("No skills available.");
-                }
-                Ok(skills) => {
-                    self.widget.ui_mut().push_line("Skills:");
-                    for skill in skills {
-                        self.widget.ui_mut().push_line(&format!(
-                            "- {}{}",
-                            skill.name,
-                            if skill.description.is_empty() {
-                                String::new()
-                            } else {
-                                format!(": {}", skill.description)
-                            }
-                        ));
-                    }
-                }
-                Err(err) => self
-                    .widget
-                    .ui_mut()
-                    .push_line(&format!("Failed to load skills: {err}")),
-            },
+            SlashCommand::Skills => self.widget.ui_mut().open_skills_menu(),
             SlashCommand::Apps => match fetch_connectors(&self.state) {
                 Ok(snapshot) if snapshot.connectors.is_empty() => {
                     self.widget.ui_mut().push_line("No apps available.");
@@ -1274,6 +1269,21 @@ impl App {
         Ok(())
     }
 
+    fn open_manage_skills_popup(&mut self) -> Result<()> {
+        let entries = fetch_skills_toggle_entries(&self.state)?;
+        let mapped = entries
+            .into_iter()
+            .map(|entry| crate::chatwidget::SkillsToggleEntry {
+                path: entry.path,
+                name: entry.name,
+                description: entry.description,
+                enabled: entry.enabled,
+            })
+            .collect::<Vec<_>>();
+        self.widget.ui_mut().open_manage_skills_popup(mapped);
+        Ok(())
+    }
+
     fn apply_model_selection(&mut self, model: String) -> Result<()> {
         app_server_rpc_request(
             &self.state.config.app_server_endpoint,
@@ -1310,6 +1320,58 @@ impl App {
             "personality set to {}",
             personality_label(personality)
         )));
+        Ok(())
+    }
+
+    fn apply_skill_enabled(&mut self, path: std::path::PathBuf, enabled: bool) -> Result<()> {
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "skills/config/write",
+            json!({
+                "path": path,
+                "enabled": enabled,
+            }),
+        )?;
+        self.refresh_skills_snapshot()?;
+        Ok(())
+    }
+
+    fn apply_app_enabled(&mut self, id: String, enabled: bool) -> Result<()> {
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": format!("apps.{id}.enabled"),
+                "value": enabled,
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        app_server_rpc_request(
+            &self.state.config.app_server_endpoint,
+            self.state.config.auth_token.as_deref(),
+            "config/value/write",
+            json!({
+                "keyPath": format!("apps.{id}.disabled_reason"),
+                "value": if enabled { Value::Null } else { Value::String("user".to_string()) },
+                "mergeStrategy": "replace",
+            }),
+        )?;
+        if let Ok(snapshot) = fetch_connectors(&self.state) {
+            self.widget.ui_mut().set_connectors_snapshot(Some(snapshot));
+        }
+        self.widget.ui_mut().set_status_message(Some(format!(
+            "app {} {}",
+            id,
+            if enabled { "enabled" } else { "disabled" }
+        )));
+        Ok(())
+    }
+
+    fn refresh_skills_snapshot(&mut self) -> Result<()> {
+        let skills = fetch_skills_for_cwd(&self.state)?;
+        self.widget.ui_mut().set_skills(Some(skills));
         Ok(())
     }
 
@@ -2050,6 +2112,64 @@ fn fetch_skills_for_cwd(state: &CliState) -> Result<Vec<codex_core::skills::mode
                 interface: None,
                 path,
                 scope: codex_core::protocol::SkillScope::User,
+            });
+        }
+    }
+    Ok(out)
+}
+
+struct SkillToggleEntry {
+    path: std::path::PathBuf,
+    name: String,
+    description: String,
+    enabled: bool,
+}
+
+fn fetch_skills_toggle_entries(state: &CliState) -> Result<Vec<SkillToggleEntry>> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "skills/list",
+        json!({
+            "cwds": [cwd],
+            "forceReload": false
+        }),
+    )?;
+    let mut out = Vec::new();
+    let data = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in data {
+        let Some(skills) = entry.get("skills").and_then(Value::as_array) else {
+            continue;
+        };
+        for skill in skills {
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let path = skill
+                .get("path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let enabled = skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            out.push(SkillToggleEntry {
+                path,
+                name: name.to_string(),
+                description,
+                enabled,
             });
         }
     }
