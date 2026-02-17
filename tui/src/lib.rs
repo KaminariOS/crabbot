@@ -358,16 +358,8 @@ pub mod web_search {
         action: Option<&crate::models::WebSearchAction>,
         query: &str,
     ) -> String {
-        let prefix = match action {
-            Some(crate::models::WebSearchAction::Cached) => "cached",
-            Some(crate::models::WebSearchAction::Requested) => "searching",
-            None => "search",
-        };
-        if query.trim().is_empty() {
-            prefix.to_string()
-        } else {
-            format!("{prefix}: {query}")
-        }
+        let _ = action;
+        query.to_string()
     }
 }
 
