@@ -161,13 +161,8 @@ impl App {
 
     fn event_loop(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
         loop {
-            if self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due() {
-                continue;
-            }
-            if self.widget.ui_mut().bottom_pane_is_in_paste_burst() {
-                thread::sleep(Duration::from_millis(5));
-                continue;
-            }
+            let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
+            let in_paste_burst = self.widget.ui_mut().bottom_pane_is_in_paste_burst();
             let _ = self.widget.ui_mut().commit_assistant_stream_tick();
             self.widget.draw(terminal)?;
             let mut should_redraw = false;
@@ -211,6 +206,10 @@ impl App {
             should_redraw |= drained.redraw;
 
             if !should_redraw {
+                if in_paste_burst {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 thread::sleep(TUI_STREAM_POLL_INTERVAL);
             }
         }
@@ -363,6 +362,13 @@ impl App {
         let ui = self.widget.ui_mut();
         if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
             ui.hide_shortcuts_overlay();
+            return Ok(LiveTuiAction::Continue);
+        }
+        if key.code == KeyCode::Esc
+            && ui.bottom_pane_is_task_running()
+            && ui.bottom_pane_no_modal_or_popup_active()
+        {
+            self.app_event_tx.send(AppEvent::Interrupt);
             return Ok(LiveTuiAction::Continue);
         }
         match key.code {

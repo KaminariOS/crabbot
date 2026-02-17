@@ -154,6 +154,8 @@ impl LiveAttachTui {
             UiEvent::TurnStarted(turn_id) => {
                 self.active_turn_id = Some(turn_id);
                 self.assistant_stream = StreamController::new(None);
+                self.bottom_pane.set_task_running(true);
+                self.bottom_pane.set_interrupt_hint_visible(true);
                 self.status_message = Some("running turn...".to_string());
             }
             UiEvent::AssistantDelta { turn_id, delta } => {
@@ -176,6 +178,8 @@ impl LiveAttachTui {
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
                 self.active_turn_id = None;
+                self.bottom_pane.set_task_running(false);
+                self.bottom_pane.set_interrupt_hint_visible(false);
                 if let Some(status) = status
                     && status != "completed"
                 {
@@ -696,6 +700,14 @@ impl LiveAttachTui {
         self.bottom_pane.is_in_paste_burst()
     }
 
+    pub(crate) fn bottom_pane_is_task_running(&self) -> bool {
+        self.bottom_pane.is_task_running()
+    }
+
+    pub(crate) fn bottom_pane_no_modal_or_popup_active(&self) -> bool {
+        self.bottom_pane.no_modal_or_popup_active()
+    }
+
     pub(crate) fn bottom_pane_composer_text(&self) -> String {
         self.bottom_pane.composer_text()
     }
@@ -704,7 +716,6 @@ impl LiveAttachTui {
         if let Some(msg) = &self.status_message {
             self.bottom_pane
                 .update_status("session".to_string(), Some(msg.clone()));
-            self.bottom_pane.ensure_status_indicator();
         } else {
             self.bottom_pane.hide_status_indicator();
         }
