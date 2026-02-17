@@ -1003,6 +1003,8 @@ fn item_id_from_params(params: &Value) -> Option<String> {
     params
         .get("itemId")
         .or_else(|| params.get("callId"))
+        .or_else(|| params.get("id"))
+        .or_else(|| params.get("item").and_then(|item| item.get("id")))
         .and_then(Value::as_str)
         .map(ToString::to_string)
 }
