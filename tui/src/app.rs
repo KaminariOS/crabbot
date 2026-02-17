@@ -1082,6 +1082,50 @@ pub(crate) fn align_left_right(left: &str, right: &str, width: usize) -> String 
 
 #[cfg(test)]
 mod tests {
+    use super::App;
+    use super::AppEventSender;
+    use super::CliState;
+    use super::LiveTuiAction;
+    use crate::app_event_sender::AppEventSender as WidgetAppEventSender;
+    use crate::bottom_pane::MentionBinding;
+    use crate::chatwidget::ChatWidget;
+    use crate::file_search::FileSearchManager;
+
+    fn make_test_app() -> App {
+        let widget = ChatWidget::new("sess_test".to_string());
+        let state = CliState::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
+        let widget_sender = WidgetAppEventSender::new(widget_tx);
+        let file_search = FileSearchManager::new(std::env::temp_dir(), widget_sender);
+
+        App {
+            widget,
+            state,
+            thread_id: "sess_test".to_string(),
+            app_event_tx: AppEventSender::new(tx),
+            app_event_rx: rx,
+            widget_event_rx: widget_rx,
+            file_search,
+        }
+    }
+
+    #[test]
+    fn handle_submit_status_sets_visible_status_message() {
+        let mut app = make_test_app();
+        let action = app
+            .handle_submit("/status", Vec::new(), Vec::<MentionBinding>::new())
+            .expect("status submit should not fail");
+        assert!(matches!(action, LiveTuiAction::Continue));
+        let status = app
+            .widget
+            .ui_mut()
+            .status_message
+            .clone()
+            .expect("status message should be set");
+        assert!(status.contains("thread=sess_test"), "status={status}");
+    }
+
     use super::LiveAttachTui;
 
     #[test]
