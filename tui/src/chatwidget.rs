@@ -571,32 +571,21 @@ impl LiveAttachTui {
                 action,
             } => self.on_web_search_end(&call_id, query, action),
             UiEvent::ThreadRolledBack { num_turns } => {
-                if num_turns > 0 {
-                    self.apply_non_pending_thread_rollback(num_turns as u32);
-                    self.push_line(&format!("[thread rolled back] {num_turns} turns"));
-                } else {
-                    self.push_line("[thread rolled back]");
+                if from_replay {
+                    self.bottom_pane_event_tx
+                        .send(UiAppEvent::ApplyThreadRollback {
+                            num_turns: u32::try_from(num_turns).unwrap_or(u32::MAX),
+                        });
                 }
             }
-            UiEvent::TurnDiffUpdated { unified_diff } => {
-                self.add_boxed_history(Box::new(new_info_event(
-                    "[turn diff updated]".to_string(),
-                    Some(unified_diff),
-                )));
+            UiEvent::TurnDiffUpdated { unified_diff: _ } => {
+                self.refresh_status_line();
             }
             UiEvent::UndoStarted { message } => {
-                if let Some(message) = message {
-                    self.push_line(&format!("[undo started] {message}"));
-                } else {
-                    self.push_line("[undo started]");
-                }
+                self.on_undo_started(message);
             }
             UiEvent::UndoCompleted { message } => {
-                if let Some(message) = message {
-                    self.push_line(&format!("[undo completed] {message}"));
-                } else {
-                    self.push_line("[undo completed]");
-                }
+                self.on_undo_completed(message);
             }
             UiEvent::PlanUpdated(update) => {
                 self.add_boxed_history(Box::new(crate::history_cell::new_plan_update(update)));
@@ -632,10 +621,7 @@ impl LiveAttachTui {
                 )));
             }
             UiEvent::BackgroundEvent { message } => {
-                self.add_boxed_history(Box::new(new_info_event(
-                    "[background event]".to_string(),
-                    Some(message),
-                )));
+                self.on_background_event(message);
             }
             UiEvent::ReviewModeEntered { hint } => {
                 let banner = hint
@@ -1595,6 +1581,24 @@ impl LiveAttachTui {
         self.add_boxed_history(Box::new(crate::history_cell::new_warning_event(
             message.into(),
         )));
+    }
+
+    fn on_background_event(&mut self, message: String) {
+        self.bottom_pane.ensure_status_indicator();
+        self.bottom_pane.set_interrupt_hint_visible(true);
+        self.status_message = Some(message);
+    }
+
+    fn on_undo_started(&mut self, message: Option<String>) {
+        self.bottom_pane.ensure_status_indicator();
+        self.bottom_pane.set_interrupt_hint_visible(false);
+        self.status_message = Some(message.unwrap_or_else(|| "Undo in progress...".to_string()));
+    }
+
+    fn on_undo_completed(&mut self, message: Option<String>) {
+        self.bottom_pane.hide_status_indicator();
+        let message = message.unwrap_or_else(|| "Undo completed successfully.".to_string());
+        self.add_boxed_history(Box::new(new_info_event(message, None)));
     }
 
     fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
