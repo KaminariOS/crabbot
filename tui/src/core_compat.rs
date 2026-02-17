@@ -69,6 +69,7 @@ pub(crate) enum UiEvent {
     },
     ExecCommandBegin {
         call_id: String,
+        process_id: Option<String>,
         command: Vec<String>,
         parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
         source: codex_core::protocol::ExecCommandSource,
@@ -83,7 +84,10 @@ pub(crate) enum UiEvent {
     },
     ExecCommandEnd {
         call_id: String,
+        process_id: Option<String>,
+        source: codex_core::protocol::ExecCommandSource,
         exit_code: i32,
+        formatted_output: String,
         aggregated_output: String,
         duration: Duration,
     },
@@ -343,6 +347,12 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 vec![UiEvent::ExecCommandBegin {
                     call_id: item_id_from_params(&notification.params)
                         .unwrap_or_else(|| "exec".to_string()),
+                    process_id: notification
+                        .params
+                        .get("processId")
+                        .or_else(|| notification.params.get("process_id"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string),
                     command: parts
                         .iter()
                         .filter_map(Value::as_str)
@@ -366,7 +376,22 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             };
             vec![UiEvent::ExecCommandEnd {
                 call_id,
+                process_id: notification
+                    .params
+                    .get("processId")
+                    .or_else(|| notification.params.get("process_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                source: parse_exec_source(notification.params.get("source")),
                 exit_code: exit_code as i32,
+                formatted_output: notification
+                    .params
+                    .get("formattedOutput")
+                    .or_else(|| notification.params.get("formatted_output"))
+                    .or_else(|| notification.params.get("output"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
                 aggregated_output: notification
                     .params
                     .get("aggregatedOutput")
@@ -1121,6 +1146,11 @@ fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
             let command = command_vec_from_value(item.get("command"));
             vec![UiEvent::ExecCommandBegin {
                 call_id,
+                process_id: item
+                    .get("processId")
+                    .or_else(|| item.get("process_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
                 command: if command.is_empty() {
                     vec!["command".to_string()]
                 } else {
@@ -1207,6 +1237,13 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
+            let formatted_output = item
+                .get("formattedOutput")
+                .or_else(|| item.get("formatted_output"))
+                .or_else(|| item.get("output"))
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| aggregated_output.as_str())
+                .to_string();
             let duration_ms = item
                 .get("durationMs")
                 .or_else(|| item.get("duration_ms"))
@@ -1214,7 +1251,14 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
                 .unwrap_or_default();
             vec![UiEvent::ExecCommandEnd {
                 call_id: call_id.to_string(),
+                process_id: item
+                    .get("processId")
+                    .or_else(|| item.get("process_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                source: parse_exec_source(item.get("source")),
                 exit_code,
+                formatted_output,
                 aggregated_output,
                 duration: duration_ms_to_duration(duration_ms),
             }]

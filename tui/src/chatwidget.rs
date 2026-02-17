@@ -13,6 +13,7 @@ use crate::core_compat::map_rpc_stream_events;
 use crate::exec_cell::CommandOutput;
 use crate::exec_cell::ExecCell;
 use crate::exec_cell::new_active_exec_command;
+use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
@@ -61,9 +62,53 @@ pub(crate) struct InFlightPrompt {
 }
 
 struct RunningCommand {
+    process_id: Option<String>,
     command: Vec<String>,
     parsed_cmd: Vec<codex_protocol::parse_command::ParsedCommand>,
     source: codex_core::protocol::ExecCommandSource,
+}
+
+struct UnifiedExecProcessSummary {
+    key: String,
+    call_id: String,
+    command_display: String,
+    recent_chunks: Vec<String>,
+}
+
+struct UnifiedExecWaitState {
+    command_display: String,
+}
+
+impl UnifiedExecWaitState {
+    fn new(command_display: String) -> Self {
+        Self { command_display }
+    }
+
+    fn is_duplicate(&self, command_display: &str) -> bool {
+        self.command_display == command_display
+    }
+}
+
+#[derive(Clone, Debug)]
+struct UnifiedExecWaitStreak {
+    process_id: String,
+    command_display: Option<String>,
+}
+
+impl UnifiedExecWaitStreak {
+    fn new(process_id: String, command_display: Option<String>) -> Self {
+        Self {
+            process_id,
+            command_display: command_display.filter(|display| !display.is_empty()),
+        }
+    }
+
+    fn update_command_display(&mut self, command_display: Option<String>) {
+        if self.command_display.is_some() {
+            return;
+        }
+        self.command_display = command_display.filter(|display| !display.is_empty());
+    }
 }
 
 #[derive(Debug)]
@@ -88,13 +133,17 @@ enum QueuedUiInterrupt {
     RequestUserInputRequest(codex_protocol::request_user_input::RequestUserInputEvent),
     ExecCommandBegin {
         call_id: String,
+        process_id: Option<String>,
         command: Vec<String>,
         parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
         source: codex_core::protocol::ExecCommandSource,
     },
     ExecCommandEnd {
         call_id: String,
+        process_id: Option<String>,
+        source: codex_core::protocol::ExecCommandSource,
         exit_code: i32,
+        formatted_output: String,
         aggregated_output: String,
         duration: Duration,
     },
@@ -183,6 +232,9 @@ pub(crate) struct LiveAttachTui {
     total_token_usage: codex_core::protocol::TokenUsage,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     running_commands: HashMap<String, RunningCommand>,
+    last_unified_wait: Option<UnifiedExecWaitState>,
+    unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
+    unified_exec_processes: Vec<UnifiedExecProcessSummary>,
     pending_interrupts: VecDeque<QueuedUiInterrupt>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
@@ -251,6 +303,9 @@ impl LiveAttachTui {
             total_token_usage: codex_core::protocol::TokenUsage::default(),
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             running_commands: HashMap::new(),
+            last_unified_wait: None,
+            unified_exec_wait_streak: None,
+            unified_exec_processes: Vec::new(),
             pending_interrupts: VecDeque::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
@@ -369,6 +424,8 @@ impl LiveAttachTui {
             UiEvent::TurnCompleted { status } => {
                 self.flush_assistant_message();
                 self.flush_active_cell();
+                self.flush_unified_exec_wait_streak();
+                self.clear_unified_exec_processes();
                 self.active_turn_id = None;
                 self.agent_turn_running = false;
                 self.update_task_running_state();
@@ -387,10 +444,11 @@ impl LiveAttachTui {
             }
             UiEvent::ExecCommandBegin {
                 call_id,
+                process_id,
                 command,
                 parsed,
                 source,
-            } => self.on_exec_command_begin_deferred(call_id, command, parsed, source),
+            } => self.on_exec_command_begin_deferred(call_id, process_id, command, parsed, source),
             UiEvent::ExecCommandOutputDelta { call_id, delta } => {
                 self.on_exec_command_output_delta(&call_id, &delta);
             }
@@ -399,10 +457,21 @@ impl LiveAttachTui {
             }
             UiEvent::ExecCommandEnd {
                 call_id,
+                process_id,
+                source,
                 exit_code,
+                formatted_output,
                 aggregated_output,
                 duration,
-            } => self.on_exec_command_end_deferred(call_id, exit_code, aggregated_output, duration),
+            } => self.on_exec_command_end_deferred(
+                call_id,
+                process_id,
+                source,
+                exit_code,
+                formatted_output,
+                aggregated_output,
+                duration,
+            ),
             UiEvent::McpToolCallBegin {
                 call_id,
                 invocation,
@@ -673,16 +742,28 @@ impl LiveAttachTui {
                 }
                 QueuedUiInterrupt::ExecCommandBegin {
                     call_id,
+                    process_id,
                     command,
                     parsed,
                     source,
-                } => self.on_exec_command_begin(call_id, command, parsed, source),
+                } => self.on_exec_command_begin(call_id, process_id, command, parsed, source),
                 QueuedUiInterrupt::ExecCommandEnd {
                     call_id,
+                    process_id,
+                    source,
                     exit_code,
+                    formatted_output,
                     aggregated_output,
                     duration,
-                } => self.on_exec_command_end(&call_id, exit_code, aggregated_output, duration),
+                } => self.on_exec_command_end(
+                    &call_id,
+                    process_id,
+                    source,
+                    exit_code,
+                    formatted_output,
+                    aggregated_output,
+                    duration,
+                ),
                 QueuedUiInterrupt::McpToolCallBegin {
                     call_id,
                     invocation,
@@ -750,6 +831,7 @@ impl LiveAttachTui {
     fn on_exec_command_begin(
         &mut self,
         call_id: String,
+        process_id: Option<String>,
         command: Vec<String>,
         parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
         source: codex_core::protocol::ExecCommandSource,
@@ -758,11 +840,18 @@ impl LiveAttachTui {
         self.running_commands.insert(
             call_id.clone(),
             RunningCommand {
+                process_id: process_id.clone(),
                 command: command.clone(),
                 parsed_cmd: parsed.clone(),
                 source,
             },
         );
+        self.track_unified_exec_process_begin(process_id.clone(), &call_id, &command, source);
+        if source == codex_core::protocol::ExecCommandSource::UnifiedExecInteraction {
+            self.last_unified_wait = Some(UnifiedExecWaitState::new(command.join(" ")));
+        } else {
+            self.last_unified_wait = None;
+        }
         if let Some(exec_cell) = self
             .active_cell
             .as_mut()
@@ -791,6 +880,7 @@ impl LiveAttachTui {
         if delta.is_empty() {
             return;
         }
+        self.track_unified_exec_output_chunk(call_id, delta);
         if let Some(exec_cell) = self
             .active_cell
             .as_mut()
@@ -807,11 +897,26 @@ impl LiveAttachTui {
     fn on_exec_command_end(
         &mut self,
         call_id: &str,
+        process_id: Option<String>,
+        source: codex_core::protocol::ExecCommandSource,
         exit_code: i32,
+        formatted_output: String,
         aggregated_output: String,
         duration: Duration,
     ) {
         let running = self.running_commands.remove(call_id);
+        let completed_process_id = process_id
+            .clone()
+            .or_else(|| running.as_ref().and_then(|rc| rc.process_id.clone()));
+        if let Some(pid) = completed_process_id.as_deref()
+            && self
+                .unified_exec_wait_streak
+                .as_ref()
+                .is_some_and(|wait| wait.process_id == pid)
+        {
+            self.flush_unified_exec_wait_streak();
+        }
+        self.track_unified_exec_process_end(completed_process_id.clone(), call_id, source);
         if let Some(exec_cell) = self
             .active_cell
             .as_mut()
@@ -830,13 +935,21 @@ impl LiveAttachTui {
             } else {
                 aggregated_output
             };
+            let formatted =
+                if source == codex_core::protocol::ExecCommandSource::UnifiedExecInteraction {
+                    String::new()
+                } else if formatted_output.is_empty() {
+                    output_text.clone()
+                } else {
+                    formatted_output
+                };
 
             exec_cell.complete_call(
                 call_id,
                 CommandOutput {
                     exit_code,
                     aggregated_output: output_text.clone(),
-                    formatted_output: output_text,
+                    formatted_output: formatted,
                 },
                 duration,
             );
@@ -859,12 +972,20 @@ impl LiveAttachTui {
         self.flush_active_cell();
         let mut cell =
             new_active_exec_command(call_id.to_string(), command, parsed_cmd, source, None, true);
+        let formatted = if source == codex_core::protocol::ExecCommandSource::UnifiedExecInteraction
+        {
+            String::new()
+        } else if formatted_output.is_empty() {
+            aggregated_output.clone()
+        } else {
+            formatted_output
+        };
         cell.complete_call(
             call_id,
             CommandOutput {
                 exit_code,
                 aggregated_output: aggregated_output.clone(),
-                formatted_output: aggregated_output,
+                formatted_output: formatted,
             },
             duration,
         );
@@ -873,13 +994,48 @@ impl LiveAttachTui {
         self.flush_active_cell();
     }
 
-    fn on_terminal_interaction(&mut self, _process_id: String, stdin: String) {
+    fn on_terminal_interaction(&mut self, process_id: String, stdin: String) {
         self.flush_assistant_message();
+        let command_display = self
+            .unified_exec_processes
+            .iter()
+            .find(|process| process.key == process_id)
+            .map(|process| process.command_display.clone());
         if stdin.is_empty() {
-            self.status_message = Some("Waiting for background terminal".to_string());
+            self.bottom_pane.ensure_status_indicator();
+            self.bottom_pane.set_interrupt_hint_visible(true);
+            self.status_message = Some(if let Some(command) = &command_display {
+                format!("Waiting for background terminal · {command}")
+            } else {
+                "Waiting for background terminal".to_string()
+            });
+            match &mut self.unified_exec_wait_streak {
+                Some(wait) if wait.process_id == process_id => {
+                    wait.update_command_display(command_display);
+                }
+                Some(_) => {
+                    self.flush_unified_exec_wait_streak();
+                    self.unified_exec_wait_streak =
+                        Some(UnifiedExecWaitStreak::new(process_id, command_display));
+                }
+                None => {
+                    self.unified_exec_wait_streak =
+                        Some(UnifiedExecWaitStreak::new(process_id, command_display));
+                }
+            }
         } else {
+            if self
+                .unified_exec_wait_streak
+                .as_ref()
+                .is_some_and(|wait| wait.process_id == process_id)
+            {
+                self.flush_unified_exec_wait_streak();
+            }
             self.flush_active_cell();
-            self.add_boxed_history(Box::new(new_unified_exec_interaction(None, stdin)));
+            self.add_boxed_history(Box::new(new_unified_exec_interaction(
+                command_display,
+                stdin,
+            )));
             if self.agent_turn_running {
                 self.status_message = Some("Working".to_string());
             }
@@ -958,6 +1114,111 @@ impl LiveAttachTui {
         )));
     }
 
+    fn flush_unified_exec_wait_streak(&mut self) {
+        let Some(wait) = self.unified_exec_wait_streak.take() else {
+            return;
+        };
+        self.add_boxed_history(Box::new(new_unified_exec_interaction(
+            wait.command_display,
+            String::new(),
+        )));
+        if self.agent_turn_running {
+            self.status_message = Some("Working".to_string());
+        }
+    }
+
+    fn track_unified_exec_process_begin(
+        &mut self,
+        process_id: Option<String>,
+        call_id: &str,
+        command: &[String],
+        source: codex_core::protocol::ExecCommandSource,
+    ) {
+        if source != codex_core::protocol::ExecCommandSource::UnifiedExecStartup {
+            return;
+        }
+        let key = process_id.unwrap_or_else(|| call_id.to_string());
+        let command_display = strip_bash_lc_and_escape(command);
+        if let Some(existing) = self
+            .unified_exec_processes
+            .iter_mut()
+            .find(|process| process.key == key)
+        {
+            existing.call_id = call_id.to_string();
+            existing.command_display = command_display;
+            existing.recent_chunks.clear();
+        } else {
+            self.unified_exec_processes.push(UnifiedExecProcessSummary {
+                key,
+                call_id: call_id.to_string(),
+                command_display,
+                recent_chunks: Vec::new(),
+            });
+        }
+        self.sync_unified_exec_footer();
+    }
+
+    fn track_unified_exec_process_end(
+        &mut self,
+        process_id: Option<String>,
+        call_id: &str,
+        source: codex_core::protocol::ExecCommandSource,
+    ) {
+        if !matches!(
+            source,
+            codex_core::protocol::ExecCommandSource::UnifiedExecStartup
+                | codex_core::protocol::ExecCommandSource::UnifiedExecInteraction
+        ) {
+            return;
+        }
+        let key = process_id.unwrap_or_else(|| call_id.to_string());
+        let before = self.unified_exec_processes.len();
+        self.unified_exec_processes
+            .retain(|process| process.key != key);
+        if self.unified_exec_processes.len() != before {
+            self.sync_unified_exec_footer();
+        }
+    }
+
+    fn sync_unified_exec_footer(&mut self) {
+        let processes = self
+            .unified_exec_processes
+            .iter()
+            .map(|process| process.command_display.clone())
+            .collect();
+        self.bottom_pane.set_unified_exec_processes(processes);
+    }
+
+    fn track_unified_exec_output_chunk(&mut self, call_id: &str, chunk: &str) {
+        let Some(process) = self
+            .unified_exec_processes
+            .iter_mut()
+            .find(|process| process.call_id == call_id)
+        else {
+            return;
+        };
+        for line in chunk
+            .lines()
+            .map(str::trim_end)
+            .filter(|line| !line.is_empty())
+        {
+            process.recent_chunks.push(line.to_string());
+        }
+        const MAX_RECENT_CHUNKS: usize = 3;
+        if process.recent_chunks.len() > MAX_RECENT_CHUNKS {
+            let drop_count = process.recent_chunks.len() - MAX_RECENT_CHUNKS;
+            process.recent_chunks.drain(0..drop_count);
+        }
+    }
+
+    fn clear_unified_exec_processes(&mut self) {
+        if self.unified_exec_processes.is_empty() {
+            return;
+        }
+        self.unified_exec_processes.clear();
+        self.sync_unified_exec_footer();
+    }
+
     fn run_commit_tick_with_scope(&mut self, scope: CommitTickScope) -> bool {
         let output = run_commit_tick(
             &mut self.adaptive_chunking,
@@ -984,6 +1245,7 @@ impl LiveAttachTui {
     fn on_exec_command_begin_deferred(
         &mut self,
         call_id: String,
+        process_id: Option<String>,
         command: Vec<String>,
         parsed: Vec<codex_protocol::parse_command::ParsedCommand>,
         source: codex_core::protocol::ExecCommandSource,
@@ -991,12 +1253,13 @@ impl LiveAttachTui {
         self.defer_or_handle(
             QueuedUiInterrupt::ExecCommandBegin {
                 call_id: call_id.clone(),
+                process_id: process_id.clone(),
                 command: command.clone(),
                 parsed: parsed.clone(),
                 source,
             },
             |s| {
-                s.on_exec_command_begin(call_id, command, parsed, source);
+                s.on_exec_command_begin(call_id, process_id, command, parsed, source);
             },
         );
     }
@@ -1004,19 +1267,33 @@ impl LiveAttachTui {
     fn on_exec_command_end_deferred(
         &mut self,
         call_id: String,
+        process_id: Option<String>,
+        source: codex_core::protocol::ExecCommandSource,
         exit_code: i32,
+        formatted_output: String,
         aggregated_output: String,
         duration: Duration,
     ) {
         self.defer_or_handle(
             QueuedUiInterrupt::ExecCommandEnd {
                 call_id: call_id.clone(),
+                process_id: process_id.clone(),
+                source,
                 exit_code,
+                formatted_output: formatted_output.clone(),
                 aggregated_output: aggregated_output.clone(),
                 duration,
             },
             |s| {
-                s.on_exec_command_end(&call_id, exit_code, aggregated_output, duration);
+                s.on_exec_command_end(
+                    &call_id,
+                    process_id,
+                    source,
+                    exit_code,
+                    formatted_output,
+                    aggregated_output,
+                    duration,
+                );
             },
         );
     }
@@ -2147,6 +2424,8 @@ impl LiveAttachTui {
         self.session_id = thread_id;
         self.history_cells.clear();
         self.active_cell = None;
+        self.unified_exec_wait_streak = None;
+        self.clear_unified_exec_processes();
         self.history_cells_flushed_to_scrollback = 0;
         self.assistant_stream = StreamController::new(None);
         self.adaptive_chunking.reset();
