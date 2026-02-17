@@ -373,19 +373,7 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ShowStatus => {
-                let ui = self.widget.ui_mut();
-                let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
-                let approvals = if approval_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    proper_join(&approval_ids)
-                };
-                let summary = format!(
-                    "thread={} approvals={} seq={} v={}",
-                    ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
-                );
-                ui.push_line(&summary);
-                ui.set_status_message(Some(summary));
+                self.emit_status_summary();
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::RefreshStream => {
@@ -545,7 +533,11 @@ impl App {
         match cmd {
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
             SlashCommand::Resume => self.app_event_tx.send(AppEvent::ResumeSession),
-            SlashCommand::Status => self.app_event_tx.send(AppEvent::ShowStatus),
+            SlashCommand::Status => self.emit_status_summary(),
+            SlashCommand::DebugConfig => self
+                .widget
+                .ui_mut()
+                .push_line("[info] /debug-config is not yet ported in app-server tui"),
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
             }
@@ -590,10 +582,6 @@ impl App {
         match trimmed {
             "/exit" | "/quit" => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/status" => {
-                self.app_event_tx.send(AppEvent::ShowStatus);
                 return Ok(LiveTuiAction::Continue);
             }
             "/refresh" => {
@@ -703,6 +691,22 @@ impl App {
                 self.widget.ui_mut().add_history_cell(Box::new(cell));
             }
         }
+    }
+
+    fn emit_status_summary(&mut self) {
+        let ui = self.widget.ui_mut();
+        let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
+        let approvals = if approval_ids.is_empty() {
+            "none".to_string()
+        } else {
+            proper_join(&approval_ids)
+        };
+        let summary = format!(
+            "thread={} approvals={} seq={} v={}",
+            ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
+        );
+        ui.push_line(&summary);
+        ui.set_status_message(Some(summary));
     }
 }
 
