@@ -766,6 +766,11 @@ impl BottomPane {
         self.push_view(view);
     }
 
+    pub(crate) fn open_status_line_setup(&mut self, status_line_items: Option<&[String]>) {
+        let view = StatusLineSetupView::new(status_line_items, self.app_event_tx.clone());
+        self.show_view(Box::new(view));
+    }
+
     /// Called when the agent requests user approval.
     pub fn push_approval_request(&mut self, request: ApprovalRequest, features: &Features) {
         let request = if let Some(view) = self.view_stack.last_mut() {

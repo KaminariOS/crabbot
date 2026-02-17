@@ -936,6 +936,10 @@ impl LiveAttachTui {
         self.bottom_pane.insert_str(text);
     }
 
+    pub(crate) fn open_status_line_setup(&mut self, status_line_items: Option<&[String]>) {
+        self.bottom_pane.open_status_line_setup(status_line_items);
+    }
+
     pub(crate) fn set_status_message(&mut self, message: Option<String>) {
         self.status_message = message;
         self.sync_bottom_pane_status();

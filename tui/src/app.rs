@@ -513,6 +513,16 @@ impl App {
                         .ui_mut()
                         .apply_file_search_result(query, matches);
                 }
+                WidgetAppEvent::StatusLineSetup { .. } => {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("status line updated".to_string()));
+                }
+                WidgetAppEvent::StatusLineSetupCancelled => {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("status line setup cancelled".to_string()));
+                }
                 _ => {}
             }
         }
@@ -552,6 +562,7 @@ impl App {
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
             SlashCommand::Resume => self.app_event_tx.send(AppEvent::ResumeSession),
             SlashCommand::Status => self.emit_status_summary(),
+            SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(None),
             SlashCommand::DebugConfig => self
                 .widget
                 .ui_mut()
