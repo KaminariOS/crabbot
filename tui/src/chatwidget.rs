@@ -16,6 +16,7 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::McpToolCallCell;
 use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell::SessionInfoCell;
 use crate::history_cell::new_active_mcp_tool_call;
 use crate::history_cell::new_active_web_search_call;
 use crate::history_cell::new_error_event;
@@ -48,6 +49,7 @@ use crossterm::event::MouseEvent;
 use crossterm::event::MouseEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
+use std::any::TypeId;
 use std::collections::BTreeMap;
 
 pub(crate) struct InFlightPrompt {
@@ -658,6 +660,50 @@ impl LiveAttachTui {
             return false;
         }
         self.history_cells.extend(output.cells);
+        true
+    }
+
+    pub(crate) fn on_commit_tick(&mut self) {
+        self.commit_assistant_stream_tick();
+    }
+
+    pub(crate) fn apply_non_pending_thread_rollback(&mut self, num_turns: u32) -> bool {
+        if num_turns == 0 {
+            return false;
+        }
+
+        let session_start_type = TypeId::of::<SessionInfoCell>();
+        let user_type = TypeId::of::<crate::history_cell::UserHistoryCell>();
+        let start = self
+            .history_cells
+            .iter()
+            .rposition(|cell| cell.as_any().type_id() == session_start_type)
+            .map_or(0, |idx| idx + 1);
+        let user_positions: Vec<usize> = self
+            .history_cells
+            .iter()
+            .enumerate()
+            .skip(start)
+            .filter_map(|(idx, cell)| (cell.as_any().type_id() == user_type).then_some(idx))
+            .collect();
+        let Some(&first_user_idx) = user_positions.first() else {
+            return false;
+        };
+
+        let turns_from_end = usize::try_from(num_turns).unwrap_or(usize::MAX);
+        let cut_idx = if turns_from_end >= user_positions.len() {
+            first_user_idx
+        } else {
+            user_positions[user_positions.len() - turns_from_end]
+        };
+        let original_len = self.history_cells.len();
+        self.history_cells.truncate(cut_idx);
+        if self.history_cells.len() == original_len {
+            return false;
+        }
+        self.history_cells_flushed_to_scrollback = self
+            .history_cells_flushed_to_scrollback
+            .min(self.history_cells.len());
         true
     }
 

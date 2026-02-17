@@ -26,6 +26,11 @@ use crate::get_git_diff::get_git_diff;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use codex_core::protocol::ExecCommandSource;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
+
+const COMMIT_ANIMATION_TICK: Duration = crate::tui::TARGET_FRAME_INTERVAL;
 
 // ---------------------------------------------------------------------------
 // App struct — mirrors upstream `app::App` but backed by app-server transport
@@ -49,12 +54,16 @@ pub(crate) struct App {
     app_event_rx: std::sync::mpsc::Receiver<AppEvent>,
     /// Widget event receiver (bottom pane + file search).
     widget_event_rx: tokio::sync::mpsc::UnboundedReceiver<WidgetAppEvent>,
+    /// Widget event sender (used for app-driven widget events like commit ticks).
+    widget_event_tx: WidgetAppEventSender,
     /// Upstream-style @file search manager.
     file_search: FileSearchManager,
     /// Runtime status data used by `/status` card rendering.
     status_runtime: StatusRuntime,
     /// One-shot guard used while switching threads.
     pending_thread_switch_clear: bool,
+    /// Controls the animation thread that sends commit tick events.
+    commit_anim_running: Arc<AtomicBool>,
 }
 
 #[derive(Default)]
@@ -105,7 +114,7 @@ impl App {
         let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
         let widget_sender = WidgetAppEventSender::new(widget_tx);
         let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        let file_search = FileSearchManager::new(search_dir, widget_sender);
+        let file_search = FileSearchManager::new(search_dir, widget_sender.clone());
         if let Ok(skills) = fetch_skills_for_cwd(&state)
             && !skills.is_empty()
         {
@@ -124,9 +133,11 @@ impl App {
             app_event_tx: AppEventSender::new(tx),
             app_event_rx: rx,
             widget_event_rx: widget_rx,
+            widget_event_tx: widget_sender.clone(),
             file_search,
             status_runtime,
             pending_thread_switch_clear: false,
+            commit_anim_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -151,7 +162,7 @@ impl App {
         let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
         let widget_sender = WidgetAppEventSender::new(widget_tx);
         let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        let file_search = FileSearchManager::new(search_dir, widget_sender);
+        let file_search = FileSearchManager::new(search_dir, widget_sender.clone());
         if let Ok(skills) = fetch_skills_for_cwd(&state)
             && !skills.is_empty()
         {
@@ -170,9 +181,11 @@ impl App {
             app_event_tx: AppEventSender::new(tx),
             app_event_rx: rx,
             widget_event_rx: widget_rx,
+            widget_event_tx: widget_sender.clone(),
             file_search,
             status_runtime,
             pending_thread_switch_clear: false,
+            commit_anim_running: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -541,154 +554,11 @@ impl App {
             ui.drain_bottom_pane_events()
         };
         for event in pending_widget_events {
-            match event {
-                WidgetAppEvent::CodexOp(op) => self.handle_widget_op(op)?,
-                WidgetAppEvent::InsertHistoryCell(cell) => {
-                    self.widget.ui_mut().add_history_cell(cell);
-                }
-                WidgetAppEvent::StartFileSearch(query) => {
-                    self.file_search.on_user_query(query);
-                }
-                WidgetAppEvent::FileSearchResult { query, matches } => {
-                    self.widget
-                        .ui_mut()
-                        .apply_file_search_result(query, matches);
-                }
-                WidgetAppEvent::OpenResumePicker => {
-                    self.open_resume_picker()?;
-                }
-                WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
-                    self.open_permissions_picker()?;
-                }
-                WidgetAppEvent::OpenSkillsList => {
-                    self.widget.ui_mut().bottom_pane_insert_str("$");
-                }
-                WidgetAppEvent::OpenManageSkillsPopup => {
-                    self.open_manage_skills_popup()?;
-                }
-                WidgetAppEvent::OpenReviewBranchPicker(cwd) => {
-                    self.open_review_branch_picker(&cwd);
-                }
-                WidgetAppEvent::OpenReviewCommitPicker(cwd) => {
-                    self.open_review_commit_picker(&cwd);
-                }
-                WidgetAppEvent::OpenReviewCustomPrompt => {
-                    self.widget.ui_mut().show_review_custom_prompt();
-                }
-                WidgetAppEvent::StartReviewUncommitted => {
-                    self.start_review_uncommitted()?;
-                }
-                WidgetAppEvent::StartReviewBaseBranch { branch } => {
-                    self.start_review_base_branch(&branch)?;
-                }
-                WidgetAppEvent::StartReviewCommit { sha, title } => {
-                    self.start_review_commit(&sha, title.as_deref())?;
-                }
-                WidgetAppEvent::StartReviewCustomInstructions(instructions) => {
-                    self.start_review_custom(&instructions)?;
-                }
-                WidgetAppEvent::ForkCurrentSession => {
-                    let active_thread_id = self.widget.ui_mut().session_id.clone();
-                    if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
-                        self.switch_to_thread(forked_thread_id, "thread forked", true);
-                    } else {
-                        self.widget
-                            .ui_mut()
-                            .set_status_message(Some("fork returned no thread id".to_string()));
-                    }
-                }
-                WidgetAppEvent::SelectAgentThread(thread_id) => {
-                    let selected_thread_id = thread_id.to_string();
-                    if let Some(resumed_thread_id) =
-                        resume_thread(&self.state, &selected_thread_id)?
-                    {
-                        self.switch_to_thread(resumed_thread_id, "thread resumed", false);
-                    } else {
-                        self.widget
-                            .ui_mut()
-                            .set_status_message(Some("resume returned no thread id".to_string()));
-                    }
-                }
-                WidgetAppEvent::UpdateModel(model) => {
-                    self.apply_model_selection(model)?;
-                }
-                WidgetAppEvent::UpdateAskForApprovalPolicy(policy) => {
-                    self.apply_approval_policy_selection(policy)?;
-                }
-                WidgetAppEvent::UpdateSandboxPolicy(policy) => {
-                    self.apply_sandbox_policy_selection(policy)?;
-                }
-                WidgetAppEvent::UpdatePersonality(personality) => {
-                    self.apply_personality_selection(personality)?;
-                }
-                WidgetAppEvent::UpdateCollaborationMode(mask) => {
-                    self.widget.ui_mut().set_collaboration_mask(mask);
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("collaboration mode updated".to_string()));
-                }
-                WidgetAppEvent::UpdateFeatureFlags { updates } => {
-                    self.apply_feature_flags(updates)?;
-                }
-                WidgetAppEvent::SetSkillEnabled { path, enabled } => {
-                    self.apply_skill_enabled(path, enabled)?;
-                }
-                WidgetAppEvent::SetAppEnabled { id, enabled } => {
-                    self.apply_app_enabled(id, enabled)?;
-                }
-                WidgetAppEvent::ManageSkillsClosed => {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("skill settings updated".to_string()));
-                }
-                WidgetAppEvent::OpenFeedbackConsent { category } => {
-                    let thread_id = self.widget.ui_mut().session_id.clone();
-                    let rollout_path = fetch_rollout_path(&self.state, &thread_id)
-                        .ok()
-                        .flatten()
-                        .map(std::path::PathBuf::from);
-                    self.widget
-                        .ui_mut()
-                        .open_feedback_consent(category, rollout_path);
-                }
-                WidgetAppEvent::OpenFeedbackNote {
-                    category,
-                    include_logs,
-                } => {
-                    let thread_id = self.widget.ui_mut().session_id.clone();
-                    let rollout_path = fetch_rollout_path(&self.state, &thread_id)
-                        .ok()
-                        .flatten()
-                        .map(std::path::PathBuf::from);
-                    self.widget
-                        .ui_mut()
-                        .open_feedback_note(category, include_logs, rollout_path);
-                }
-                WidgetAppEvent::StatusLineSetup { .. } => {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("status line updated".to_string()));
-                }
-                WidgetAppEvent::StatusLineSetupCancelled => {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("status line setup cancelled".to_string()));
-                }
-                WidgetAppEvent::FullScreenApprovalRequest(request) => {
-                    self.widget
-                        .ui_mut()
-                        .push_fullscreen_approval_request(request);
-                }
-                _ => {}
-            }
+            self.handle_widget_app_event(event)?;
         }
 
         while let Ok(event) = self.widget_event_rx.try_recv() {
-            if let WidgetAppEvent::FileSearchResult { query, matches } = event {
-                self.widget
-                    .ui_mut()
-                    .apply_file_search_result(query, matches);
-            }
+            self.handle_widget_app_event(event)?;
         }
 
         if let Some((cmd, args, text_elements)) = queued_command {
@@ -705,6 +575,175 @@ impl App {
             });
         }
         Ok(LiveTuiAction::Continue)
+    }
+
+    fn handle_widget_app_event(&mut self, event: WidgetAppEvent) -> Result<()> {
+        match event {
+            WidgetAppEvent::CodexOp(op) => self.handle_widget_op(op)?,
+            WidgetAppEvent::InsertHistoryCell(cell) => {
+                self.widget.ui_mut().add_history_cell(cell);
+            }
+            WidgetAppEvent::ApplyThreadRollback { num_turns } => {
+                self.widget
+                    .ui_mut()
+                    .apply_non_pending_thread_rollback(num_turns);
+            }
+            WidgetAppEvent::StartCommitAnimation => {
+                if self
+                    .commit_anim_running
+                    .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+                    .is_ok()
+                {
+                    let tx = self.widget_event_tx.clone();
+                    let running = self.commit_anim_running.clone();
+                    thread::spawn(move || {
+                        while running.load(Ordering::Relaxed) {
+                            thread::sleep(COMMIT_ANIMATION_TICK);
+                            tx.send(WidgetAppEvent::CommitTick);
+                        }
+                    });
+                }
+            }
+            WidgetAppEvent::StopCommitAnimation => {
+                self.commit_anim_running.store(false, Ordering::Release);
+            }
+            WidgetAppEvent::CommitTick => {
+                self.widget.ui_mut().on_commit_tick();
+            }
+            WidgetAppEvent::StartFileSearch(query) => {
+                self.file_search.on_user_query(query);
+            }
+            WidgetAppEvent::FileSearchResult { query, matches } => {
+                self.widget
+                    .ui_mut()
+                    .apply_file_search_result(query, matches);
+            }
+            WidgetAppEvent::OpenResumePicker => {
+                self.open_resume_picker()?;
+            }
+            WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
+                self.open_permissions_picker()?;
+            }
+            WidgetAppEvent::OpenSkillsList => {
+                self.widget.ui_mut().bottom_pane_insert_str("$");
+            }
+            WidgetAppEvent::OpenManageSkillsPopup => {
+                self.open_manage_skills_popup()?;
+            }
+            WidgetAppEvent::OpenReviewBranchPicker(cwd) => {
+                self.open_review_branch_picker(&cwd);
+            }
+            WidgetAppEvent::OpenReviewCommitPicker(cwd) => {
+                self.open_review_commit_picker(&cwd);
+            }
+            WidgetAppEvent::OpenReviewCustomPrompt => {
+                self.widget.ui_mut().show_review_custom_prompt();
+            }
+            WidgetAppEvent::StartReviewUncommitted => {
+                self.start_review_uncommitted()?;
+            }
+            WidgetAppEvent::StartReviewBaseBranch { branch } => {
+                self.start_review_base_branch(&branch)?;
+            }
+            WidgetAppEvent::StartReviewCommit { sha, title } => {
+                self.start_review_commit(&sha, title.as_deref())?;
+            }
+            WidgetAppEvent::StartReviewCustomInstructions(instructions) => {
+                self.start_review_custom(&instructions)?;
+            }
+            WidgetAppEvent::ForkCurrentSession => {
+                let active_thread_id = self.widget.ui_mut().session_id.clone();
+                if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
+                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("fork returned no thread id".to_string()));
+                }
+            }
+            WidgetAppEvent::SelectAgentThread(thread_id) => {
+                let selected_thread_id = thread_id.to_string();
+                if let Some(resumed_thread_id) = resume_thread(&self.state, &selected_thread_id)? {
+                    self.switch_to_thread(resumed_thread_id, "thread resumed", false);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("resume returned no thread id".to_string()));
+                }
+            }
+            WidgetAppEvent::UpdateModel(model) => {
+                self.apply_model_selection(model)?;
+            }
+            WidgetAppEvent::UpdateAskForApprovalPolicy(policy) => {
+                self.apply_approval_policy_selection(policy)?;
+            }
+            WidgetAppEvent::UpdateSandboxPolicy(policy) => {
+                self.apply_sandbox_policy_selection(policy)?;
+            }
+            WidgetAppEvent::UpdatePersonality(personality) => {
+                self.apply_personality_selection(personality)?;
+            }
+            WidgetAppEvent::UpdateCollaborationMode(mask) => {
+                self.widget.ui_mut().set_collaboration_mask(mask);
+                self.widget
+                    .ui_mut()
+                    .set_status_message(Some("collaboration mode updated".to_string()));
+            }
+            WidgetAppEvent::UpdateFeatureFlags { updates } => {
+                self.apply_feature_flags(updates)?;
+            }
+            WidgetAppEvent::SetSkillEnabled { path, enabled } => {
+                self.apply_skill_enabled(path, enabled)?;
+            }
+            WidgetAppEvent::SetAppEnabled { id, enabled } => {
+                self.apply_app_enabled(id, enabled)?;
+            }
+            WidgetAppEvent::ManageSkillsClosed => {
+                self.widget
+                    .ui_mut()
+                    .set_status_message(Some("skill settings updated".to_string()));
+            }
+            WidgetAppEvent::OpenFeedbackConsent { category } => {
+                let thread_id = self.widget.ui_mut().session_id.clone();
+                let rollout_path = fetch_rollout_path(&self.state, &thread_id)
+                    .ok()
+                    .flatten()
+                    .map(std::path::PathBuf::from);
+                self.widget
+                    .ui_mut()
+                    .open_feedback_consent(category, rollout_path);
+            }
+            WidgetAppEvent::OpenFeedbackNote {
+                category,
+                include_logs,
+            } => {
+                let thread_id = self.widget.ui_mut().session_id.clone();
+                let rollout_path = fetch_rollout_path(&self.state, &thread_id)
+                    .ok()
+                    .flatten()
+                    .map(std::path::PathBuf::from);
+                self.widget
+                    .ui_mut()
+                    .open_feedback_note(category, include_logs, rollout_path);
+            }
+            WidgetAppEvent::StatusLineSetup { .. } => {
+                self.widget
+                    .ui_mut()
+                    .set_status_message(Some("status line updated".to_string()));
+            }
+            WidgetAppEvent::StatusLineSetupCancelled => {
+                self.widget
+                    .ui_mut()
+                    .set_status_message(Some("status line setup cancelled".to_string()));
+            }
+            WidgetAppEvent::FullScreenApprovalRequest(request) => {
+                self.widget
+                    .ui_mut()
+                    .push_fullscreen_approval_request(request);
+            }
+            _ => {}
+        }
+        Ok(())
     }
 
     fn dispatch_slash_command(
