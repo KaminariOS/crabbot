@@ -562,6 +562,42 @@ impl App {
                     .ui_mut()
                     .push_line(&format!("Pending approvals: {pending}"));
             }
+            SlashCommand::Review => {
+                if arg.trim().is_empty() {
+                    self.widget
+                        .ui_mut()
+                        .push_line("[info] /review popup is not yet ported in app-server tui");
+                } else {
+                    self.app_event_tx.send(AppEvent::StartTurn {
+                        text: format!("/review {}", arg.trim()),
+                        text_elements,
+                        mention_bindings: Vec::new(),
+                    });
+                }
+            }
+            SlashCommand::Rename => {
+                if arg.trim().is_empty() {
+                    self.widget
+                        .ui_mut()
+                        .push_line("[info] usage: /rename <thread-name>");
+                } else {
+                    self.widget.ui_mut().push_line(&format!(
+                        "[info] rename is not yet ported to app-server api: {}",
+                        arg.trim()
+                    ));
+                }
+            }
+            SlashCommand::SandboxReadRoot => {
+                if arg.trim().is_empty() {
+                    self.widget
+                        .ui_mut()
+                        .push_line("Usage: /sandbox-add-read-dir <absolute-directory-path>");
+                } else {
+                    self.widget.ui_mut().push_line(
+                        "[info] /sandbox-add-read-dir is not yet ported in app-server tui",
+                    );
+                }
+            }
             SlashCommand::Quit | SlashCommand::Exit => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
             }
