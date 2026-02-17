@@ -423,6 +423,7 @@ impl LiveAttachTui {
             let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
                 Paragraph::new(history)
+                    .style(Style::default().fg(self.readable_fg_color()))
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
                 chunks[0],
@@ -462,6 +463,7 @@ impl LiveAttachTui {
             frame.render_widget(
                 Paragraph::new(
                     Line::from(self.footer_line_text(chunks[footer_chunk_index].width as usize))
+                        .style(Style::default().fg(self.readable_fg_color()))
                         .dim(),
                 ),
                 chunks[footer_chunk_index],
@@ -539,17 +541,25 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn composer_row_style(&self) -> Style {
+        let fg = self.readable_fg_color();
         let themed = style::user_message_style();
         if themed.bg.is_some() {
-            themed
+            themed.fg(fg)
         } else if env::var("COLORTERM")
             .map(|value| value.contains("truecolor"))
             .unwrap_or(false)
         {
-            Style::default().bg(Color::Rgb(38, 42, 46))
+            Style::default().bg(Color::Rgb(38, 42, 46)).fg(fg)
         } else {
-            Style::default().bg(Color::DarkGray)
+            Style::default().bg(Color::DarkGray).fg(fg)
         }
+    }
+
+    fn readable_fg_color(&self) -> Color {
+        // Some terminals report incorrect default palette values in alternate
+        // screen, which can produce black-on-black text. Prefer a stable,
+        // high-contrast foreground for now.
+        Color::White
     }
 
     pub(crate) fn special_token_style(&self, token: char) -> Option<Style> {
