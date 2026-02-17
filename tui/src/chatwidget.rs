@@ -271,10 +271,13 @@ pub(crate) struct LiveAttachTui {
     local_user_message_echoes: VecDeque<String>,
     agent_turn_running: bool,
     mcp_startup_running: bool,
+    retry_status_message: Option<String>,
     had_work_activity: bool,
     turn_runtime_metrics: codex_otel::RuntimeMetricsSummary,
     reasoning_buffer: String,
     full_reasoning_buffer: String,
+    is_review_mode: bool,
+    pre_review_token_info: Option<Option<codex_core::protocol::TokenUsageInfo>>,
     current_rollout_path: Option<std::path::PathBuf>,
     status_line_items: Option<Vec<String>>,
     status_line_invalid_items_warned: bool,
@@ -352,10 +355,13 @@ impl LiveAttachTui {
             local_user_message_echoes: VecDeque::new(),
             agent_turn_running: false,
             mcp_startup_running: false,
+            retry_status_message: None,
             had_work_activity: false,
             turn_runtime_metrics: codex_otel::RuntimeMetricsSummary::default(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            is_review_mode: false,
+            pre_review_token_info: None,
             current_rollout_path: None,
             status_line_items: None,
             status_line_invalid_items_warned: false,
@@ -410,6 +416,11 @@ impl LiveAttachTui {
     }
 
     fn apply_ui_event(&mut self, event: UiEvent, from_replay: bool) {
+        let is_stream_error = matches!(&event, UiEvent::StreamError { .. });
+        if !is_stream_error {
+            self.restore_retry_status_message_if_present();
+        }
+
         match event {
             UiEvent::SessionState(state) => {
                 if self.previous_state.as_deref() != Some(state.as_str()) {
@@ -624,18 +635,9 @@ impl LiveAttachTui {
                 self.on_background_event(message);
             }
             UiEvent::ReviewModeEntered { hint } => {
-                let banner = hint
-                    .map(|hint| format!(">> Code review started: {hint} <<"))
-                    .unwrap_or_else(|| ">> Code review started <<".to_string());
-                self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
-                    banner,
-                )));
+                self.on_entered_review_mode(hint, from_replay);
             }
-            UiEvent::ReviewModeExited => {
-                self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
-                    "<< Code review finished >>".to_string(),
-                )));
-            }
+            UiEvent::ReviewModeExited => self.on_exited_review_mode(),
             UiEvent::UserMessage {
                 text,
                 text_elements,
@@ -1491,6 +1493,7 @@ impl LiveAttachTui {
         self.turn_runtime_metrics = codex_otel::RuntimeMetricsSummary::default();
         self.update_task_running_state();
         self.status_message = Some("Working".to_string());
+        self.retry_status_message = None;
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
     }
@@ -1601,11 +1604,53 @@ impl LiveAttachTui {
         self.add_boxed_history(Box::new(new_info_event(message, None)));
     }
 
+    fn on_entered_review_mode(&mut self, hint: Option<String>, from_replay: bool) {
+        if self.pre_review_token_info.is_none() {
+            self.pre_review_token_info = Some(self.token_info.clone());
+        }
+        if !from_replay && !self.bottom_pane.is_task_running() {
+            self.bottom_pane.set_task_running(true);
+        }
+        self.is_review_mode = true;
+        let banner = hint
+            .map(|hint| format!(">> Code review started: {hint} <<"))
+            .unwrap_or_else(|| ">> Code review started <<".to_string());
+        self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
+            banner,
+        )));
+    }
+
+    fn on_exited_review_mode(&mut self) {
+        self.flush_assistant_message();
+        self.flush_interrupt_queue();
+        self.flush_active_cell();
+        self.is_review_mode = false;
+        self.restore_pre_review_token_info();
+        self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
+            "<< Code review finished >>".to_string(),
+        )));
+    }
+
+    fn restore_pre_review_token_info(&mut self) {
+        if let Some(token_info) = self.pre_review_token_info.take() {
+            self.set_token_info(token_info);
+        }
+    }
+
     fn on_stream_error(&mut self, message: String, additional_details: Option<String>) {
+        if self.retry_status_message.is_none() {
+            self.retry_status_message = self.status_message.clone();
+        }
         self.status_message = Some(match additional_details {
             Some(details) if !details.trim().is_empty() => format!("{message} ({details})"),
             _ => message,
         });
+    }
+
+    fn restore_retry_status_message_if_present(&mut self) {
+        if let Some(message) = self.retry_status_message.take() {
+            self.status_message = Some(message);
+        }
     }
 
     fn on_interrupted_turn(&mut self, reason: Option<String>, from_replay: bool) {
