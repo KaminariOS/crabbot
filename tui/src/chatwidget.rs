@@ -319,33 +319,49 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn apply_stream_events(&mut self, stream_events: &[DaemonStreamEnvelope]) {
+        self.apply_stream_events_with_replay(stream_events, false);
+    }
+
+    pub(crate) fn apply_stream_events_with_replay(
+        &mut self,
+        stream_events: &[DaemonStreamEnvelope],
+        from_replay: bool,
+    ) {
         if let Some(last) = stream_events.last() {
             self.last_sequence = last.sequence;
         }
         self.received_events += stream_events.len();
-        self.apply_ui_events(map_legacy_stream_events(stream_events));
+        self.apply_ui_events(map_legacy_stream_events(stream_events), from_replay);
     }
 
     pub(crate) fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
+        self.apply_rpc_stream_events_with_replay(stream_events, false);
+    }
+
+    pub(crate) fn apply_rpc_stream_events_with_replay(
+        &mut self,
+        stream_events: &[DaemonRpcStreamEnvelope],
+        from_replay: bool,
+    ) {
         if let Some(last) = stream_events.last() {
             self.last_sequence = last.sequence;
         }
         self.received_events += stream_events.len();
-        self.apply_ui_events(map_rpc_stream_events(stream_events));
+        self.apply_ui_events(map_rpc_stream_events(stream_events), from_replay);
     }
 
     pub(crate) fn apply_codex_event(&mut self, event: codex_core::protocol::Event) {
         self.received_events += 1;
-        self.apply_ui_events(map_codex_protocol_event(&event));
+        self.apply_ui_events(map_codex_protocol_event(&event), false);
     }
 
-    fn apply_ui_events(&mut self, events: Vec<UiEvent>) {
+    fn apply_ui_events(&mut self, events: Vec<UiEvent>, from_replay: bool) {
         for event in events {
-            self.apply_ui_event(event);
+            self.apply_ui_event(event, from_replay);
         }
     }
 
-    fn apply_ui_event(&mut self, event: UiEvent) {
+    fn apply_ui_event(&mut self, event: UiEvent, from_replay: bool) {
         match event {
             UiEvent::SessionState(state) => {
                 if self.previous_state.as_deref() != Some(state.as_str()) {
@@ -459,7 +475,7 @@ impl LiveAttachTui {
                 }
             }
             UiEvent::TurnAborted { reason } => {
-                self.on_interrupted_turn(reason);
+                self.on_interrupted_turn(reason, from_replay);
             }
             UiEvent::Error { message } => {
                 self.on_error(message);
@@ -1301,13 +1317,13 @@ impl LiveAttachTui {
         });
     }
 
-    fn on_interrupted_turn(&mut self, reason: Option<String>) {
+    fn on_interrupted_turn(&mut self, reason: Option<String>, from_replay: bool) {
         self.finalize_turn_as_failed();
         let interrupted = reason
             .as_deref()
             .map(|r| r.eq_ignore_ascii_case("interrupted"))
             .unwrap_or(true);
-        if interrupted {
+        if interrupted && !from_replay {
             self.add_boxed_history(Box::new(new_error_event(
                 "Conversation interrupted - tell the model what to do differently. Something went wrong? Hit `/feedback` to report the issue.".to_string(),
             )));

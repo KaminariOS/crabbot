@@ -102,7 +102,9 @@ impl App {
             Ok(events) => {
                 if !events.is_empty() {
                     status_runtime.apply_stream_events(&events);
-                    widget.ui_mut().apply_rpc_stream_events(&events);
+                    widget
+                        .ui_mut()
+                        .apply_rpc_stream_events_with_replay(&events, true);
                 }
             }
             Err(err) => {
@@ -170,7 +172,7 @@ impl App {
             ui.latest_state = cached_session_state_label(&state, &session_id)
                 .unwrap_or("unknown")
                 .to_string();
-            ui.apply_stream_events(&initial_events);
+            ui.apply_stream_events_with_replay(&initial_events, true);
             ui.set_status_message(Some("attached to app-server websocket".to_string()));
         }
         if !widget.ui_mut().has_history_cells() {
@@ -364,7 +366,9 @@ impl App {
                 && !events.is_empty()
             {
                 self.status_runtime.apply_stream_events(&events);
-                self.widget.ui_mut().apply_rpc_stream_events(&events);
+                self.widget
+                    .ui_mut()
+                    .apply_rpc_stream_events_with_replay(&events, true);
             }
             let model = self
                 .status_runtime
