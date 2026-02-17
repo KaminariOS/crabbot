@@ -11,6 +11,7 @@ pub(super) use crate::core_compat::AppExitInfo;
 pub(super) use crate::core_compat::ExitMode;
 pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
+pub(super) use crate::core_compat::fork_thread;
 pub(super) use crate::core_compat::interrupt_turn;
 pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread;
@@ -548,6 +549,16 @@ impl App {
                 WidgetAppEvent::OpenResumePicker => {
                     self.open_resume_picker()?;
                 }
+                WidgetAppEvent::ForkCurrentSession => {
+                    let active_thread_id = self.widget.ui_mut().session_id.clone();
+                    if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
+                        self.switch_to_thread(forked_thread_id, "thread forked", true);
+                    } else {
+                        self.widget
+                            .ui_mut()
+                            .set_status_message(Some("fork returned no thread id".to_string()));
+                    }
+                }
                 WidgetAppEvent::SelectAgentThread(thread_id) => {
                     let selected_thread_id = thread_id.to_string();
                     if let Some(resumed_thread_id) =
@@ -624,7 +635,16 @@ impl App {
                 .widget
                 .ui_mut()
                 .push_line("[info] /debug-config is not yet ported in app-server tui"),
-            SlashCommand::Fork => self.app_event_tx.send(AppEvent::NewSession),
+            SlashCommand::Fork => {
+                let active_thread_id = self.widget.ui_mut().session_id.clone();
+                if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
+                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("fork returned no thread id".to_string()));
+                }
+            }
             SlashCommand::Init => {
                 let init_target = std::env::current_dir()
                     .unwrap_or_else(|_| std::env::temp_dir())
