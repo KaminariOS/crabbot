@@ -5,8 +5,19 @@ Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, w
 ## Finish Plan (From Current State)
 
 Current baseline:
-- Real upstream `bottom_pane` is wired and `cargo check -p crabbot_tui` passes.
-- Temporary compatibility stubs still exist (`history_cell_stub`, `exec_cell_stub`, `status_stub`, `status_indicator_widget_stub`, `skills_helpers_stub`) and must be removed.
+- Real upstream modules are wired for:
+  - `history_cell`
+  - `exec_cell`
+  - `status`
+  - `status_indicator_widget`
+  - `skills_helpers`
+- Temporary compatibility stubs have been removed from module wiring and deleted.
+- Build gates currently pass:
+  - `cargo check -p crabbot_tui`
+  - `cargo run -p crabbot_cli -- codex --help`
+- One temporary non-transport diff remains in `history_cell.rs`:
+  - `UpdateAvailableHistoryCell::display_lines` uses manual `Line` construction instead of `ratatui_macros::{line,text}` due local workspace `ratatui` git patch type mismatch against crates.io `ratatui-macros`.
+  - This is a compatibility workaround, not intended long-term drift.
 
 Execution order to finish full port:
 
@@ -14,24 +25,24 @@ Execution order to finish full port:
 - Replace `history_cell_stub` with real upstream `history_cell`.
 - Keep only transport-facing protocol differences in `core_compat`/`lib` compatibility types.
 - Exit criteria:
-  - `mod history_cell` points to real module.
-  - No `history_cell_stub` references in build graph.
-  - `cargo check -p crabbot_tui` passes.
+  - [x] `mod history_cell` points to real module.
+  - [x] No `history_cell_stub` references in build graph.
+  - [x] `cargo check -p crabbot_tui` passes.
 
 2. **Exec + status surface parity**
 - Replace `exec_cell_stub`, `status_stub`, and `status_indicator_widget_stub` with real upstream modules.
 - Port missing type/API shims in `lib.rs` so upstream modules compile unchanged.
 - Exit criteria:
-  - Real `exec_cell`, `status`, `status_indicator_widget` are active.
-  - Footer/status rendering paths come from upstream modules.
-  - `cargo check -p crabbot_tui` passes.
+  - [x] Real `exec_cell`, `status`, `status_indicator_widget` are active.
+  - [x] Footer/status rendering paths come from upstream modules.
+  - [x] `cargo check -p crabbot_tui` passes.
 
 3. **Skill/helpers parity**
 - Replace `skills_helpers_stub` with real upstream `skills_helpers`.
 - Align `SkillMetadata` compatibility shape to upstream expectations used by picker/rendering.
 - Exit criteria:
-  - Real `skills_helpers` active.
-  - Skill list/filter UI behavior matches upstream.
+  - [x] Real `skills_helpers` active.
+  - [ ] Skill list/filter UI behavior matches upstream (manual verification pending).
 
 4. **ChatWidget full upstream structure**
 - Port `chatwidget.rs` structure to upstream flow (state shape, render orchestration, bottom pane coordination).
@@ -76,7 +87,7 @@ Execution order to finish full port:
 ## Phase 1: Runtime Path Parity (No UI Feature Changes Yet)
 
 - [ ] Replace simplified runtime entry flow with upstream runtime flow shape (in progress):
-- [ ] `tui/src/lib.rs` uses upstream module graph structure.
+- [x] `tui/src/lib.rs` uses upstream module graph structure for real UI modules (stub module paths removed).
 - [x] `tui/src/tui.rs` now matches upstream file content.
 - [x] Keep crate compiling while introducing runtime modules incrementally.
 - [x] Keep command entry points stable for CLI integration (`crabbot_cli -> crabbot_tui`).
@@ -100,20 +111,21 @@ Execution order to finish full port:
 
 ## Phase 4: Module Wiring Completion
 
-- [ ] Ensure all copied upstream modules are actually wired into compile/runtime graph.
+- [x] Ensure all copied upstream modules are actually wired into compile/runtime graph.
 - [x] Remove/avoid dead parallel runtime paths.
-- [ ] Keep no `*_app_server.rs` duplicate UI files; modify upstream-path files in place.
-- [ ] Keep path/name parity with upstream for all TUI source files.
+- [x] Keep no `*_app_server.rs` duplicate UI files; modify upstream-path files in place.
+- [x] Keep path/name parity with upstream for all TUI source files (transport seam files excepted).
 
 ## Phase 5: Diff Cleanup (Strict)
 
 - [x] Run `diff -qr ~/repos/codex/codex-rs/tui/src ~/repos/crabbot/tui/src`.
-- [x] Reduce diffs to only:
+- [ ] Reduce diffs to only:
 - [x] `tui/src/lib.rs`
 - [x] `tui/src/app.rs`
 - [x] `tui/src/chatwidget.rs`
 - [x] `tui/src/core_compat.rs` (local seam file)
-- [x] Confirm no unnecessary drift in other files.
+- [ ] `tui/src/history_cell.rs` temporary compatibility workaround remains (remove after ratatui macro compatibility fix).
+- [x] Confirm no other unnecessary drift/stub files.
 
 ## Phase 6: Behavior Validation
 
@@ -144,13 +156,15 @@ Execution order to finish full port:
 - `tui/src/app.rs` now hosts the active app-server runtime loop (previous temporary shim removed).
 - `tui/src/tui.rs` and `tui/src/notifications/mod.rs` now match upstream exactly.
 - `tui/src/insert_history.rs` now matches upstream exactly.
-- `lib.rs` provides a local compatibility namespace (`codex_core::config::types::NotificationMethod`) and a minimal `render::line_utils` bridge for wrapping support without introducing a `codex-core` dependency.
+- `lib.rs` now provides an expanded compatibility surface so upstream `history_cell` / `exec_cell` / `status` compile while transport remains app-server driven.
+- `history_cell.rs` has one temporary compatibility diff in `UpdateAvailableHistoryCell::display_lines` due `ratatui` patch + `ratatui-macros` type mismatch in this workspace.
 
 ## Current Diff Inventory
 
 - `tui/src/lib.rs`
 - `tui/src/app.rs`
 - `tui/src/chatwidget.rs`
+- `tui/src/history_cell.rs` (temporary macro compatibility workaround)
 - `tui/src/core_compat.rs` (local seam file)
 
 ## Repeatable Commands
