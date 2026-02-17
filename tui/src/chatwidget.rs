@@ -869,7 +869,9 @@ impl LiveAttachTui {
         let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
         let bottom_pane_height = self.bottom_pane.desired_height(width).max(1);
         history_height
+            .saturating_add(1)
             .saturating_add(shortcuts_overlay_height)
+            .saturating_add(1)
             .saturating_add(bottom_pane_height)
     }
 
@@ -880,29 +882,31 @@ impl LiveAttachTui {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(shortcuts_overlay_height),
+                Constraint::Length(1),
                 Constraint::Length(bottom_pane_height),
             ])
             .split(area);
 
-        let history_lines_vec = self.history_view_lines(chunks[0].width);
+        let history_lines_vec = self.history_view_lines(chunks[1].width);
         let history_lines = history_lines_vec.len().max(1) as u16;
-        let max_scroll = history_lines.saturating_sub(chunks[0].height);
+        let max_scroll = history_lines.saturating_sub(chunks[1].height);
         self.history_scroll_offset = self.history_scroll_offset.min(max_scroll);
         let scroll = max_scroll.saturating_sub(self.history_scroll_offset);
         Paragraph::new(history_lines_vec)
             .style(Style::default())
             .wrap(Wrap { trim: false })
             .scroll((scroll, 0))
-            .render(chunks[0], buf);
+            .render(chunks[1], buf);
 
         if shortcuts_overlay_height > 0 {
             Paragraph::new(shortcuts_overlay_lines)
                 .style(self.composer_row_style())
-                .render(chunks[1], buf);
+                .render(chunks[2], buf);
         }
-        self.bottom_pane.render(chunks[2], buf);
+        self.bottom_pane.render(chunks[4], buf);
     }
 
     pub(crate) fn cursor_pos(&self, area: Rect) -> Option<(u16, u16)> {
@@ -911,12 +915,14 @@ impl LiveAttachTui {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
+                Constraint::Length(1),
                 Constraint::Min(1),
                 Constraint::Length(shortcuts_overlay_height),
+                Constraint::Length(1),
                 Constraint::Length(bottom_pane_height),
             ])
             .split(area);
-        self.bottom_pane.cursor_pos(chunks[2])
+        self.bottom_pane.cursor_pos(chunks[4])
     }
 
     pub(crate) fn scroll_history_page_up(&mut self) {
@@ -1074,7 +1080,6 @@ impl LiveAttachTui {
             ]));
         }
         for cell in &self.history_cells {
-            lines.push(Line::from(""));
             lines.extend(cell.display_lines(width));
         }
         if lines.is_empty() {

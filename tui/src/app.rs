@@ -185,7 +185,9 @@ impl App {
 
         let terminal = crate::tui::init().context("initialize tui terminal")?;
         let mut tui = crate::tui::Tui::new(terminal);
+        let _ = tui.enter_alt_screen();
         let loop_result = self.event_loop(&mut tui);
+        let _ = tui.leave_alt_screen();
         let _ = crate::tui::restore();
 
         loop_result?;
