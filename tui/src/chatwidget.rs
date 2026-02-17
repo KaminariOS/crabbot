@@ -102,6 +102,8 @@ impl LiveAttachTui {
             UiEvent::ThreadStarted(thread_id) => {
                 let changed = self.session_id != thread_id;
                 self.session_id = thread_id.clone();
+                self.latest_state = "active".to_string();
+                self.previous_state = Some("active".to_string());
                 if changed {
                     self.active_turn_id = None;
                     self.pending_approvals.clear();
