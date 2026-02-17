@@ -1,5 +1,6 @@
 use super::*;
 
+use crate::bottom_pane::InputResult;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::LiveAttachTui;
 pub(super) use crate::core_compat::AppEvent;
@@ -14,7 +15,6 @@ pub(super) use crate::core_compat::resume_thread;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn;
 pub(super) use crate::core_compat::stream_events;
-use crate::key_hint::is_altgr;
 use crate::slash_commands::find_builtin_command;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
@@ -351,156 +351,48 @@ impl App {
     fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<LiveTuiAction> {
         let mut queued_submit: Option<String> = None;
         let ui = self.widget.ui_mut();
+        if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
+            ui.hide_shortcuts_overlay();
+            return Ok(LiveTuiAction::Continue);
+        }
         match key.code {
-            KeyCode::Char('\u{0002}') if key.modifiers == KeyModifiers::NONE => {
-                ui.move_input_cursor_left();
-            }
-            KeyCode::Char('\u{0006}') if key.modifiers == KeyModifiers::NONE => {
-                ui.move_input_cursor_right();
-            }
-            KeyCode::Char('\u{0010}') if key.modifiers == KeyModifiers::NONE => {
-                ui.move_input_cursor_up();
-            }
-            KeyCode::Char('\u{000e}') if key.modifiers == KeyModifiers::NONE => {
-                ui.move_input_cursor_down();
-            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
                 return Ok(LiveTuiAction::Continue);
             }
-            KeyCode::Char('a') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_to_beginning_of_line(true);
-            }
-            KeyCode::Char('e') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_to_end_of_line(true);
-            }
-            KeyCode::Char('b') if key.modifiers == KeyModifiers::ALT => {
-                ui.move_input_cursor_word_left();
-            }
-            KeyCode::Char('f') if key.modifiers == KeyModifiers::ALT => {
-                ui.move_input_cursor_word_right();
-            }
-            KeyCode::Char('b') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_left();
-            }
-            KeyCode::Char('f') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_right();
-            }
-            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_up();
-            }
-            KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_down();
-            }
-            KeyCode::Char('h') if key.modifiers == (KeyModifiers::CONTROL | KeyModifiers::ALT) => {
-                ui.delete_input_word_backward();
-            }
-            KeyCode::Char('h') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.input_backspace();
-            }
-            KeyCode::Char('w') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.delete_input_word_backward();
-            }
-            KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.kill_to_beginning_of_line();
-            }
-            KeyCode::Char('k') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.kill_to_end_of_line();
-            }
-            KeyCode::Char('y') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.yank_kill_buffer();
-            }
-            KeyCode::Char('d') if key.modifiers == KeyModifiers::CONTROL => {
-                ui.input_delete();
-            }
-            KeyCode::Up => {
-                if key.modifiers == KeyModifiers::CONTROL {
-                    ui.move_input_cursor_up();
-                } else if ui.slash_picker_is_active() {
-                    ui.slash_picker_move_up();
-                } else {
-                    ui.history_prev();
-                }
-            }
-            KeyCode::Down => {
-                if key.modifiers == KeyModifiers::CONTROL {
-                    ui.move_input_cursor_down();
-                } else if ui.slash_picker_is_active() {
-                    ui.slash_picker_move_down();
-                } else {
-                    ui.history_next();
-                }
-            }
-            KeyCode::Left if key.modifiers == KeyModifiers::ALT => ui.move_input_cursor_word_left(),
-            KeyCode::Left if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_word_left()
-            }
-            KeyCode::Left => ui.move_input_cursor_left(),
-            KeyCode::Right if key.modifiers == KeyModifiers::ALT => {
-                ui.move_input_cursor_word_right()
-            }
-            KeyCode::Right if key.modifiers == KeyModifiers::CONTROL => {
-                ui.move_input_cursor_word_right()
-            }
-            KeyCode::Right => ui.move_input_cursor_right(),
-            KeyCode::Home => ui.move_input_cursor_home(),
-            KeyCode::End => ui.move_input_cursor_end(),
-            KeyCode::Esc => {
-                ui.hide_shortcuts_overlay();
-            }
-            KeyCode::Enter => {
-                if key.modifiers.contains(KeyModifiers::SHIFT) {
-                    ui.input_insert_char('\n');
-                    return Ok(LiveTuiAction::Continue);
-                }
-                if ui.should_apply_slash_picker_on_enter() {
-                    let _ = ui.apply_selected_slash_entry();
-                    return Ok(LiveTuiAction::Continue);
-                }
-                queued_submit = Some(ui.take_input());
-            }
-            KeyCode::Backspace => {
-                if key.modifiers == KeyModifiers::ALT {
-                    ui.delete_input_word_backward();
-                } else {
-                    ui.input_backspace();
-                }
-            }
-            KeyCode::Delete => {
-                if key.modifiers == KeyModifiers::ALT {
-                    ui.delete_input_word_forward();
-                } else {
-                    ui.input_delete();
-                }
-            }
-            KeyCode::Tab => {
-                if ui.slash_picker_is_active() {
-                    let _ = ui.apply_selected_slash_entry();
-                } else {
-                    ui.input_insert_char('\t');
-                }
-            }
             KeyCode::Char('?') => {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && ui.input.trim().is_empty()
+                    && ui.bottom_pane_composer_text().trim().is_empty()
                 {
                     ui.toggle_shortcuts_overlay();
-                } else if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                {
-                    ui.input_insert_char('?');
+                } else {
+                    match ui.handle_bottom_pane_key_event(key) {
+                        InputResult::Submitted { text, .. } | InputResult::Queued { text, .. } => {
+                            queued_submit = Some(text);
+                        }
+                        InputResult::Command(cmd) => {
+                            queued_submit = Some(format!("/{}", cmd.command()));
+                        }
+                        InputResult::CommandWithArgs(cmd, args, _) => {
+                            queued_submit = Some(format!("/{} {}", cmd.command(), args));
+                        }
+                        InputResult::None => {}
+                    }
                 }
             }
-            KeyCode::Char(ch) => {
-                if is_altgr(key.modifiers)
-                    || (!key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT))
-                {
-                    ui.input_insert_char(ch);
+            _ => match ui.handle_bottom_pane_key_event(key) {
+                InputResult::Submitted { text, .. } | InputResult::Queued { text, .. } => {
+                    queued_submit = Some(text);
                 }
-            }
-            _ => {}
+                InputResult::Command(cmd) => {
+                    queued_submit = Some(format!("/{}", cmd.command()));
+                }
+                InputResult::CommandWithArgs(cmd, args, _) => {
+                    queued_submit = Some(format!("/{} {}", cmd.command(), args));
+                }
+                InputResult::None => {}
+            },
         }
         if let Some(input) = queued_submit {
             self.app_event_tx.send(AppEvent::SubmitInput(input));

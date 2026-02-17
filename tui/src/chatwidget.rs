@@ -1,4 +1,9 @@
 use crate::app::align_left_right;
+use crate::app_event::AppEvent as UiAppEvent;
+use crate::app_event_sender::AppEventSender as UiAppEventSender;
+use crate::bottom_pane::BottomPane;
+use crate::bottom_pane::BottomPaneParams;
+use crate::bottom_pane::InputResult;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
@@ -7,12 +12,14 @@ use crate::history_cell::HistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
 use crate::key_hint;
 use crate::mention_codec;
+use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::builtins_for_input;
 use crate::text_formatting;
 use crate::version::CODEX_CLI_VERSION;
 use crate::*;
 use codex_utils_fuzzy_match::fuzzy_match;
+use crossterm::event::KeyEvent;
 
 pub(crate) struct InFlightPrompt {
     pub(crate) prompt: String,
@@ -38,10 +45,22 @@ pub(crate) struct LiveAttachTui {
     slash_picker_index: usize,
     shortcuts_overlay_visible: bool,
     kill_buffer: String,
+    bottom_pane: BottomPane,
 }
 
 impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
+        let (ui_event_tx, _ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
+        let bottom_pane = BottomPane::new(BottomPaneParams {
+            app_event_tx: UiAppEventSender::new(ui_event_tx),
+            frame_requester: crate::tui::FrameRequester::no_op(),
+            has_input_focus: true,
+            enhanced_keys_supported: true,
+            placeholder_text: TUI_COMPOSER_PLACEHOLDER.to_string(),
+            disable_paste_burst: false,
+            animations_enabled: true,
+            skills: None,
+        });
         Self {
             session_id,
             transcript: String::new(),
@@ -60,6 +79,7 @@ impl LiveAttachTui {
             slash_picker_index: 0,
             shortcuts_overlay_visible: false,
             kill_buffer: String::new(),
+            bottom_pane,
         }
     }
 
@@ -572,20 +592,20 @@ impl LiveAttachTui {
         (visible, cursor_col, offset)
     }
 
-    pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    pub(crate) fn draw(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         terminal.draw(|frame| {
             let shortcuts_overlay_lines = self.shortcuts_overlay_lines();
             let shortcuts_overlay_height = shortcuts_overlay_lines.len() as u16;
-            let slash_picker_lines = self.slash_picker_lines(frame.area().width as usize);
-            let slash_picker_height = slash_picker_lines.len() as u16;
+            let bottom_pane_height = self.bottom_pane.desired_height(frame.area().width).max(1);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Min(1),
                     Constraint::Length(shortcuts_overlay_height),
-                    Constraint::Length(slash_picker_height),
-                    Constraint::Length(1),
-                    Constraint::Length(1),
+                    Constraint::Length(bottom_pane_height),
                 ])
                 .split(frame.area());
 
@@ -606,45 +626,20 @@ impl LiveAttachTui {
                     chunks[1],
                 );
             }
-
-            if slash_picker_height > 0 {
-                frame.render_widget(
-                    Paragraph::new(slash_picker_lines).style(self.composer_row_style()),
-                    chunks[2],
-                );
+            self.bottom_pane.render(chunks[2], frame.buffer_mut());
+            if let Some((x, y)) = self.bottom_pane.cursor_pos(chunks[2]) {
+                frame.set_cursor_position((x, y));
             }
-
-            let input_chunk_index = if shortcuts_overlay_height > 0 && slash_picker_height > 0 {
-                3
-            } else if shortcuts_overlay_height > 0 || slash_picker_height > 0 {
-                2
-            } else {
-                1
-            };
-            let footer_chunk_index = input_chunk_index + 1;
-
-            let input_width = chunks[input_chunk_index].width as usize;
-            let (visible_input, cursor_col, offset) = self.input_view(input_width);
-            let input_line = self.input_line(visible_input, offset, input_width);
-            frame.render_widget(
-                Paragraph::new(input_line).style(self.composer_row_style()),
-                chunks[input_chunk_index],
-            );
-
-            frame.render_widget(
-                Paragraph::new(Line::from(
-                    self.footer_line_text(chunks[footer_chunk_index].width as usize),
-                ))
-                .style(Style::default()),
-                chunks[footer_chunk_index],
-            );
-
-            let cursor_x = chunks[input_chunk_index]
-                .x
-                .saturating_add(cursor_col.try_into().unwrap_or(u16::MAX));
-            frame.set_cursor_position((cursor_x, chunks[input_chunk_index].y));
         })?;
         Ok(())
+    }
+
+    pub(crate) fn handle_bottom_pane_key_event(&mut self, key: KeyEvent) -> InputResult {
+        self.bottom_pane.handle_key_event(key)
+    }
+
+    pub(crate) fn bottom_pane_composer_text(&self) -> String {
+        self.bottom_pane.composer_text()
     }
 
     fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -938,6 +933,10 @@ impl LiveAttachTui {
         self.shortcuts_overlay_visible = false;
     }
 
+    pub(crate) fn shortcuts_overlay_visible(&self) -> bool {
+        self.shortcuts_overlay_visible
+    }
+
     fn shortcuts_overlay_lines(&self) -> Vec<Line<'static>> {
         if !self.shortcuts_overlay_visible {
             return Vec::new();
@@ -1077,7 +1076,10 @@ impl ChatWidget {
         &self.ui.session_id
     }
 
-    pub(crate) fn draw(&self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+    pub(crate) fn draw(
+        &mut self,
+        terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    ) -> Result<()> {
         self.ui.draw(terminal)
     }
 }

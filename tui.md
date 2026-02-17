@@ -118,7 +118,7 @@ Execution order to finish full port:
 
 - [ ] Port upstream `chatwidget.rs` flow in place (same file name/path).
 - [ ] Keep upstream transcript/history rendering behavior.
-- [ ] Keep upstream bottom pane interactions (composer, slash, overlays, status rows).
+- [~] Keep upstream bottom pane interactions (composer, slash, overlays, status rows). (composer rendering + key routing now using `BottomPane`; overlays/status rows still partial)
 - [x] Ported foreground/background rendering away from hardcoded black/gray overrides in `chatwidget` to follow upstream default terminal palette behavior.
 - [x] Ported upstream-like textarea editing controls in current composer path (word-wise move/delete, line kill/yank, AltGr-safe char insert, Ctrl/Alt navigation bindings).
 - [x] Ported upstream-style session header/help card rendering (`SessionHeaderHistoryCell`) into active chat transcript draw path to reduce first-screen visual drift.
