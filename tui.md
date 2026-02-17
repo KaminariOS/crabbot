@@ -2,6 +2,34 @@
 
 Goal: make `crabbot` TUI match upstream `codex-rs/tui` behavior and structure, with exactly one architectural difference: backend transport uses app-server (`core_compat.rs`) instead of `codex-core`.
 
+## Active Plan (Next Execution Steps)
+
+1. **Complete assistant stream parity**
+- [x] Move assistant delta handling to upstream `StreamController` (`chatwidget`).
+- [x] Commit streamed assistant output from app loop ticks (newline-gated progression).
+- [ ] Hook adaptive chunking/commit-tick policy (`streaming::commit_tick`) so burst streams match upstream pacing under load.
+
+2. **Port active-cell style history flow for non-chat events**
+- [ ] Replace remaining plain transcript fallbacks with explicit upstream `HistoryCell` constructors where possible.
+- [ ] Prioritize cells affecting visual identity: status/info/error, approvals, and tool/exec-like rows from websocket events.
+
+3. **Port richer websocket event -> cell mappings**
+- [ ] Expand `core_compat` event translation so `chatwidget` can render more upstream-like structured cells (instead of generic text lines).
+- [ ] Keep transport-only differences isolated to `core_compat.rs`/compat types.
+
+4. **Close textarea/composer parity gaps**
+- [x] Route key input, paste normalization, and paste-burst handling through `BottomPane`.
+- [ ] Audit and port remaining textarea behaviors that still diverge from upstream (selection/cursor edge behavior and slash-inline interactions).
+
+5. **Visual parity passes + diff-driven cleanup**
+- [ ] Re-run upstream diff focused on `app.rs` and `chatwidget.rs` after each port chunk.
+- [ ] Prioritize visual deltas first (foreground/background styles, spacing, markers, ordering) before deeper feature parity.
+- [ ] Keep commits small and scoped by one behavior family each.
+
+6. **Validation gate per chunk**
+- [x] `cargo check -p crabbot_tui` after each port commit.
+- [ ] Manual UI parity checks for assistant streaming, status rows, approvals, and composer interactions.
+
 ## Finish Plan (From Current State)
 
 Current baseline:
