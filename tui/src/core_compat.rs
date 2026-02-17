@@ -572,8 +572,30 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .get("item")
             .and_then(|item| item.get("type"))
             .and_then(Value::as_str)
-            .filter(|item_type| *item_type == "agent_message" || *item_type == "agentMessage")
-            .map(|_| Vec::new())
+            .filter(|item_type| *item_type == "user_message" || *item_type == "userMessage")
+            .and_then(|_| {
+                notification
+                    .params
+                    .get("item")
+                    .and_then(parse_user_message_item)
+            })
+            .map(|(text, text_elements)| {
+                vec![UiEvent::UserMessage {
+                    text,
+                    text_elements,
+                }]
+            })
+            .or_else(|| {
+                notification
+                    .params
+                    .get("item")
+                    .and_then(|item| item.get("type"))
+                    .and_then(Value::as_str)
+                    .filter(|item_type| {
+                        *item_type == "agent_message" || *item_type == "agentMessage"
+                    })
+                    .map(|_| Vec::new())
+            })
             .unwrap_or_else(|| map_item_completed_notification(&notification.params)),
         "item/viewImageToolCall" | "item/view_image_tool_call" | "item/viewImage/toolCall" => {
             notification
@@ -1287,6 +1309,35 @@ fn parse_user_message_event(
         .cloned()
         .and_then(|v| serde_json::from_value(v).ok())
         .unwrap_or_default();
+    Some((text, text_elements))
+}
+
+fn parse_user_message_item(
+    value: &Value,
+) -> Option<(String, Vec<codex_protocol::user_input::TextElement>)> {
+    let text = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(Value::as_str)
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(Value::as_array)
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find_map(|item| item.get("text").and_then(Value::as_str))
+                })
+        })?
+        .to_string();
+
+    let text_elements = value
+        .get("text_elements")
+        .or_else(|| value.get("textElements"))
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
+        .unwrap_or_default();
+
     Some((text, text_elements))
 }
 
