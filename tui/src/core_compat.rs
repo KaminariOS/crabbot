@@ -59,6 +59,9 @@ pub(crate) enum UiEvent {
         turn_id: Option<String>,
         delta: String,
     },
+    AgentMessage {
+        message: String,
+    },
     AgentReasoningDelta {
         delta: String,
     },
@@ -570,20 +573,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             .and_then(|item| item.get("type"))
             .and_then(Value::as_str)
             .filter(|item_type| *item_type == "agent_message" || *item_type == "agentMessage")
-            .and_then(|_| {
-                notification
-                    .params
-                    .get("item")
-                    .and_then(|item| item.get("text"))
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string)
-            })
-            .map(|text| {
-                vec![UiEvent::AssistantDelta {
-                    turn_id: None,
-                    delta: text,
-                }]
-            })
+            .map(|_| Vec::new())
             .unwrap_or_else(|| map_item_completed_notification(&notification.params)),
         "item/viewImageToolCall" | "item/view_image_tool_call" | "item/viewImage/toolCall" => {
             notification
@@ -1030,9 +1020,8 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
             .or_else(|| msg.get("text"))
             .and_then(Value::as_str)
             .map(|text| {
-                vec![UiEvent::AssistantDelta {
-                    turn_id: None,
-                    delta: text.to_string(),
+                vec![UiEvent::AgentMessage {
+                    message: text.to_string(),
                 }]
             })
             .unwrap_or_default(),

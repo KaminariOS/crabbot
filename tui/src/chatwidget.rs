@@ -470,6 +470,17 @@ impl LiveAttachTui {
                 };
                 self.append_assistant_delta(delta);
             }
+            UiEvent::AgentMessage { message } => {
+                // Upstream behavior: final agent message flushes stream, and is only
+                // rendered directly when no stream content was emitted.
+                let streamed = self.assistant_stream.finalize();
+                if let Some(cell) = streamed {
+                    self.add_boxed_history(cell);
+                } else if !message.is_empty() {
+                    self.append_assistant_delta(&message);
+                    self.flush_assistant_message();
+                }
+            }
             UiEvent::AgentReasoningDelta { delta } => {
                 self.on_agent_reasoning_delta(delta);
             }
