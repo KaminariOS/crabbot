@@ -67,6 +67,9 @@ pub(crate) enum UiEvent {
     },
     AgentReasoningFinal,
     AgentReasoningSectionBreak,
+    AgentMessageItemCompleted {
+        phase: Option<String>,
+    },
     TurnCompleted {
         status: Option<String>,
         last_agent_message: Option<String>,
@@ -589,12 +592,8 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                 notification
                     .params
                     .get("item")
-                    .and_then(|item| item.get("type"))
-                    .and_then(Value::as_str)
-                    .filter(|item_type| {
-                        *item_type == "agent_message" || *item_type == "agentMessage"
-                    })
-                    .map(|_| Vec::new())
+                    .and_then(parse_agent_message_item_completed)
+                    .map(|phase| vec![UiEvent::AgentMessageItemCompleted { phase }])
             })
             .unwrap_or_else(|| map_item_completed_notification(&notification.params)),
         "item/viewImageToolCall" | "item/view_image_tool_call" | "item/viewImage/toolCall" => {
@@ -1751,6 +1750,20 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
         }
         _ => Vec::new(),
     }
+}
+
+fn parse_agent_message_item_completed(item: &Value) -> Option<Option<String>> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if item_type != "agent_message" && item_type != "agentMessage" {
+        return None;
+    }
+    let phase = item
+        .get("phase")
+        .or_else(|| item.get("messagePhase"))
+        .or_else(|| item.get("message_phase"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+    Some(phase)
 }
 
 fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {

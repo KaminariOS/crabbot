@@ -276,6 +276,7 @@ pub(crate) struct LiveAttachTui {
     turn_runtime_metrics: codex_otel::RuntimeMetricsSummary,
     reasoning_buffer: String,
     full_reasoning_buffer: String,
+    pending_status_indicator_restore: bool,
     is_review_mode: bool,
     pre_review_token_info: Option<Option<codex_core::protocol::TokenUsageInfo>>,
     current_rollout_path: Option<std::path::PathBuf>,
@@ -360,6 +361,7 @@ impl LiveAttachTui {
             turn_runtime_metrics: codex_otel::RuntimeMetricsSummary::default(),
             reasoning_buffer: String::new(),
             full_reasoning_buffer: String::new(),
+            pending_status_indicator_restore: false,
             is_review_mode: false,
             pre_review_token_info: None,
             current_rollout_path: None,
@@ -502,6 +504,9 @@ impl LiveAttachTui {
             }
             UiEvent::AgentReasoningSectionBreak => {
                 self.on_reasoning_section_break();
+            }
+            UiEvent::AgentMessageItemCompleted { phase } => {
+                self.on_agent_message_item_completed(phase);
             }
             UiEvent::TurnCompleted {
                 status,
@@ -1451,6 +1456,22 @@ impl LiveAttachTui {
         self.sync_unified_exec_footer();
     }
 
+    fn stream_controllers_idle(&self) -> bool {
+        self.assistant_stream.queued_lines() == 0
+    }
+
+    fn maybe_restore_status_indicator_after_stream_idle(&mut self) {
+        if !self.pending_status_indicator_restore
+            || !self.bottom_pane.is_task_running()
+            || !self.stream_controllers_idle()
+        {
+            return;
+        }
+        self.bottom_pane.ensure_status_indicator();
+        self.sync_bottom_pane_status();
+        self.pending_status_indicator_restore = false;
+    }
+
     fn finalize_active_cell_as_failed(&mut self) {
         if let Some(mut cell) = self.active_cell.take() {
             if let Some(exec) = cell.as_any_mut().downcast_mut::<ExecCell>() {
@@ -1494,8 +1515,10 @@ impl LiveAttachTui {
         self.update_task_running_state();
         self.status_message = Some("Working".to_string());
         self.retry_status_message = None;
+        self.pending_status_indicator_restore = false;
         self.reasoning_buffer.clear();
         self.full_reasoning_buffer.clear();
+        self.sync_bottom_pane_status();
     }
 
     fn on_task_complete(
@@ -1563,6 +1586,7 @@ impl LiveAttachTui {
         } else {
             self.status_message = None;
         }
+        self.sync_bottom_pane_status();
     }
 
     fn on_server_overloaded_error(&mut self, message: String) {
@@ -1590,18 +1614,21 @@ impl LiveAttachTui {
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(true);
         self.status_message = Some(message);
+        self.sync_bottom_pane_status();
     }
 
     fn on_undo_started(&mut self, message: Option<String>) {
         self.bottom_pane.ensure_status_indicator();
         self.bottom_pane.set_interrupt_hint_visible(false);
         self.status_message = Some(message.unwrap_or_else(|| "Undo in progress...".to_string()));
+        self.sync_bottom_pane_status();
     }
 
     fn on_undo_completed(&mut self, message: Option<String>) {
         self.bottom_pane.hide_status_indicator();
         let message = message.unwrap_or_else(|| "Undo completed successfully.".to_string());
         self.add_boxed_history(Box::new(new_info_event(message, None)));
+        self.sync_bottom_pane_status();
     }
 
     fn on_entered_review_mode(&mut self, hint: Option<String>, from_replay: bool) {
@@ -1629,6 +1656,7 @@ impl LiveAttachTui {
         self.add_boxed_history(Box::new(crate::history_cell::new_review_status_line(
             "<< Code review finished >>".to_string(),
         )));
+        self.sync_bottom_pane_status();
     }
 
     fn restore_pre_review_token_info(&mut self) {
@@ -1645,12 +1673,19 @@ impl LiveAttachTui {
             Some(details) if !details.trim().is_empty() => format!("{message} ({details})"),
             _ => message,
         });
+        self.sync_bottom_pane_status();
     }
 
     fn restore_retry_status_message_if_present(&mut self) {
         if let Some(message) = self.retry_status_message.take() {
             self.status_message = Some(message);
+            self.sync_bottom_pane_status();
         }
+    }
+
+    fn on_agent_message_item_completed(&mut self, phase: Option<String>) {
+        self.pending_status_indicator_restore = matches!(phase.as_deref(), Some("commentary"));
+        self.maybe_restore_status_indicator_after_stream_idle();
     }
 
     fn on_interrupted_turn(&mut self, reason: Option<String>, from_replay: bool) {
@@ -1684,6 +1719,7 @@ impl LiveAttachTui {
             self.bottom_pane_event_tx
                 .send(UiAppEvent::StopCommitAnimation);
             self.sync_bottom_pane_status();
+            self.maybe_restore_status_indicator_after_stream_idle();
             self.flush_interrupt_queue();
         }
         changed
