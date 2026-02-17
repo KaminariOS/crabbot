@@ -243,12 +243,18 @@ fn convert_output_from_tui(output: crabbot_tui::CommandOutput) -> CommandOutput 
 
 fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
     let mut tui_state = convert_state_to_tui(state)?;
-    let output = crabbot_tui::handle_tui(
-        crabbot_tui::TuiArgs {
-            thread_id: args.thread_id,
-        },
-        &mut tui_state,
-    )?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("initialize tokio runtime for tui")?;
+    let output = runtime.block_on(async {
+        crabbot_tui::handle_tui(
+            crabbot_tui::TuiArgs {
+                thread_id: args.thread_id,
+            },
+            &mut tui_state,
+        )
+    })?;
     *state = convert_state_from_tui(tui_state)?;
     Ok(convert_output_from_tui(output))
 }
@@ -259,8 +265,13 @@ fn handle_attach_tui_interactive_with_crate(
     state: &mut CliState,
 ) -> Result<CommandOutput> {
     let mut tui_state = convert_state_to_tui(state)?;
-    let output =
-        crabbot_tui::handle_attach_tui_interactive(session_id, initial_events, &mut tui_state)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("initialize tokio runtime for attach tui")?;
+    let output = runtime.block_on(async {
+        crabbot_tui::handle_attach_tui_interactive(session_id, initial_events, &mut tui_state)
+    })?;
     *state = convert_state_from_tui(tui_state)?;
     Ok(convert_output_from_tui(output))
 }

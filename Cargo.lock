@@ -490,6 +490,7 @@ dependencies = [
  "serde_json",
  "supports-color",
  "tempfile",
+ "tokio",
  "unicode-segmentation",
  "unicode-width 0.2.1",
 ]

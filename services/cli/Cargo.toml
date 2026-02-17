@@ -15,6 +15,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
 unicode-segmentation = "1"
 unicode-width = "0.2"
 
