@@ -865,9 +865,12 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn desired_height(&self, width: u16) -> u16 {
+        let history_height = self.history_view_lines(width).len().max(1) as u16;
         let shortcuts_overlay_height = self.shortcuts_overlay_lines().len() as u16;
         let bottom_pane_height = self.bottom_pane.desired_height(width).max(1);
-        1 + shortcuts_overlay_height + bottom_pane_height
+        history_height
+            .saturating_add(shortcuts_overlay_height)
+            .saturating_add(bottom_pane_height)
     }
 
     pub(crate) fn render(&mut self, area: Rect, buf: &mut Buffer) {
