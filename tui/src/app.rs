@@ -282,6 +282,25 @@ impl App {
                 }
                 Ok(LiveTuiAction::Continue)
             }
+            AppEvent::ShowStatus => {
+                let ui = self.widget.ui_mut();
+                let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
+                let approvals = if approval_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    proper_join(&approval_ids)
+                };
+                ui.status_message = Some(format!(
+                    "thread={} approvals={} seq={} v={}",
+                    ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
+                ));
+                Ok(LiveTuiAction::Continue)
+            }
+            AppEvent::RefreshStream => {
+                self.widget.ui_mut().status_message = Some("refreshing stream...".to_string());
+                self.app_event_tx.send(AppEvent::Tick);
+                Ok(LiveTuiAction::Continue)
+            }
             AppEvent::ResumeSession => {
                 let ui = self.widget.ui_mut();
                 if let Some(thread_id) = resume_thread(&self.state, &ui.session_id)? {
@@ -410,21 +429,11 @@ impl App {
                 return Ok(LiveTuiAction::Continue);
             }
             "/status" => {
-                let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
-                let approvals = if approval_ids.is_empty() {
-                    "none".to_string()
-                } else {
-                    proper_join(&approval_ids)
-                };
-                ui.status_message = Some(format!(
-                    "thread={} approvals={} seq={} v={}",
-                    ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
-                ));
+                self.app_event_tx.send(AppEvent::ShowStatus);
                 return Ok(LiveTuiAction::Continue);
             }
             "/refresh" => {
-                ui.status_message = Some("refreshing stream...".to_string());
-                self.app_event_tx.send(AppEvent::Tick);
+                self.app_event_tx.send(AppEvent::RefreshStream);
                 return Ok(LiveTuiAction::Continue);
             }
             "/new" => {

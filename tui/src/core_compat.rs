@@ -553,6 +553,12 @@ pub(crate) enum AppEvent {
     /// Request to interrupt the active turn.
     Interrupt,
 
+    /// Request to show a status snapshot in the footer.
+    ShowStatus,
+
+    /// Request to refresh stream state now.
+    RefreshStream,
+
     /// Request to resume the current thread/session.
     ResumeSession,
 

@@ -104,6 +104,7 @@ Execution order to finish full port:
 - [x] `/resume`, `/approve`, `/deny`, and `/refresh` now dispatch through explicit app events (`ResumeSession`, `ApprovalDecision`, `Tick`) instead of inline side effects.
 - [x] Event-loop queue draining deduplicated into a single helper to keep loop scheduling flow centralized.
 - [x] Ctrl-C and `/exit`/`/quit` now route through `AppEvent::Exit` dispatch; tick stream poll failures now set status and continue instead of aborting the TUI loop.
+- [x] `/status` and `/refresh` now dispatch through dedicated app events (`ShowStatus`, `RefreshStream`) so submit handling remains dispatch-oriented.
 - [ ] Remove `codex-core` calls from `app.rs`; route backend operations through `core_compat.rs`.
 - [ ] Preserve upstream app event handling order and redraw scheduling.
 - [ ] Preserve upstream overlays/pickers mode transitions.
