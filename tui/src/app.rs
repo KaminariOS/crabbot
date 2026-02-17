@@ -11,7 +11,7 @@ pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::UiApprovalRequest;
 pub(super) use crate::core_compat::UiEvent;
 pub(super) use crate::core_compat::interrupt_turn;
-pub(super) use crate::core_compat::map_daemon_stream_events;
+pub(super) use crate::core_compat::map_legacy_stream_events;
 pub(super) use crate::core_compat::map_rpc_stream_events;
 pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread;
@@ -34,7 +34,7 @@ use crate::version::CODEX_CLI_VERSION;
 pub(crate) struct App {
     /// The active chat widget.
     widget: ChatWidget,
-    /// Shared CLI state (daemon endpoint, sessions, auth).
+    /// Shared CLI state (app-server endpoint, sessions, auth).
     state: CliState,
     /// ID of the active app-server thread.
     thread_id: String,
@@ -43,10 +43,10 @@ pub(crate) struct App {
 impl App {
     /// Create a new `App` for an interactive TUI session.
     ///
-    /// Mirrors upstream `App::run()` initialization: ensures the daemon is
+    /// Mirrors upstream `App::run()` initialization: ensures the app-server is
     /// ready, starts or reuses a thread, and creates the initial `ChatWidget`.
     pub(crate) fn new(args: TuiArgs, mut state: CliState) -> Result<Self> {
-        ensure_daemon_ready(&state)?;
+        ensure_app_server_ready(&state)?;
         let thread_id = args
             .thread_id
             .or_else(|| state.last_thread_id.clone())
@@ -55,7 +55,7 @@ impl App {
         state.last_thread_id = Some(thread_id.clone());
 
         let mut widget = ChatWidget::new(thread_id.clone());
-        widget.ui_mut().status_message = Some("connected to daemon app-server bridge".to_string());
+        widget.ui_mut().status_message = Some("connected to app-server websocket".to_string());
         let _ = widget.poll_stream_updates(&state);
 
         Ok(Self {
@@ -65,7 +65,7 @@ impl App {
         })
     }
 
-    /// Create an `App` that attaches to an existing daemon session.
+    /// Create an `App` that attaches to an existing app-server session.
     pub(crate) fn attach(
         session_id: String,
         initial_events: Vec<DaemonStreamEnvelope>,
@@ -78,7 +78,7 @@ impl App {
                 .unwrap_or("unknown")
                 .to_string();
             ui.apply_stream_events(&initial_events);
-            ui.status_message = Some("attached to daemon app-server bridge".to_string());
+            ui.status_message = Some("attached to app-server websocket".to_string());
         }
         state.last_thread_id = Some(session_id.clone());
 
@@ -164,7 +164,7 @@ impl App {
                 should_redraw = true;
             }
 
-            // Tick: poll stream for daemon events.
+            // Tick: poll stream for app-server events.
             match self.handle_event(AppEvent::Tick)? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => return Ok(()),
@@ -337,7 +337,7 @@ pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> 
             "ok": true,
             "action": "tui",
             "thread_id": state.last_thread_id,
-            "daemon_endpoint": state.config.daemon_endpoint,
+            "app_server_endpoint": state.config.app_server_endpoint,
         })));
     }
 

@@ -8,7 +8,6 @@ use crabbot_protocol::DaemonRpcRequestResponse;
 use crabbot_protocol::DaemonRpcServerRequest;
 use crabbot_protocol::DaemonRpcStreamEnvelope;
 use crabbot_protocol::DaemonRpcStreamEvent;
-use crabbot_protocol::DaemonSessionStatusResponse;
 use crabbot_protocol::DaemonStreamEnvelope;
 use crabbot_protocol::DaemonStreamEvent;
 use crossterm::event::DisableBracketedPaste;
@@ -45,10 +44,7 @@ use std::env;
 use std::io::IsTerminal;
 use std::io::{self};
 use std::net::TcpStream;
-use std::path::Path;
 use std::path::PathBuf;
-use std::process::Command;
-use std::process::Stdio;
 use std::sync::LazyLock;
 use std::sync::Mutex;
 use std::thread;
@@ -835,7 +831,7 @@ pub use codex_utils_cli_stub::SandboxModeCliArg;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
-const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+const APP_SERVER_RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 const TUI_COMPOSER_PROMPT: &str = "\u{203a} ";
 const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
 const TUI_SLASH_PICKER_MAX_ROWS: usize = 4;
@@ -859,7 +855,8 @@ pub struct SessionRuntimeState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CliConfig {
     pub api_endpoint: String,
-    pub daemon_endpoint: String,
+    #[serde(alias = "daemon_endpoint")]
+    pub app_server_endpoint: String,
     pub auth_token: Option<String>,
 }
 
@@ -867,7 +864,7 @@ impl Default for CliConfig {
     fn default() -> Self {
         Self {
             api_endpoint: "http://127.0.0.1:8787".to_string(),
-            daemon_endpoint: "http://127.0.0.1:8788".to_string(),
+            app_server_endpoint: "ws://127.0.0.1:8765".to_string(),
             auth_token: None,
         }
     }
@@ -894,7 +891,7 @@ pub enum CommandOutput {
 #[derive(Debug, Default, Clone)]
 struct ConfigSetArgs {
     api_endpoint: Option<String>,
-    daemon_endpoint: Option<String>,
+    app_server_endpoint: Option<String>,
     auth_token: Option<String>,
     clear_auth_token: bool,
 }
@@ -1019,11 +1016,11 @@ fn handle_config_set(args: ConfigSetArgs, state: &mut CliState) -> Result<Value>
         changed = true;
     }
 
-    if let Some(daemon_endpoint) = args.daemon_endpoint {
-        if daemon_endpoint.trim().is_empty() {
-            bail!("daemon_endpoint cannot be empty");
+    if let Some(app_server_endpoint) = args.app_server_endpoint {
+        if app_server_endpoint.trim().is_empty() {
+            bail!("app_server_endpoint cannot be empty");
         }
-        state.config.daemon_endpoint = daemon_endpoint;
+        state.config.app_server_endpoint = app_server_endpoint;
         changed = true;
     }
 
@@ -1055,136 +1052,32 @@ fn parse_session_status(state: &str) -> Result<SessionStatus> {
     match state {
         "active" => Ok(SessionStatus::Active),
         "interrupted" => Ok(SessionStatus::Interrupted),
-        other => bail!("unsupported daemon session state: {other}"),
+        other => bail!("unsupported app-server session state: {other}"),
     }
 }
 
-fn persist_daemon_session(
-    state: &mut CliState,
-    daemon_session: &DaemonSessionStatusResponse,
-) -> Result<()> {
-    let state_value = parse_session_status(&daemon_session.state)?;
-    let last_sequence = state
-        .sessions
-        .get(&daemon_session.session_id)
-        .map(|runtime| runtime.last_sequence)
-        .unwrap_or(0);
-    state.sessions.insert(
-        daemon_session.session_id.clone(),
-        SessionRuntimeState {
-            state: state_value,
-            updated_at_unix_ms: daemon_session.updated_at_unix_ms,
-            last_event: daemon_session.last_event.clone(),
-            last_sequence,
-        },
-    );
-    Ok(())
-}
-
-fn ensure_daemon_ready(state: &CliState) -> Result<()> {
-    if with_app_server_ws_client(
-        &state.config.daemon_endpoint,
+fn ensure_app_server_ready(state: &CliState) -> Result<()> {
+    with_app_server_ws_client(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         |_| Ok(()),
     )
-    .is_ok()
-    {
-        return Ok(());
-    }
-
-    auto_start_daemon_process()?;
-
-    for _ in 0..20 {
-        if with_app_server_ws_client(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-            |_| Ok(()),
+    .with_context(|| {
+        format!(
+            "failed to connect to app-server websocket at {}",
+            state.config.app_server_endpoint
         )
-        .is_ok()
-        {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(150));
-    }
-
-    bail!(
-        "daemon is not healthy at {}; run `cargo run -p crabbot_daemon` or set CRABBOT_DAEMON_BIN",
-        state.config.daemon_endpoint
-    )
+    })
 }
 
-fn auto_start_daemon_process() -> Result<()> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(explicit) = env::var_os("CRABBOT_DAEMON_BIN") {
-        if !PathBuf::from(&explicit).as_os_str().is_empty() {
-            candidates.push(PathBuf::from(explicit));
-        }
-    }
-
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            candidates.push(parent.join("crabbot_daemon"));
-        }
-    }
-    candidates.push(PathBuf::from("crabbot_daemon"));
-
-    let mut last_error: Option<anyhow::Error> = None;
-    for candidate in candidates {
-        match spawn_daemon_process(&candidate) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    if spawn_daemon_via_cargo().is_ok() {
-        return Ok(());
-    }
-
-    match last_error {
-        Some(error) => Err(error),
-        None => bail!("unable to auto-start daemon"),
-    }
-}
-
-fn spawn_daemon_process(binary: &Path) -> Result<()> {
-    let mut command = Command::new(binary);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(bind) = env::var_os("CRABBOT_DAEMON_BIND") {
-        command.env("CRABBOT_DAEMON_BIND", bind);
-    }
-
-    command
-        .spawn()
-        .with_context(|| format!("auto-start daemon via {}", binary.display()))?;
-    Ok(())
-}
-
-fn spawn_daemon_via_cargo() -> Result<()> {
-    if !Path::new("Cargo.toml").exists() {
-        bail!("Cargo.toml not found in current working directory");
-    }
-
-    Command::new("cargo")
-        .args(["run", "-p", "crabbot_daemon"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("auto-start daemon via cargo run -p crabbot_daemon")?;
-    Ok(())
-}
-
-fn daemon_prompt_session(
-    daemon_endpoint: &str,
+fn app_server_prompt_session(
+    app_server_endpoint: &str,
     session_id: &str,
     text: &str,
     auth_token: Option<&str>,
 ) -> Result<DaemonPromptResponse> {
-    let response = daemon_app_server_rpc_request(
-        daemon_endpoint,
+    let response = app_server_rpc_request(
+        app_server_endpoint,
         auth_token,
         "turn/start",
         json!({
@@ -1199,7 +1092,9 @@ fn daemon_prompt_session(
         }),
     )
     .with_context(|| {
-        format!("request app-server turn/start (session={session_id}, endpoint={daemon_endpoint})")
+        format!(
+            "request app-server turn/start (session={session_id}, endpoint={app_server_endpoint})"
+        )
     })?;
 
     let turn_id = response
@@ -1388,7 +1283,7 @@ impl AppServerWsClient {
             "params": params,
         }))?;
 
-        let deadline = Instant::now() + DAEMON_PROMPT_REQUEST_TIMEOUT;
+        let deadline = Instant::now() + APP_SERVER_RPC_REQUEST_TIMEOUT;
         while Instant::now() < deadline {
             let Some(raw_line) = self.read_text_with_timeout(Duration::from_millis(200))? else {
                 continue;
@@ -1437,16 +1332,17 @@ impl AppServerWsClient {
     }
 }
 
-fn app_server_ws_url(daemon_endpoint: &str) -> Result<String> {
+fn app_server_ws_url(app_server_endpoint: &str) -> Result<String> {
     if let Ok(value) = env::var("CODEX_APP_SERVER_WS_URL")
         && !value.trim().is_empty()
     {
         return Ok(value);
     }
-    if daemon_endpoint.starts_with("ws://") || daemon_endpoint.starts_with("wss://") {
-        return Ok(daemon_endpoint.to_string());
+    if app_server_endpoint.starts_with("ws://") || app_server_endpoint.starts_with("wss://") {
+        return Ok(app_server_endpoint.to_string());
     }
-    let mut url = Url::parse(daemon_endpoint).context("parse daemon endpoint for websocket")?;
+    let mut url =
+        Url::parse(app_server_endpoint).context("parse app-server endpoint for websocket")?;
     match url.scheme() {
         "http" => {
             let _ = url.set_scheme("ws");
@@ -1454,20 +1350,20 @@ fn app_server_ws_url(daemon_endpoint: &str) -> Result<String> {
         "https" => {
             let _ = url.set_scheme("wss");
         }
-        other => bail!("unsupported daemon endpoint scheme for websocket: {other}"),
+        other => bail!("unsupported app-server endpoint scheme for websocket: {other}"),
     }
     Ok(url.to_string())
 }
 
 fn with_app_server_ws_client<T, F>(
-    daemon_endpoint: &str,
+    app_server_endpoint: &str,
     auth_token: Option<&str>,
     f: F,
 ) -> Result<T>
 where
     F: FnOnce(&mut AppServerWsClient) -> Result<T>,
 {
-    let ws_url = app_server_ws_url(daemon_endpoint)?;
+    let ws_url = app_server_ws_url(app_server_endpoint)?;
     let mut guard = APP_SERVER_WS_CLIENT
         .lock()
         .map_err(|_| anyhow!("app-server websocket client mutex poisoned"))?;
@@ -1489,34 +1385,34 @@ where
     result
 }
 
-fn daemon_app_server_rpc_request(
-    daemon_endpoint: &str,
+fn app_server_rpc_request(
+    app_server_endpoint: &str,
     auth_token: Option<&str>,
     method: &str,
     params: Value,
 ) -> Result<DaemonRpcRequestResponse> {
-    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+    with_app_server_ws_client(app_server_endpoint, auth_token, |client| {
         client.request(method, params)
     })
 }
 
-fn daemon_app_server_rpc_respond(
-    daemon_endpoint: &str,
+fn app_server_rpc_respond(
+    app_server_endpoint: &str,
     auth_token: Option<&str>,
     request_id: Value,
     result: Value,
 ) -> Result<()> {
-    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+    with_app_server_ws_client(app_server_endpoint, auth_token, |client| {
         client.respond(request_id, result)
     })
 }
 
-fn fetch_daemon_app_server_stream(
-    daemon_endpoint: &str,
+fn fetch_app_server_stream(
+    app_server_endpoint: &str,
     auth_token: Option<&str>,
     since_sequence: Option<u64>,
 ) -> Result<Vec<DaemonRpcStreamEnvelope>> {
-    with_app_server_ws_client(daemon_endpoint, auth_token, |client| {
+    with_app_server_ws_client(app_server_endpoint, auth_token, |client| {
         client.drain_stream_events(since_sequence.unwrap_or_default())
     })
 }
@@ -1551,12 +1447,12 @@ fn cached_last_sequence(state: &CliState, session_id: &str) -> Option<u64> {
 fn render_attach_tui(
     session_id: &str,
     stream_events: &[DaemonStreamEnvelope],
-    daemon_endpoint: &str,
+    app_server_endpoint: &str,
 ) -> String {
     render_attach_tui_with_columns_and_fallback(
         session_id,
         stream_events,
-        daemon_endpoint,
+        app_server_endpoint,
         terminal_columns(),
         None,
     )
@@ -1566,13 +1462,13 @@ fn render_attach_tui(
 fn render_attach_tui_with_columns(
     session_id: &str,
     stream_events: &[DaemonStreamEnvelope],
-    daemon_endpoint: &str,
+    app_server_endpoint: &str,
     columns: usize,
 ) -> String {
     render_attach_tui_with_columns_and_fallback(
         session_id,
         stream_events,
-        daemon_endpoint,
+        app_server_endpoint,
         columns,
         None,
     )
@@ -1581,7 +1477,7 @@ fn render_attach_tui_with_columns(
 fn render_attach_tui_with_columns_and_fallback(
     session_id: &str,
     stream_events: &[DaemonStreamEnvelope],
-    daemon_endpoint: &str,
+    app_server_endpoint: &str,
     columns: usize,
     fallback_state: Option<&str>,
 ) -> String {
@@ -1651,7 +1547,7 @@ fn render_attach_tui_with_columns_and_fallback(
         &latest_state,
         stream_events.len(),
         last_sequence,
-        daemon_endpoint,
+        app_server_endpoint,
         columns,
     );
 
@@ -1685,11 +1581,11 @@ fn build_attach_footer(
     state: &str,
     received_events: usize,
     last_sequence: u64,
-    daemon_endpoint: &str,
+    app_server_endpoint: &str,
     columns: usize,
 ) -> String {
     let full = format!(
-        "session={session_id} state={state} events={received_events} seq={last_sequence} daemon={daemon_endpoint}"
+        "session={session_id} state={state} events={received_events} seq={last_sequence} app_server={app_server_endpoint}"
     );
     if full.len() <= columns {
         return full;

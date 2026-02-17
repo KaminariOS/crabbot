@@ -5,7 +5,7 @@
 //!
 //! ## Architecture
 //! Upstream codex-tui depends on `codex-core` for event types, config, auth, and
-//! protocol handling. Crabbot instead talks to an app-server daemon over HTTP.
+//! protocol handling. Crabbot instead talks directly to an app-server websocket server.
 //! This module provides the same *structural types* the rest of the TUI expects
 //! (events, exit info, config shims) without pulling in `codex-core`.
 use super::*;
@@ -60,7 +60,7 @@ pub(crate) enum UiEvent {
     ApprovalRequired(UiApprovalRequest),
 }
 
-pub(crate) fn map_daemon_stream_events(stream_events: &[DaemonStreamEnvelope]) -> Vec<UiEvent> {
+pub(crate) fn map_legacy_stream_events(stream_events: &[DaemonStreamEnvelope]) -> Vec<UiEvent> {
     let mut events = Vec::new();
     for envelope in stream_events {
         match &envelope.event {
@@ -135,7 +135,7 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
             }
             DaemonRpcStreamEvent::DecodeError(error) => {
                 events.push(UiEvent::TranscriptLine(format!(
-                    "[daemon rpc decode error] {}",
+                    "[app-server rpc decode error] {}",
                     error.message
                 )));
             }
@@ -329,8 +329,8 @@ fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {
 }
 
 pub(crate) fn start_thread(state: &CliState) -> Result<String> {
-    let response = daemon_app_server_rpc_request(
-        &state.config.daemon_endpoint,
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "thread/start",
         json!({
@@ -342,8 +342,8 @@ pub(crate) fn start_thread(state: &CliState) -> Result<String> {
 }
 
 pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Result<Option<String>> {
-    let response = daemon_app_server_rpc_request(
-        &state.config.daemon_endpoint,
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "turn/start",
         json!({
@@ -366,8 +366,8 @@ pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Resul
 }
 
 pub(crate) fn interrupt_turn(state: &CliState, thread_id: &str, turn_id: &str) -> Result<()> {
-    let _ = daemon_app_server_rpc_request(
-        &state.config.daemon_endpoint,
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "turn/interrupt",
         json!({
@@ -379,8 +379,8 @@ pub(crate) fn interrupt_turn(state: &CliState, thread_id: &str, turn_id: &str) -
 }
 
 pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<String>> {
-    let response = daemon_app_server_rpc_request(
-        &state.config.daemon_endpoint,
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "thread/resume",
         json!({
@@ -413,8 +413,8 @@ pub(crate) fn respond_to_approval(
         }
     };
 
-    daemon_app_server_rpc_respond(
-        &state.config.daemon_endpoint,
+    app_server_rpc_respond(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         request_id,
         json!({
@@ -428,8 +428,8 @@ pub(crate) fn stream_events(
     state: &CliState,
     since_sequence: u64,
 ) -> Result<Vec<DaemonRpcStreamEnvelope>> {
-    fetch_daemon_app_server_stream(
-        &state.config.daemon_endpoint,
+    fetch_app_server_stream(
+        &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         Some(since_sequence),
     )
@@ -438,7 +438,7 @@ pub(crate) fn stream_events(
 /// Decode a single app-server wire message line into the UI stream envelope.
 ///
 /// Accepts both:
-/// - Crabbot daemon stream envelopes (`DaemonRpcStreamEnvelope`)
+/// - Crabbot legacy stream envelopes (`DaemonRpcStreamEnvelope`)
 /// - Raw app-server JSON-RPC websocket messages (request/notification/response)
 ///
 /// Responses for in-flight client requests are ignored (`Ok(None)`) because
@@ -480,7 +480,7 @@ pub(crate) fn decode_app_server_wire_line(
     }
 
     let message = serde_json::from_str::<WireMessage>(line)
-        .with_context(|| "parse app-server wire line (daemon envelope or json-rpc)")?;
+        .with_context(|| "parse app-server wire line (app-server envelope or json-rpc)")?;
 
     let event = match message {
         WireMessage::StreamEnvelope(envelope) => return Ok(Some(envelope)),
@@ -541,7 +541,7 @@ pub(crate) enum AppEvent {
     Tick,
 
     // -- App-server specific events --
-    /// Incoming stream events from the app-server daemon.
+    /// Incoming stream events from the app-server websocket server.
     StreamUpdate(Vec<DaemonRpcStreamEnvelope>),
 
     /// User submitted input from the composer.
@@ -622,7 +622,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decode_wire_line_accepts_daemon_stream_envelope() {
+    fn decode_wire_line_accepts_legacy_stream_envelope() {
         let line = r#"{"schema_version":1,"sequence":7,"event":{"type":"notification","payload":{"method":"turn/started","params":{"turn":{"id":"t_1"}}}}}"#;
         let envelope = decode_app_server_wire_line(line, 99)
             .expect("decode should succeed")

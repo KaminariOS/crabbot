@@ -5,7 +5,7 @@ use crate::core_compat::AppEvent;
 use crate::core_compat::LiveTuiAction;
 use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
-use crate::core_compat::map_daemon_stream_events;
+use crate::core_compat::map_legacy_stream_events;
 use crate::core_compat::map_rpc_stream_events;
 use crate::key_hint;
 use crate::mention_codec;
@@ -68,7 +68,7 @@ impl LiveAttachTui {
             self.last_sequence = last.sequence;
         }
         self.received_events += stream_events.len();
-        self.apply_ui_events(map_daemon_stream_events(stream_events));
+        self.apply_ui_events(map_legacy_stream_events(stream_events));
     }
 
     pub(crate) fn apply_rpc_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
@@ -341,7 +341,7 @@ impl LiveAttachTui {
 
     pub(crate) fn start_prompt_request(
         &mut self,
-        daemon_endpoint: String,
+        app_server_endpoint: String,
         auth_token: Option<String>,
         prompt: String,
     ) -> Result<()> {
@@ -352,8 +352,8 @@ impl LiveAttachTui {
         let session_id = self.session_id.clone();
         let request_prompt = prompt.clone();
         let handle = thread::spawn(move || {
-            daemon_prompt_session(
-                &daemon_endpoint,
+            app_server_prompt_session(
+                &app_server_endpoint,
                 &session_id,
                 &request_prompt,
                 auth_token.as_deref(),
