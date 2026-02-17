@@ -1069,6 +1069,7 @@ impl LiveAttachTui {
             ]));
         }
         for cell in &self.history_cells {
+            lines.push(Line::from(""));
             lines.extend(cell.display_lines(width));
         }
         if lines.is_empty() {
