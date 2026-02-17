@@ -1274,6 +1274,10 @@ impl LiveAttachTui {
         self.bottom_pane.composer_text()
     }
 
+    pub(crate) fn bottom_pane_composer_text_with_pending(&self) -> String {
+        self.bottom_pane.composer_text_with_pending()
+    }
+
     pub(crate) fn apply_external_edit(&mut self, text: String) {
         self.bottom_pane.apply_external_edit(text);
     }

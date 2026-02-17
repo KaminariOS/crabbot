@@ -523,6 +523,7 @@ impl App {
             Option<String>,
             Vec<codex_protocol::user_input::TextElement>,
         )> = None;
+        let mut queued_external_editor_launch = false;
         if key.code == KeyCode::PageUp {
             self.widget.ui_mut().scroll_history_page_up();
             return Ok(LiveTuiAction::Continue);
@@ -541,6 +542,12 @@ impl App {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
                     return Ok(LiveTuiAction::Continue);
+                }
+                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if !ui.shortcuts_overlay_visible() && ui.bottom_pane_no_modal_or_popup_active()
+                    {
+                        queued_external_editor_launch = true;
+                    }
                 }
                 KeyCode::Char('?') => {
                     if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -598,6 +605,10 @@ impl App {
 
         while let Ok(event) = self.widget_event_rx.try_recv() {
             self.handle_widget_app_event(event)?;
+        }
+
+        if queued_external_editor_launch {
+            self.handle_widget_app_event(WidgetAppEvent::LaunchExternalEditor)?;
         }
 
         if let Some((cmd, args, text_elements)) = queued_command {
@@ -1616,50 +1627,55 @@ impl App {
                 .set_status_message(Some("close active popup before editing".to_string()));
             return Ok(());
         }
-        if !self.widget.ui_mut().bottom_pane_is_task_running()
-            && !self.widget.ui_mut().bottom_pane_composer_text().is_empty()
-        {
-            let seed = self.widget.ui_mut().bottom_pane_composer_text();
-            let editor_cmd = match crate::external_editor::resolve_editor_command() {
-                Ok(cmd) => cmd,
-                Err(err) => {
-                    self.widget.ui_mut().add_history_cell(Box::new(
-                        crate::history_cell::new_error_event(err.to_string()),
-                    ));
-                    return Ok(());
-                }
-            };
-            let edit_result = thread::spawn(move || -> Result<String> {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()?;
-                runtime
-                    .block_on(crate::external_editor::run_editor(&seed, &editor_cmd))
-                    .map_err(|err| anyhow::anyhow!("{err}"))
-            })
-            .join();
+        let seed = self
+            .widget
+            .ui_mut()
+            .bottom_pane_composer_text_with_pending();
+        let editor_cmd = match crate::external_editor::resolve_editor_command() {
+            Ok(cmd) => cmd,
+            Err(crate::external_editor::EditorError::MissingEditor) => {
+                self.widget
+                    .ui_mut()
+                    .add_history_cell(Box::new(crate::history_cell::new_error_event(
+                    "Cannot open external editor: set $VISUAL or $EDITOR before starting Codex."
+                        .to_string(),
+                )));
+                return Ok(());
+            }
+            Err(err) => {
+                self.widget.ui_mut().add_history_cell(Box::new(
+                    crate::history_cell::new_error_event(format!("Failed to open editor: {err}",)),
+                ));
+                return Ok(());
+            }
+        };
 
-            match edit_result {
-                Ok(Ok(edited)) => {
-                    self.widget.ui_mut().apply_external_edit(edited);
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("external editor applied".to_string()));
-                }
-                Ok(Err(err)) => {
-                    self.widget.ui_mut().add_history_cell(Box::new(
-                        crate::history_cell::new_error_event(format!(
-                            "external editor failed: {err}"
-                        )),
-                    ));
-                }
-                Err(_) => {
-                    self.widget.ui_mut().add_history_cell(Box::new(
-                        crate::history_cell::new_error_event(
-                            "external editor panicked".to_string(),
-                        ),
-                    ));
-                }
+        let edit_result = thread::spawn(move || -> Result<String> {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?;
+            runtime
+                .block_on(crate::external_editor::run_editor(&seed, &editor_cmd))
+                .map_err(|err| anyhow::anyhow!("{err}"))
+        })
+        .join();
+
+        match edit_result {
+            Ok(Ok(edited)) => {
+                let cleaned = edited.trim_end().to_string();
+                self.widget.ui_mut().apply_external_edit(cleaned);
+            }
+            Ok(Err(err)) => {
+                self.widget.ui_mut().add_history_cell(Box::new(
+                    crate::history_cell::new_error_event(format!("Failed to open editor: {err}")),
+                ));
+            }
+            Err(_) => {
+                self.widget.ui_mut().add_history_cell(Box::new(
+                    crate::history_cell::new_error_event(
+                        "Failed to open editor: editor panicked".to_string(),
+                    ),
+                ));
             }
         }
         Ok(())
