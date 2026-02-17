@@ -1224,6 +1224,14 @@ mod codex_protocol_stub {
                 uuid: uuid::Uuid::new_v4().to_string(),
             }
         }
+
+        pub fn from_string(value: impl Into<String>) -> Result<Self, uuid::Error> {
+            let uuid = value.into();
+            let parsed = uuid::Uuid::parse_str(&uuid)?;
+            Ok(Self {
+                uuid: parsed.to_string(),
+            })
+        }
     }
 
     impl Default for ThreadId {

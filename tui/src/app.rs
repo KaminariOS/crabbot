@@ -23,8 +23,6 @@ use crate::file_search::FileSearchManager;
 use crate::get_git_diff::get_git_diff;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
-use crate::text_formatting::proper_join;
-use crate::version::CODEX_CLI_VERSION;
 use codex_core::protocol::ExecCommandSource;
 use crossterm::style::ResetColor;
 
@@ -828,20 +826,38 @@ impl App {
     }
 
     fn emit_status_summary(&mut self) {
-        let ui = self.widget.ui_mut();
-        let approval_ids = ui.pending_approvals.keys().cloned().collect::<Vec<_>>();
-        let approvals = if approval_ids.is_empty() {
-            "none".to_string()
-        } else {
-            proper_join(&approval_ids)
-        };
-        let summary = format!(
-            "thread={} approvals={} seq={} v={}",
-            ui.session_id, approvals, ui.last_sequence, CODEX_CLI_VERSION
+        let mut config = crate::config::Config::default();
+        config.cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
+
+        let auth_manager = crate::AuthManager::default();
+        let token_usage = codex_core::protocol::TokenUsage::default();
+        let rate_limits: Vec<crate::status::RateLimitSnapshotDisplay> = Vec::new();
+        let thread_id =
+            codex_protocol::ThreadId::from_string(self.widget.ui_mut().session_id.clone())
+                .ok()
+                .map(Some)
+                .unwrap_or(None);
+        let model_name = config
+            .model
+            .clone()
+            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+
+        let cell = crate::status::new_status_output_with_rate_limits(
+            &config,
+            &auth_manager,
+            None,
+            &token_usage,
+            &thread_id,
+            None,
+            None,
+            rate_limits.as_slice(),
+            None,
+            chrono::Local::now(),
+            &model_name,
+            None,
+            None,
         );
-        ui.push_line("/status");
-        ui.push_line(&summary);
-        ui.set_status_message(Some(summary));
+        self.widget.ui_mut().add_history_cell(Box::new(cell));
     }
 }
 
