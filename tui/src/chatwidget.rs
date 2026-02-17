@@ -53,6 +53,7 @@ use ratatui::layout::Rect;
 use std::any::TypeId;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::collections::VecDeque;
 
 pub(crate) struct InFlightPrompt {
@@ -232,6 +233,7 @@ pub(crate) struct LiveAttachTui {
     total_token_usage: codex_core::protocol::TokenUsage,
     rate_limit_snapshots_by_limit_id: BTreeMap<String, RateLimitSnapshotDisplay>,
     running_commands: HashMap<String, RunningCommand>,
+    suppressed_exec_calls: HashSet<String>,
     last_unified_wait: Option<UnifiedExecWaitState>,
     unified_exec_wait_streak: Option<UnifiedExecWaitStreak>,
     unified_exec_processes: Vec<UnifiedExecProcessSummary>,
@@ -303,6 +305,7 @@ impl LiveAttachTui {
             total_token_usage: codex_core::protocol::TokenUsage::default(),
             rate_limit_snapshots_by_limit_id: BTreeMap::new(),
             running_commands: HashMap::new(),
+            suppressed_exec_calls: HashSet::new(),
             last_unified_wait: None,
             unified_exec_wait_streak: None,
             unified_exec_processes: Vec::new(),
@@ -847,10 +850,21 @@ impl LiveAttachTui {
             },
         );
         self.track_unified_exec_process_begin(process_id.clone(), &call_id, &command, source);
+        let command_display = command.join(" ");
+        let should_suppress_unified_wait = source
+            == codex_core::protocol::ExecCommandSource::UnifiedExecInteraction
+            && self
+                .last_unified_wait
+                .as_ref()
+                .is_some_and(|wait| wait.is_duplicate(&command_display));
         if source == codex_core::protocol::ExecCommandSource::UnifiedExecInteraction {
-            self.last_unified_wait = Some(UnifiedExecWaitState::new(command.join(" ")));
+            self.last_unified_wait = Some(UnifiedExecWaitState::new(command_display));
         } else {
             self.last_unified_wait = None;
+        }
+        if should_suppress_unified_wait {
+            self.suppressed_exec_calls.insert(call_id);
+            return;
         }
         if let Some(exec_cell) = self
             .active_cell
@@ -905,6 +919,9 @@ impl LiveAttachTui {
         duration: Duration,
     ) {
         let running = self.running_commands.remove(call_id);
+        if self.suppressed_exec_calls.remove(call_id) {
+            return;
+        }
         let completed_process_id = process_id
             .clone()
             .or_else(|| running.as_ref().and_then(|rc| rc.process_id.clone()));
