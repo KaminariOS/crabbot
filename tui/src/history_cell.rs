@@ -493,38 +493,45 @@ impl UpdateAvailableHistoryCell {
 
 impl HistoryCell for UpdateAvailableHistoryCell {
     fn display_lines(&self, width: u16) -> Vec<Line<'static>> {
-        use ratatui_macros::line;
-        use ratatui_macros::text;
         let update_instruction = if let Some(update_action) = self.update_action {
-            line!["Run ", update_action.command_str().cyan(), " to update."]
+            Line::from(vec![
+                "Run ".into(),
+                update_action.command_str().cyan(),
+                " to update.".into(),
+            ])
         } else {
-            line![
-                "See ",
+            Line::from(vec![
+                "See ".into(),
                 "https://github.com/openai/codex".cyan().underlined(),
-                " for installation options."
-            ]
+                " for installation options.".into(),
+            ])
         };
 
-        let content = text![
-            line![
+        let content = vec![
+            Line::from(vec![
                 padded_emoji("✨").bold().cyan(),
                 "Update available!".bold().cyan(),
-                " ",
+                " ".into(),
                 format!("{CODEX_CLI_VERSION} -> {}", self.latest_version).bold(),
-            ],
+            ]),
             update_instruction,
-            "",
-            "See full release notes:",
-            "https://github.com/openai/codex/releases/latest"
-                .cyan()
-                .underlined(),
+            Line::default(),
+            Line::from("See full release notes:"),
+            Line::from(
+                "https://github.com/openai/codex/releases/latest"
+                    .cyan()
+                    .underlined(),
+            ),
         ];
 
         let inner_width = content
-            .width()
+            .iter()
+            .map(Line::width)
+            .max()
+            .unwrap_or(1)
             .min(usize::from(width.saturating_sub(4)))
             .max(1);
-        with_border_with_inner_width(content.lines, inner_width)
+        with_border_with_inner_width(content, inner_width)
     }
 }
 

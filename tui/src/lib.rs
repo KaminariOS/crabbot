@@ -58,39 +58,200 @@ use tungstenite::connect;
 use tungstenite::stream::MaybeTlsStream;
 use url::Url;
 
+extern crate self as codex_ansi_escape;
 extern crate self as codex_chatgpt;
 extern crate self as codex_core;
 extern crate self as codex_feedback;
 extern crate self as codex_file_search;
+extern crate self as codex_otel;
 extern crate self as codex_protocol;
 extern crate self as codex_utils_approval_presets;
 extern crate self as codex_utils_cli;
+extern crate self as codex_utils_elapsed;
 extern crate self as codex_utils_sandbox_summary;
+extern crate self as rmcp;
 
 pub mod config {
+    use crate::WireApi;
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
     pub mod types {
         pub use crate::core_compat::config::types::NotificationMethod;
+        use serde::Deserialize;
+        use serde::Serialize;
+        use std::collections::HashMap;
+        use std::path::PathBuf;
 
-        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(tag = "type", rename_all = "snake_case")]
         pub enum McpServerTransportConfig {
-            Stdio,
-            Sse,
+            Stdio {
+                command: String,
+                #[serde(default)]
+                args: Vec<String>,
+                #[serde(default)]
+                env: Option<HashMap<String, String>>,
+                #[serde(default)]
+                env_vars: Option<HashMap<String, String>>,
+                #[serde(default)]
+                cwd: Option<PathBuf>,
+            },
+            StreamableHttp {
+                url: String,
+                #[serde(default)]
+                http_headers: Option<HashMap<String, String>>,
+                #[serde(default)]
+                env_http_headers: Option<HashMap<String, String>>,
+            },
+        }
+
+        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        pub struct McpServerConfig {
+            pub transport: McpServerTransportConfig,
+            #[serde(default = "enabled_default")]
+            pub enabled: bool,
+            #[serde(default)]
+            pub disabled_reason: Option<String>,
+        }
+
+        fn enabled_default() -> bool {
+            true
+        }
+
+        impl Default for McpServerTransportConfig {
+            fn default() -> Self {
+                Self::Stdio {
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: None,
+                    env_vars: None,
+                    cwd: None,
+                }
+            }
         }
     }
 
-    /// Stub for `codex_core::config::Config` – only the fields that TUI modules
-    /// actually access are included.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub enum ReasoningSummary {
+        None,
+        Auto,
+        Concise,
+        Detailed,
+    }
+
+    impl std::fmt::Display for ReasoningSummary {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                ReasoningSummary::None => f.write_str("none"),
+                ReasoningSummary::Auto => f.write_str("auto"),
+                ReasoningSummary::Concise => f.write_str("concise"),
+                ReasoningSummary::Detailed => f.write_str("detailed"),
+            }
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct ValueRef<T>(pub T);
+
+    impl<T> ValueRef<T> {
+        pub fn get(&self) -> &T {
+            &self.0
+        }
+        pub fn value(&self) -> T
+        where
+            T: Clone,
+        {
+            self.0.clone()
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    pub struct Permissions {
+        pub approval_policy: ValueRef<crate::protocol::AskForApproval>,
+        pub sandbox_policy: ValueRef<crate::protocol::SandboxPolicy>,
+    }
+
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct McpServers(pub BTreeMap<String, types::McpServerConfig>);
+
+    impl McpServers {
+        pub fn iter(
+            &self,
+        ) -> std::collections::btree_map::Iter<'_, String, types::McpServerConfig> {
+            self.0.iter()
+        }
+
+        pub fn get(&self) -> &BTreeMap<String, types::McpServerConfig> {
+            &self.0
+        }
+    }
+
+    impl Default for McpServers {
+        fn default() -> Self {
+            Self(BTreeMap::new())
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub struct Config {
-        pub cwd: std::path::PathBuf,
-        pub model: String,
+        pub cwd: PathBuf,
+        pub model: Option<String>,
         pub model_provider_id: String,
         pub model_provider: ConfigModelProvider,
+        pub permissions: Permissions,
+        pub model_reasoning_summary: ReasoningSummary,
+        pub model_context_window: Option<i64>,
+        pub show_tooltips: bool,
+        pub mcp_servers: McpServers,
+        pub model_supports_reasoning_summaries: Option<bool>,
     }
 
     #[derive(Debug, Clone)]
     pub struct ConfigModelProvider {
         pub name: String,
+        pub env_key: Option<String>,
+        pub wire_api: WireApi,
+        pub base_url: Option<String>,
+    }
+
+    impl Default for ConfigModelProvider {
+        fn default() -> Self {
+            Self {
+                name: "openai".to_string(),
+                env_key: None,
+                wire_api: WireApi::Responses,
+                base_url: None,
+            }
+        }
+    }
+
+    impl ConfigModelProvider {
+        pub fn is_openai(&self) -> bool {
+            self.name.eq_ignore_ascii_case("openai")
+        }
+    }
+
+    impl Default for Config {
+        fn default() -> Self {
+            Self {
+                cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
+                model: None,
+                model_provider_id: "openai".to_string(),
+                model_provider: ConfigModelProvider::default(),
+                permissions: Permissions {
+                    approval_policy: ValueRef(crate::protocol::AskForApproval::OnRequest),
+                    sandbox_policy: ValueRef(
+                        crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+                    ),
+                },
+                model_reasoning_summary: ReasoningSummary::None,
+                model_context_window: None,
+                show_tooltips: true,
+                mcp_servers: McpServers::default(),
+                model_supports_reasoning_summaries: None,
+            }
+        }
     }
 
     /// Stub for `codex_core::config::log_dir`.
@@ -100,6 +261,80 @@ pub mod config {
         dir.push("logs");
         std::fs::create_dir_all(&dir)?;
         Ok(dir)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireApi {
+    ChatCompletions,
+    Responses,
+}
+
+pub mod auth {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum AuthMode {
+        ApiKey,
+        Chatgpt,
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CachedAuth {
+    mode: auth::AuthMode,
+    email: Option<String>,
+}
+
+impl CachedAuth {
+    pub fn auth_mode(&self) -> auth::AuthMode {
+        self.mode
+    }
+
+    pub fn get_account_email(&self) -> Option<String> {
+        self.email.clone()
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AuthManager {
+    auth: Option<CachedAuth>,
+}
+
+impl AuthManager {
+    pub fn auth_cached(&self) -> Option<CachedAuth> {
+        self.auth.clone()
+    }
+}
+
+pub mod project_doc {
+    use crate::config::Config;
+    use std::path::PathBuf;
+
+    pub fn discover_project_doc_paths(_config: &Config) -> Result<Vec<PathBuf>, std::io::Error> {
+        Ok(Vec::new())
+    }
+}
+
+pub mod bash {
+    pub fn extract_bash_command(command: &[String]) -> Option<(&str, &str)> {
+        crate::parse_command::extract_shell_command(command)
+    }
+}
+
+pub mod web_search {
+    pub fn web_search_detail(
+        action: Option<&crate::models::WebSearchAction>,
+        query: &str,
+    ) -> String {
+        let prefix = match action {
+            Some(crate::models::WebSearchAction::Cached) => "cached",
+            Some(crate::models::WebSearchAction::Requested) => "searching",
+            None => "search",
+        };
+        if query.trim().is_empty() {
+            prefix.to_string()
+        } else {
+            format!("{prefix}: {query}")
+        }
     }
 }
 
@@ -342,6 +577,76 @@ pub mod protocol {
     pub struct RateLimitSnapshot {
         pub limit_id: Option<String>,
         pub limit_name: Option<String>,
+        #[serde(default)]
+        pub primary: Option<RateLimitWindow>,
+        #[serde(default)]
+        pub secondary: Option<RateLimitWindow>,
+        #[serde(default)]
+        pub credits: Option<CreditsSnapshot>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RateLimitWindow {
+        #[serde(default)]
+        pub used_percent: f64,
+        #[serde(default)]
+        pub resets_at: Option<i64>,
+        #[serde(default)]
+        pub window_minutes: Option<i64>,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct CreditsSnapshot {
+        #[serde(default)]
+        pub has_credits: bool,
+        #[serde(default)]
+        pub unlimited: bool,
+        #[serde(default)]
+        pub balance: Option<String>,
+    }
+
+    #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+    pub struct TokenUsage {
+        #[serde(default)]
+        pub input_tokens: i64,
+        #[serde(default)]
+        pub cached_input_tokens: i64,
+        #[serde(default)]
+        pub output_tokens: i64,
+        #[serde(default)]
+        pub reasoning_output_tokens: i64,
+        #[serde(default)]
+        pub total_tokens: i64,
+    }
+
+    impl TokenUsage {
+        pub fn tokens_in_context_window(&self) -> i64 {
+            self.input_tokens + self.cached_input_tokens + self.output_tokens
+        }
+
+        pub fn blended_total(&self) -> i64 {
+            self.total_tokens
+        }
+
+        pub fn non_cached_input(&self) -> i64 {
+            self.input_tokens
+        }
+
+        pub fn percent_of_context_window_remaining(&self, window: i64) -> i64 {
+            if window <= 0 {
+                return 0;
+            }
+            let used = self.tokens_in_context_window().max(0);
+            ((window - used).max(0) * 100) / window
+        }
+    }
+
+    #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+    pub struct TokenUsageInfo {
+        #[serde(default)]
+        pub last_token_usage: TokenUsage,
+        #[serde(default)]
+        pub model_context_window: Option<i64>,
     }
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -366,10 +671,26 @@ pub mod protocol {
         Unknown,
         Authorized,
         Unauthorized,
+        Unsupported,
+    }
+
+    impl std::fmt::Display for McpAuthStatus {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                McpAuthStatus::Unknown => f.write_str("unknown"),
+                McpAuthStatus::Authorized => f.write_str("authorized"),
+                McpAuthStatus::Unauthorized => f.write_str("unauthorized"),
+                McpAuthStatus::Unsupported => f.write_str("unsupported"),
+            }
+        }
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct McpInvocation {
+        pub server: String,
+        pub tool: String,
+        #[serde(default)]
+        pub arguments: Option<serde_json::Value>,
         pub server_name: String,
         pub tool_name: String,
     }
@@ -377,12 +698,9 @@ pub mod protocol {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct SessionConfiguredEvent {
         pub session_id: String,
+        pub model: String,
         #[serde(default)]
-        pub model: Option<String>,
-        #[serde(default)]
-        pub model_reasoning_effort: Option<String>,
-        #[serde(default)]
-        pub model_reasoning_summary: Option<String>,
+        pub reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
     }
 
     /// MCP request identifier.
@@ -695,6 +1013,116 @@ pub use codex_file_search_stub::FileSearchSnapshot;
 pub use codex_file_search_stub::SessionReporter;
 pub use codex_file_search_stub::create_session;
 
+pub fn ansi_escape_line(input: &str) -> ratatui::text::Line<'static> {
+    ratatui::text::Line::from(input.to_string())
+}
+
+pub fn format_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs();
+    if secs < 60 {
+        return format!("{secs}s");
+    }
+    let mins = secs / 60;
+    let rem = secs % 60;
+    if rem == 0 {
+        format!("{mins}m")
+    } else {
+        format!("{mins}m {rem}s")
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeMetricCounter {
+    pub count: u64,
+    pub duration_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, Default, serde::Serialize, serde::Deserialize)]
+pub struct RuntimeMetricsSummary {
+    pub tool_calls: RuntimeMetricCounter,
+    pub api_calls: RuntimeMetricCounter,
+    pub websocket_calls: RuntimeMetricCounter,
+    pub streaming_events: RuntimeMetricCounter,
+    pub websocket_events: RuntimeMetricCounter,
+    pub responses_api_overhead_ms: u64,
+    pub responses_api_inference_time_ms: u64,
+    pub responses_api_engine_iapi_ttft_ms: u64,
+    pub responses_api_engine_service_ttft_ms: u64,
+    pub responses_api_engine_iapi_tbt_ms: u64,
+    pub responses_api_engine_service_tbt_ms: u64,
+}
+
+pub mod model {
+    use serde::Deserialize;
+    use serde::Serialize;
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct Content {
+        #[serde(default)]
+        pub raw: RawContent,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum RawContent {
+        Text(TextContent),
+        Image(ImageContent),
+        Audio(AudioContent),
+        Resource(ResourceContent),
+        ResourceLink(ResourceLink),
+    }
+
+    impl Default for RawContent {
+        fn default() -> Self {
+            Self::Text(TextContent::default())
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct TextContent {
+        #[serde(default)]
+        pub text: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct ImageContent {
+        #[serde(default)]
+        pub data: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct AudioContent {
+        #[serde(default)]
+        pub data: String,
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct ResourceContent {
+        pub resource: ResourceContents,
+    }
+
+    impl Default for ResourceContent {
+        fn default() -> Self {
+            Self {
+                resource: ResourceContents::TextResourceContents { uri: String::new() },
+            }
+        }
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "snake_case")]
+    pub enum ResourceContents {
+        TextResourceContents { uri: String },
+        BlobResourceContents { uri: String },
+    }
+
+    #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+    pub struct ResourceLink {
+        #[serde(default)]
+        pub uri: String,
+    }
+}
+
 /// Stub backing `codex_protocol`.
 mod codex_protocol_stub {
     use serde::Deserialize;
@@ -740,6 +1168,19 @@ mod codex_protocol_stub {
             Medium,
             High,
             XHigh,
+        }
+
+        impl std::fmt::Display for ReasoningEffort {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    ReasoningEffort::None => f.write_str("none"),
+                    ReasoningEffort::Minimal => f.write_str("minimal"),
+                    ReasoningEffort::Low => f.write_str("low"),
+                    ReasoningEffort::Medium => f.write_str("medium"),
+                    ReasoningEffort::High => f.write_str("high"),
+                    ReasoningEffort::XHigh => f.write_str("xhigh"),
+                }
+            }
         }
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -813,14 +1254,16 @@ mod codex_protocol_stub {
     pub mod mcp {
         use serde::Deserialize;
         use serde::Serialize;
+        use serde_json::Value;
 
         pub use crate::protocol::RequestId;
 
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct Resource {
             pub uri: String,
+            pub name: String,
             #[serde(default)]
-            pub name: Option<String>,
+            pub title: Option<String>,
             #[serde(default)]
             pub description: Option<String>,
         }
@@ -828,10 +1271,62 @@ mod codex_protocol_stub {
         #[derive(Debug, Clone, Serialize, Deserialize)]
         pub struct ResourceTemplate {
             pub uri_template: String,
+            pub name: String,
             #[serde(default)]
-            pub name: Option<String>,
+            pub title: Option<String>,
             #[serde(default)]
             pub description: Option<String>,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+        pub struct Tool {
+            #[serde(default)]
+            pub name: String,
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+        pub struct CallToolResult {
+            #[serde(default)]
+            pub content: Vec<Value>,
+            #[serde(default)]
+            pub is_error: Option<bool>,
+        }
+    }
+
+    pub mod plan_tool {
+        use serde::Deserialize;
+        use serde::Serialize;
+
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct PlanItemArg {
+            pub step: String,
+            pub status: StepStatus,
+        }
+
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum StepStatus {
+            Pending,
+            InProgress,
+            Completed,
+        }
+
+        impl std::fmt::Display for StepStatus {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                match self {
+                    StepStatus::Pending => f.write_str("pending"),
+                    StepStatus::InProgress => f.write_str("in_progress"),
+                    StepStatus::Completed => f.write_str("completed"),
+                }
+            }
+        }
+
+        #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+        pub struct UpdatePlanArgs {
+            #[serde(default)]
+            pub explanation: Option<String>,
+            #[serde(default)]
+            pub plan: Vec<PlanItemArg>,
         }
     }
 
@@ -1037,10 +1532,38 @@ mod codex_utils_cli_stub {
     pub struct CliConfigOverrides {
         pub model_provider: Option<String>,
     }
+
+    pub mod format_env_display {
+        use std::collections::HashMap;
+
+        pub fn format_env_display(
+            env: Option<&HashMap<String, String>>,
+            env_vars: &Option<HashMap<String, String>>,
+        ) -> String {
+            let mut entries: Vec<String> = Vec::new();
+            if let Some(env) = env {
+                for (k, _v) in env {
+                    entries.push(format!("{k}=*****"));
+                }
+            }
+            if let Some(env_vars) = env_vars {
+                for (k, v) in env_vars {
+                    entries.push(format!("{k}={v}"));
+                }
+            }
+            entries.sort();
+            if entries.is_empty() {
+                "-".to_string()
+            } else {
+                entries.join(", ")
+            }
+        }
+    }
 }
 pub use codex_utils_cli_stub::ApprovalModeCliArg;
 pub use codex_utils_cli_stub::CliConfigOverrides;
 pub use codex_utils_cli_stub::SandboxModeCliArg;
+pub use codex_utils_cli_stub::format_env_display;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
@@ -1123,14 +1646,12 @@ mod core_compat;
 mod custom_terminal;
 mod cwd_prompt;
 mod diff_render;
-#[path = "exec_cell_stub.rs"]
 mod exec_cell;
 mod exec_command;
 mod external_editor;
 mod file_search;
 mod frames;
 mod get_git_diff;
-#[path = "history_cell_stub.rs"]
 mod history_cell;
 mod insert_history;
 mod key_hint;
@@ -1145,14 +1666,11 @@ mod render;
 mod selection_list;
 mod session_log;
 mod shimmer;
-#[path = "skills_helpers_stub.rs"]
 mod skills_helpers;
 mod slash_command;
 #[path = "bottom_pane/slash_commands.rs"]
 mod slash_commands;
-#[path = "status_stub.rs"]
 mod status;
-#[path = "status_indicator_widget_stub.rs"]
 mod status_indicator_widget;
 mod style;
 mod terminal_palette;

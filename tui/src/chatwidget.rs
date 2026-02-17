@@ -850,6 +850,33 @@ impl ChatWidget {
     }
 }
 
+pub(crate) fn get_limits_duration(minutes: i64) -> String {
+    if minutes <= 0 {
+        return "unknown".to_string();
+    }
+    if minutes % (60 * 24 * 7) == 0 {
+        let weeks = minutes / (60 * 24 * 7);
+        return if weeks == 1 {
+            "weekly".to_string()
+        } else {
+            format!("{weeks}w")
+        };
+    }
+    if minutes % (60 * 24) == 0 {
+        let days = minutes / (60 * 24);
+        return if days == 1 {
+            "daily".to_string()
+        } else {
+            format!("{days}d")
+        };
+    }
+    if minutes % 60 == 0 {
+        let hours = minutes / 60;
+        return format!("{hours}h");
+    }
+    format!("{minutes}m")
+}
+
 #[cfg(test)]
 mod tests {
     use super::LiveAttachTui;
