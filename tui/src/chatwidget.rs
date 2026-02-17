@@ -8,9 +8,13 @@ use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
 use crate::core_compat::map_rpc_stream_events;
+use crate::history_cell::AgentMessageCell;
 use crate::history_cell::HistoryCell;
+use crate::history_cell::PlainHistoryCell;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell::new_user_prompt;
 use crate::key_hint;
+use crate::markdown::append_markdown;
 use crate::mention_codec;
 use crate::render::renderable::Renderable;
 use crate::slash_command::SlashCommand;
@@ -30,6 +34,7 @@ pub(crate) struct InFlightPrompt {
 pub(crate) struct LiveAttachTui {
     pub(crate) session_id: String,
     transcript: String,
+    history_cells: Vec<Box<dyn HistoryCell>>,
     pub(crate) input: String,
     input_cursor: usize,
     command_history: Vec<String>,
@@ -64,6 +69,7 @@ impl LiveAttachTui {
         Self {
             session_id,
             transcript: String::new(),
+            history_cells: Vec::new(),
             input: String::new(),
             input_cursor: 0,
             command_history: Vec::new(),
@@ -160,6 +166,7 @@ impl LiveAttachTui {
                 self.append_assistant_delta(delta);
             }
             UiEvent::TurnCompleted { status } => {
+                self.flush_assistant_message();
                 self.active_turn_id = None;
                 if let Some(status) = status
                     && status != "completed"
@@ -170,9 +177,6 @@ impl LiveAttachTui {
                     ));
                 } else {
                     self.status_message = None;
-                }
-                if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
-                    self.transcript.push('\n');
                 }
             }
             UiEvent::TranscriptLine(line) => {
@@ -197,24 +201,21 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn push_line(&mut self, line: &str) {
-        if !self.transcript.is_empty() && !self.transcript.ends_with('\n') {
-            self.transcript.push('\n');
-        }
-        self.transcript.push_str(line);
-        self.transcript.push('\n');
+        self.flush_assistant_message();
+        self.history_cells.push(Box::new(PlainHistoryCell::new(vec![
+            line.to_string().into(),
+        ])));
     }
 
     pub(crate) fn push_user_prompt(&mut self, prompt: &str) {
         let decoded = mention_codec::decode_history_mentions(prompt);
         let display_prompt = decoded.text;
-        if !self.transcript.is_empty() && !self.transcript.ends_with("\n\n") {
-            if !self.transcript.ends_with('\n') {
-                self.transcript.push('\n');
-            }
-            self.transcript.push('\n');
-        }
-        self.transcript
-            .push_str(&format!("\u{203a} {display_prompt}\n\n"));
+        self.history_cells.push(Box::new(new_user_prompt(
+            display_prompt,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )));
     }
 
     pub(crate) fn append_assistant_delta(&mut self, delta: &str) {
@@ -223,6 +224,21 @@ impl LiveAttachTui {
         }
 
         self.transcript.push_str(delta);
+    }
+
+    fn flush_assistant_message(&mut self) {
+        if self.transcript.trim().is_empty() {
+            self.transcript.clear();
+            return;
+        }
+        let mut lines = Vec::new();
+        append_markdown(&self.transcript, None, &mut lines);
+        if lines.is_empty() {
+            lines.push(self.transcript.clone().into());
+        }
+        self.history_cells
+            .push(Box::new(AgentMessageCell::new(lines, true)));
+        self.transcript.clear();
     }
 
     pub(crate) fn input_insert_str(&mut self, text: &str) {
@@ -645,6 +661,10 @@ impl LiveAttachTui {
         self.bottom_pane.handle_key_event(key)
     }
 
+    pub(crate) fn handle_bottom_pane_paste(&mut self, text: String) {
+        self.bottom_pane.handle_paste(text);
+    }
+
     pub(crate) fn bottom_pane_composer_text(&self) -> String {
         self.bottom_pane.composer_text()
     }
@@ -667,45 +687,50 @@ impl LiveAttachTui {
             CODEX_CLI_VERSION,
         );
         let mut lines = HistoryCell::display_lines(&header, width);
-        lines.push(Line::from(""));
-        lines.push(
-            "  To get started, describe a task or try one of these commands:"
-                .dim()
-                .into(),
-        );
-        lines.push(Line::from(""));
-        lines.push(Line::from(vec![
-            "  ".into(),
-            "/init".into(),
-            " - create an AGENTS.md file with instructions for Codex".dim(),
-        ]));
-        lines.push(Line::from(vec![
-            "  ".into(),
-            "/status".into(),
-            " - show current session configuration".dim(),
-        ]));
-        lines.push(Line::from(vec![
-            "  ".into(),
-            "/permissions".into(),
-            " - choose what Codex is allowed to do".dim(),
-        ]));
-        lines.push(Line::from(vec![
-            "  ".into(),
-            "/model".into(),
-            " - choose what model and reasoning effort to use".dim(),
-        ]));
-        lines.push(Line::from(vec![
-            "  ".into(),
-            "/review".into(),
-            " - review any changes and find issues".dim(),
-        ]));
+        let has_content = !self.history_cells.is_empty() || !self.transcript.trim().is_empty();
+        if !has_content {
+            lines.push(Line::from(""));
+            lines.push(
+                "  To get started, describe a task or try one of these commands:"
+                    .dim()
+                    .into(),
+            );
+            lines.push(Line::from(""));
+            lines.push(Line::from(vec![
+                "  ".into(),
+                "/init".into(),
+                " - create an AGENTS.md file with instructions for Codex".dim(),
+            ]));
+            lines.push(Line::from(vec![
+                "  ".into(),
+                "/status".into(),
+                " - show current session configuration".dim(),
+            ]));
+            lines.push(Line::from(vec![
+                "  ".into(),
+                "/permissions".into(),
+                " - choose what Codex is allowed to do".dim(),
+            ]));
+            lines.push(Line::from(vec![
+                "  ".into(),
+                "/model".into(),
+                " - choose what model and reasoning effort to use".dim(),
+            ]));
+            lines.push(Line::from(vec![
+                "  ".into(),
+                "/review".into(),
+                " - review any changes and find issues".dim(),
+            ]));
+        }
+        for cell in &self.history_cells {
+            lines.push(Line::from(""));
+            lines.extend(cell.display_lines(width));
+        }
         if !self.transcript.trim().is_empty() {
             lines.push(Line::from(""));
-            lines.extend(
-                self.transcript
-                    .lines()
-                    .map(|line| Line::from(line.to_string())),
-            );
+            let mut live_lines = Vec::new();
+            append_markdown(&self.transcript, None, &mut live_lines);
+            lines.extend(AgentMessageCell::new(live_lines, true).display_lines(width));
         }
         if lines.is_empty() {
             lines.push(Line::from(""));

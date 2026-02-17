@@ -258,7 +258,7 @@ impl App {
         match event {
             AppEvent::Key(key_event) => self.handle_key_event(key_event),
             AppEvent::Paste(pasted) => {
-                self.widget.ui_mut().input_insert_str(&pasted);
+                self.widget.ui_mut().handle_bottom_pane_paste(pasted);
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::Resize => Ok(LiveTuiAction::Continue),
