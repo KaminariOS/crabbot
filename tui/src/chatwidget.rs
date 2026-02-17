@@ -3,6 +3,8 @@ use crate::core_compat::UiApprovalRequest;
 use crate::core_compat::UiEvent;
 use crate::core_compat::map_legacy_stream_events;
 use crate::core_compat::map_rpc_stream_events;
+use crate::history_cell::HistoryCell;
+use crate::history_cell::SessionHeaderHistoryCell;
 use crate::key_hint;
 use crate::mention_codec;
 use crate::slash_command::SlashCommand;
@@ -587,12 +589,12 @@ impl LiveAttachTui {
                 ])
                 .split(frame.area());
 
-            let history = self.history_view_text();
-            let history_lines = history.lines().count().max(1) as u16;
+            let history_lines_vec = self.history_view_lines(chunks[0].width);
+            let history_lines = history_lines_vec.len().max(1) as u16;
             let scroll = history_lines.saturating_sub(chunks[0].height);
             frame.render_widget(
-                Paragraph::new(history)
-                    .style(Style::default().bold())
+                Paragraph::new(history_lines_vec)
+                    .style(Style::default())
                     .wrap(Wrap { trim: false })
                     .scroll((scroll, 0)),
                 chunks[0],
@@ -645,16 +647,58 @@ impl LiveAttachTui {
         Ok(())
     }
 
-    fn history_view_text(&self) -> String {
-        let cwd = display_cwd_for_welcome();
-        let mut text = format!(
-            "  codex\n\n  >_ OpenAI Codex ({CODEX_CLI_VERSION})\n\n  model:     gpt-5.3-codex medium    /model to change\n\n  directory: {cwd}\n\n  Tip: New 2x rate limits until April 2nd.\n"
-        );
-        if !self.transcript.trim().is_empty() {
-            text.push('\n');
-            text.push_str(&self.transcript);
+    fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let mut lines = if self.transcript.trim().is_empty() {
+            let header = SessionHeaderHistoryCell::new(
+                "gpt-5.3-codex".to_string(),
+                None,
+                env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
+                CODEX_CLI_VERSION,
+            );
+            let mut header_lines = HistoryCell::display_lines(&header, width);
+            header_lines.push(Line::from(""));
+            header_lines.push(
+                "  To get started, describe a task or try one of these commands:"
+                    .dim()
+                    .into(),
+            );
+            header_lines.push(Line::from(""));
+            header_lines.push(Line::from(vec![
+                "  ".into(),
+                "/init".into(),
+                " - create an AGENTS.md file with instructions for Codex".dim(),
+            ]));
+            header_lines.push(Line::from(vec![
+                "  ".into(),
+                "/status".into(),
+                " - show current session configuration".dim(),
+            ]));
+            header_lines.push(Line::from(vec![
+                "  ".into(),
+                "/permissions".into(),
+                " - choose what Codex is allowed to do".dim(),
+            ]));
+            header_lines.push(Line::from(vec![
+                "  ".into(),
+                "/model".into(),
+                " - choose what model and reasoning effort to use".dim(),
+            ]));
+            header_lines.push(Line::from(vec![
+                "  ".into(),
+                "/review".into(),
+                " - review any changes and find issues".dim(),
+            ]));
+            header_lines
+        } else {
+            self.transcript
+                .lines()
+                .map(|line| Line::from(line.to_string()))
+                .collect()
+        };
+        if lines.is_empty() {
+            lines.push(Line::from(""));
         }
-        text
+        lines
     }
 
     pub(crate) fn input_line(
