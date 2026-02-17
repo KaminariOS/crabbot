@@ -1090,4 +1090,26 @@ mod tests {
         assert!(text.contains("hello"));
         assert!(!text.contains("OpenAI Codex"));
     }
+
+    #[test]
+    fn input_word_navigation_and_deletion() {
+        let mut ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
+        ui.replace_input("alpha beta gamma".to_string());
+        ui.move_input_cursor_word_left();
+        ui.move_input_cursor_word_left();
+        assert_eq!(&ui.input[ui.input_cursor..], "beta gamma");
+        ui.delete_input_word_forward();
+        assert_eq!(ui.input, "alpha  gamma");
+    }
+
+    #[test]
+    fn kill_and_yank_line_segments() {
+        let mut ui = LiveAttachTui::new("sess".to_string(), "active".to_string());
+        ui.replace_input("hello world".to_string());
+        ui.move_input_cursor_word_right();
+        ui.kill_to_end_of_line();
+        assert_eq!(ui.input, "hello");
+        ui.yank_kill_buffer();
+        assert_eq!(ui.input, "hello world");
+    }
 }

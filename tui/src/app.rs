@@ -352,6 +352,18 @@ impl App {
         let mut queued_submit: Option<String> = None;
         let ui = self.widget.ui_mut();
         match key.code {
+            KeyCode::Char('\u{0002}') if key.modifiers == KeyModifiers::NONE => {
+                ui.move_input_cursor_left();
+            }
+            KeyCode::Char('\u{0006}') if key.modifiers == KeyModifiers::NONE => {
+                ui.move_input_cursor_right();
+            }
+            KeyCode::Char('\u{0010}') if key.modifiers == KeyModifiers::NONE => {
+                ui.move_input_cursor_up();
+            }
+            KeyCode::Char('\u{000e}') if key.modifiers == KeyModifiers::NONE => {
+                ui.move_input_cursor_down();
+            }
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
                 return Ok(LiveTuiAction::Continue);
