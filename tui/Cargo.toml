@@ -23,7 +23,7 @@ ratatui = { version = "0.29", features = [
     "unstable-rendered-line-info",
     "unstable-widget-ref",
 ] }
-ratatui-macros = "0.7"
+ratatui-macros = "0.6.0"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
