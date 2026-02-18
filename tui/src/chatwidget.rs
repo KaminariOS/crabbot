@@ -31,7 +31,6 @@ use crate::history_cell::new_web_search_call;
 use crate::key_hint;
 use crate::mention_codec;
 use crate::render::Insets;
-use crate::render::line_utils::is_blank_line_spaces_only;
 use crate::render::renderable::FlexRenderable;
 use crate::render::renderable::Renderable;
 use crate::render::renderable::RenderableExt;
@@ -187,48 +186,6 @@ enum QueuedUiInterrupt {
         duration: Duration,
         result: Result<codex_protocol::mcp::CallToolResult, String>,
     },
-}
-
-struct TranscriptRenderable<'a> {
-    ui: &'a LiveAttachTui,
-}
-
-impl Renderable for TranscriptRenderable<'_> {
-    fn render(&self, area: Rect, buf: &mut Buffer) {
-        let history_lines_vec = self
-            .ui
-            .history_view_lines(area.width)
-            .into_iter()
-            .map(|line| pad_line_to_width(line, area.width))
-            .collect::<Vec<_>>();
-        let history_lines = history_lines_vec.len().max(1) as u16;
-        let max_scroll = history_lines.saturating_sub(area.height);
-        let scroll = max_scroll.saturating_sub(self.ui.history_scroll_offset.min(max_scroll));
-        Paragraph::new(history_lines_vec)
-            .style(Style::default())
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .render(area, buf);
-    }
-
-    fn desired_height(&self, width: u16) -> u16 {
-        self.ui.history_view_lines(width).len().max(1) as u16
-    }
-}
-
-/// Mirror upstream `insert_history_lines` behavior for in-viewport transcript rendering:
-/// line-level style should visually fill the whole terminal row.
-fn pad_line_to_width(mut line: Line<'static>, width: u16) -> Line<'static> {
-    if is_blank_line_spaces_only(&line) {
-        return line;
-    }
-    let target = usize::from(width);
-    let line_width = line.width();
-    if target > line_width {
-        let pad = " ".repeat(target - line_width);
-        line.spans.push(Span::styled(pad, line.style));
-    }
-    line
 }
 
 pub(crate) struct LiveAttachTui {
@@ -430,7 +387,7 @@ impl LiveAttachTui {
         match event {
             UiEvent::SessionConfigured {
                 session_id,
-                model,
+                model: _model,
                 reasoning_effort: _,
                 history_log_id,
                 history_entry_count,
@@ -440,7 +397,6 @@ impl LiveAttachTui {
                 }
                 self.bottom_pane
                     .set_history_metadata(history_log_id, history_entry_count);
-                self.status_message = Some(format!("session configured ({model})"));
             }
             UiEvent::SessionState(state) => {
                 if self.previous_state.as_deref() != Some(state.as_str()) {
@@ -2993,6 +2949,7 @@ impl LiveAttachTui {
         self.pending_approvals.clear();
         self.pending_prompt = None;
         self.history_scroll_offset = 0;
+        self.status_message = None;
         self.previous_state = None;
         self.latest_state = "active".to_string();
         self.received_events = 0;
@@ -3012,6 +2969,8 @@ impl LiveAttachTui {
         self.status_line_branch_cwd = None;
         self.status_line_branch_pending = false;
         self.status_line_branch_lookup_complete = false;
+        self.bottom_pane.hide_status_indicator();
+        self.bottom_pane.set_interrupt_hint_visible(false);
         self.bottom_pane.set_context_window(None, None);
         self.clear_input();
         self.refresh_status_line();
@@ -3229,10 +3188,12 @@ impl LiveAttachTui {
     }
 
     fn as_renderable(&self) -> RenderableItem<'_> {
-        let transcript = RenderableItem::Owned(Box::new(TranscriptRenderable { ui: self }))
-            .inset(Insets::tlbr(1, 0, 0, 0));
+        let active_cell_renderable = match &self.active_cell {
+            Some(cell) => RenderableItem::Borrowed(cell).inset(Insets::tlbr(1, 0, 0, 0)),
+            None => RenderableItem::Owned(Box::new(())),
+        };
         let mut flex = FlexRenderable::new();
-        flex.push(1, transcript);
+        flex.push(1, active_cell_renderable);
         flex.push(
             0,
             RenderableItem::Borrowed(&self.bottom_pane).inset(Insets::tlbr(1, 0, 0, 0)),

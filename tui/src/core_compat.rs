@@ -2248,67 +2248,12 @@ fn parse_thread_resume_result(result: &Value) -> ThreadResumeResult {
                 "event": { "msg": message }
             })));
         }
-    } else if let Some(thread) = result.get("thread") {
-        replay_events.extend(parse_thread_turn_items_to_ui_events(thread));
     }
 
     ThreadResumeResult {
         thread_id,
         replay_events,
     }
-}
-
-fn parse_thread_turn_items_to_ui_events(thread: &Value) -> Vec<UiEvent> {
-    let mut events = Vec::new();
-    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
-        return events;
-    };
-    for turn in turns {
-        let Some(items) = turn.get("items").and_then(Value::as_array) else {
-            continue;
-        };
-        for item in items {
-            if let Some((text, text_elements)) = parse_user_message_item(item) {
-                events.push(UiEvent::UserMessage {
-                    text,
-                    text_elements,
-                });
-                continue;
-            }
-            if let Some(message) = parse_agent_message_text(item) {
-                events.push(UiEvent::AgentMessage { message });
-            }
-        }
-    }
-    events
-}
-
-fn parse_agent_message_text(item: &Value) -> Option<String> {
-    let item_type = item.get("type").and_then(Value::as_str)?;
-    if item_type != "agent_message" && item_type != "agentMessage" {
-        return None;
-    }
-
-    let text = item
-        .get("text")
-        .or_else(|| item.get("message"))
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|entry| entry.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-        })?;
-    if text.is_empty() {
-        return None;
-    }
-    Some(text)
 }
 
 // ---------------------------------------------------------------------------

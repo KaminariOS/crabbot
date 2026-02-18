@@ -105,24 +105,25 @@ impl App {
         let mut widget = ChatWidget::new(thread_id.clone());
         let mut status_runtime = StatusRuntime::default();
         widget.ui_mut().set_status_message(Some(status_message));
-        match stream_events(&state, widget.ui_mut().last_sequence) {
-            Ok(events) => {
-                if !events.is_empty() {
-                    status_runtime.apply_stream_events(&events);
-                    widget
-                        .ui_mut()
-                        .apply_rpc_stream_events_with_replay(&events, true);
-                }
-            }
-            Err(err) => {
-                widget.ui_mut().set_status_message(Some(format!(
-                    "connected; initial stream sync failed: {}",
-                    err
-                )));
-            }
-        }
         if !resume_replay_events.is_empty() {
             widget.ui_mut().apply_replay_ui_events(resume_replay_events);
+        } else {
+            match stream_events(&state, widget.ui_mut().last_sequence) {
+                Ok(events) => {
+                    if !events.is_empty() {
+                        status_runtime.apply_stream_events(&events);
+                        widget
+                            .ui_mut()
+                            .apply_rpc_stream_events_with_replay(&events, true);
+                    }
+                }
+                Err(err) => {
+                    widget.ui_mut().set_status_message(Some(format!(
+                        "connected; initial stream sync failed: {}",
+                        err
+                    )));
+                }
+            }
         }
         if !widget.ui_mut().has_history_cells() {
             let model = status_runtime
@@ -321,43 +322,28 @@ impl App {
             })?;
             let mut should_redraw = false;
 
-            // Poll terminal for input events and drain all ready events so
-            // repeated input is processed with the same responsiveness as upstream.
+            // Poll terminal for input events.
             if event::poll(TUI_EVENT_WAIT_STEP).context("poll tui input event")? {
-                loop {
-                    let app_event = match event::read().context("read tui input event")? {
-                        Event::Key(key_event) => {
-                            // Match upstream key handling: ignore only key releases so
-                            // repeated keypresses (e.g., holding `d`) continue to flow.
-                            if key_event.kind == KeyEventKind::Release {
-                                if !event::poll(Duration::ZERO).context("poll tui input event")? {
-                                    break;
-                                }
-                                continue;
-                            }
-                            AppEvent::Key(key_event)
-                        }
-                        Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
-                        Event::Paste(pasted) => AppEvent::Paste(pasted),
-                        Event::Resize(_, _) => AppEvent::Resize,
-                        _ => {
-                            if !event::poll(Duration::ZERO).context("poll tui input event")? {
-                                break;
-                            }
+                let app_event = match event::read().context("read tui input event")? {
+                    Event::Key(key_event) => {
+                        // Match upstream key handling: ignore only key releases so
+                        // repeated keypresses (e.g., holding `d`) continue to flow.
+                        if key_event.kind == KeyEventKind::Release {
                             continue;
                         }
-                    };
-
-                    match self.handle_event(tui, app_event).await? {
-                        LiveTuiAction::Continue => {}
-                        LiveTuiAction::Detach => return Ok(()),
+                        AppEvent::Key(key_event)
                     }
-                    should_redraw = true;
+                    Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
+                    Event::Paste(pasted) => AppEvent::Paste(pasted),
+                    Event::Resize(_, _) => AppEvent::Resize,
+                    _ => continue,
+                };
 
-                    if !event::poll(Duration::ZERO).context("poll tui input event")? {
-                        break;
-                    }
+                match self.handle_event(tui, app_event).await? {
+                    LiveTuiAction::Continue => {}
+                    LiveTuiAction::Detach => return Ok(()),
                 }
+                should_redraw = true;
             }
 
             let drained = self.drain_pending_app_events(tui).await?;
@@ -423,16 +409,15 @@ impl App {
                 .reset_for_thread_switch(thread_id.clone());
             self.status_runtime = StatusRuntime::default();
             self.pending_thread_switch_clear = true;
-            if let Ok(events) = stream_events(&self.state, 0)
+            if !replay_events.is_empty() {
+                self.widget.ui_mut().apply_replay_ui_events(replay_events);
+            } else if let Ok(events) = stream_events(&self.state, 0)
                 && !events.is_empty()
             {
                 self.status_runtime.apply_stream_events(&events);
                 self.widget
                     .ui_mut()
                     .apply_rpc_stream_events_with_replay(&events, true);
-            }
-            if !replay_events.is_empty() {
-                self.widget.ui_mut().apply_replay_ui_events(replay_events);
             }
             if !self.widget.ui_mut().has_history_cells() {
                 let model = self
@@ -479,10 +464,7 @@ impl App {
     ) -> Result<LiveTuiAction> {
         match event {
             AppEvent::Key(key_event) => self.handle_key_event(tui, key_event).await,
-            AppEvent::Mouse(mouse_event) => {
-                self.widget.ui_mut().handle_mouse_event(mouse_event);
-                Ok(LiveTuiAction::Continue)
-            }
+            AppEvent::Mouse(_mouse_event) => Ok(LiveTuiAction::Continue),
             AppEvent::Paste(pasted) => {
                 // Mirror upstream textarea behavior: normalize CR to LF for pasted text.
                 let pasted = pasted.replace('\r', "\n");
@@ -606,14 +588,6 @@ impl App {
             Vec<codex_protocol::user_input::TextElement>,
         )> = None;
         let mut queued_external_editor_launch = false;
-        if key.code == KeyCode::PageUp {
-            self.widget.ui_mut().scroll_history_page_up();
-            return Ok(LiveTuiAction::Continue);
-        }
-        if key.code == KeyCode::PageDown {
-            self.widget.ui_mut().scroll_history_page_down();
-            return Ok(LiveTuiAction::Continue);
-        }
         let pending_widget_events = {
             let ui = self.widget.ui_mut();
             if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
