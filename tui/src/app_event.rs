@@ -50,6 +50,8 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
+    /// Fork from the selected thread in the picker.
+    ForkFromThread(ThreadId),
 
     /// Start a new session.
     NewSession,

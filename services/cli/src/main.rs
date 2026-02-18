@@ -265,6 +265,10 @@ struct TuiArgs {
     thread_id: Option<String>,
     #[arg(long, default_value_t = false)]
     no_alt_screen: bool,
+    #[arg(skip)]
+    startup_picker: Option<crabbot_tui::StartupPicker>,
+    #[arg(skip)]
+    startup_picker_show_all: bool,
 }
 
 #[derive(Debug, Args)]
@@ -389,12 +393,27 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
             crabbot_tui::TuiArgs {
                 thread_id: args.thread_id,
                 no_alt_screen: args.no_alt_screen,
+                startup_picker: args.startup_picker,
+                startup_picker_show_all: args.startup_picker_show_all,
             },
             &mut tui_state,
         )
     })?;
     *state = convert_state_from_tui(tui_state)?;
     Ok(convert_output_from_tui(output))
+}
+
+fn run_upstream_picker_with_tui(
+    state: &CliState,
+    mode: crabbot_tui::StartupPicker,
+    show_all: bool,
+) -> Result<Option<String>> {
+    let tui_state = convert_state_to_tui(state)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("initialize tokio runtime for startup picker")?;
+    runtime.block_on(async { crabbot_tui::run_startup_picker(mode, show_all, &tui_state).await })
 }
 
 fn handle_attach_tui_interactive_with_crate(
@@ -557,6 +576,8 @@ fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Resul
         TuiArgs {
             thread_id: Some(thread_id),
             no_alt_screen: args.no_alt_screen,
+            startup_picker: None,
+            startup_picker_show_all: false,
         },
         state,
     )
@@ -564,13 +585,28 @@ fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Resul
 
 fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
+    let selected_from_picker = if command.session_id.is_none() && !command.last {
+        run_upstream_picker_with_tui(state, crabbot_tui::StartupPicker::Resume, command.all)?
+    } else {
+        None
+    };
     let overrides = build_runtime_overrides(&command.interactive)?;
-    let target = resolve_source_thread_for_resume_or_fork(
-        state,
-        command.session_id,
-        command.last,
-        command.all,
-    )?;
+    let target = if command.session_id.is_none() && !command.last {
+        let Some(selected) = selected_from_picker else {
+            return handle_tui_with_crate(
+                TuiArgs {
+                    thread_id: None,
+                    no_alt_screen: command.interactive.no_alt_screen,
+                    startup_picker: None,
+                    startup_picker_show_all: false,
+                },
+                state,
+            );
+        };
+        selected
+    } else {
+        resolve_source_thread_for_resume_or_fork(state, command.session_id, true, command.all)?
+    };
     let thread_id =
         resolve_thread_resume(state, &target, &overrides, ThreadResolutionMode::Resume)?;
     maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
@@ -578,6 +614,8 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
         TuiArgs {
             thread_id: Some(thread_id),
             no_alt_screen: command.interactive.no_alt_screen,
+            startup_picker: None,
+            startup_picker_show_all: false,
         },
         state,
     )
@@ -585,19 +623,36 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
 
 fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
+    let selected_from_picker = if command.session_id.is_none() && !command.last {
+        run_upstream_picker_with_tui(state, crabbot_tui::StartupPicker::Fork, command.all)?
+    } else {
+        None
+    };
     let overrides = build_runtime_overrides(&command.interactive)?;
-    let target = resolve_source_thread_for_resume_or_fork(
-        state,
-        command.session_id,
-        command.last,
-        command.all,
-    )?;
+    let target = if command.session_id.is_none() && !command.last {
+        let Some(selected) = selected_from_picker else {
+            return handle_tui_with_crate(
+                TuiArgs {
+                    thread_id: None,
+                    no_alt_screen: command.interactive.no_alt_screen,
+                    startup_picker: None,
+                    startup_picker_show_all: false,
+                },
+                state,
+            );
+        };
+        selected
+    } else {
+        resolve_source_thread_for_resume_or_fork(state, command.session_id, true, command.all)?
+    };
     let thread_id = resolve_thread_fork(state, &target, &overrides)?;
     maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
     handle_tui_with_crate(
         TuiArgs {
             thread_id: Some(thread_id),
             no_alt_screen: command.interactive.no_alt_screen,
+            startup_picker: None,
+            startup_picker_show_all: false,
         },
         state,
     )
@@ -626,6 +681,8 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
             // cache (resume-or-start fallback), not as strict explicit input.
             thread_id: None,
             no_alt_screen: false,
+            startup_picker: None,
+            startup_picker_show_all: false,
         },
         state,
     )

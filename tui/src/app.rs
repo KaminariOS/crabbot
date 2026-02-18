@@ -24,6 +24,7 @@ use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::resume_picker::SessionSelection;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use crate::version::CODEX_CLI_VERSION;
@@ -68,6 +69,10 @@ pub(crate) struct App {
     commit_anim_running: Arc<AtomicBool>,
     /// Run without alternate screen mode when requested by CLI.
     no_alt_screen: bool,
+    /// Optional startup picker mode requested by CLI.
+    startup_picker: Option<StartupPicker>,
+    /// Whether startup picker should include all threads across cwd.
+    startup_picker_show_all: bool,
 }
 
 #[derive(Default)]
@@ -146,7 +151,7 @@ impl App {
             widget.ui_mut().set_connectors_snapshot(Some(connectors));
         }
 
-        Ok(Self {
+        let app = Self {
             widget,
             state,
             thread_id,
@@ -159,7 +164,11 @@ impl App {
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             no_alt_screen: args.no_alt_screen,
-        })
+            startup_picker: args.startup_picker,
+            startup_picker_show_all: args.startup_picker_show_all,
+        };
+
+        Ok(app)
     }
 
     /// Create an `App` that attaches to an existing app-server session.
@@ -218,6 +227,8 @@ impl App {
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
             no_alt_screen: false,
+            startup_picker: None,
+            startup_picker_show_all: false,
         })
     }
 
@@ -241,6 +252,17 @@ impl App {
             let _ = tui.enter_alt_screen();
             true
         };
+        if let Some(mode) = self.startup_picker.take() {
+            match mode {
+                StartupPicker::Resume => {
+                    self.open_thread_picker(&mut tui, false, self.startup_picker_show_all)?
+                }
+                StartupPicker::Fork => {
+                    self.open_thread_picker(&mut tui, true, self.startup_picker_show_all)?
+                }
+            }
+        }
+
         let loop_result = self.event_loop(&mut tui);
         if entered_alt_screen {
             let _ = tui.leave_alt_screen();
@@ -309,25 +331,25 @@ impl App {
                     _ => continue,
                 };
 
-                match self.handle_event(app_event)? {
+                match self.handle_event(tui, app_event)? {
                     LiveTuiAction::Continue => {}
                     LiveTuiAction::Detach => return Ok(()),
                 }
                 should_redraw = true;
             }
 
-            let drained = self.drain_pending_app_events()?;
+            let drained = self.drain_pending_app_events(tui)?;
             if drained.detach {
                 return Ok(());
             }
             should_redraw |= drained.redraw;
 
             // Tick: poll stream for app-server events.
-            match self.handle_event(AppEvent::Tick)? {
+            match self.handle_event(tui, AppEvent::Tick)? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => return Ok(()),
             }
-            let drained = self.drain_pending_app_events()?;
+            let drained = self.drain_pending_app_events(tui)?;
             if drained.detach {
                 return Ok(());
             }
@@ -343,10 +365,10 @@ impl App {
         }
     }
 
-    fn drain_pending_app_events(&mut self) -> Result<DrainResult> {
+    fn drain_pending_app_events(&mut self, tui: &mut crate::tui::Tui) -> Result<DrainResult> {
         let mut handled_any = false;
         while let Ok(app_event) = self.app_event_rx.try_recv() {
-            match self.handle_event(app_event)? {
+            match self.handle_event(tui, app_event)? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => {
                     return Ok(DrainResult {
@@ -417,9 +439,13 @@ impl App {
     /// This is the central dispatch point, mirroring upstream's enormous
     /// `handle_event`. Currently handles the essential events; additional
     /// upstream event types will be added incrementally.
-    fn handle_event(&mut self, event: AppEvent) -> Result<LiveTuiAction> {
+    fn handle_event(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        event: AppEvent,
+    ) -> Result<LiveTuiAction> {
         match event {
-            AppEvent::Key(key_event) => self.handle_key_event(key_event),
+            AppEvent::Key(key_event) => self.handle_key_event(tui, key_event),
             AppEvent::Mouse(mouse_event) => {
                 self.widget.ui_mut().handle_mouse_event(mouse_event);
                 Ok(LiveTuiAction::Continue)
@@ -451,7 +477,7 @@ impl App {
                 text,
                 text_elements,
                 mention_bindings,
-            } => self.handle_submit(&text, text_elements, mention_bindings),
+            } => self.handle_submit(tui, &text, text_elements, mention_bindings),
             AppEvent::StartTurn {
                 text,
                 text_elements,
@@ -509,7 +535,7 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ResumeSession => {
-                self.open_resume_picker()?;
+                self.open_resume_picker(tui)?;
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ApprovalDecision { arg, approve } => {
@@ -531,7 +557,11 @@ impl App {
     }
 
     /// Handle a key press event — mirrors upstream `App::handle_key_event`.
-    fn handle_key_event(&mut self, key: crossterm::event::KeyEvent) -> Result<LiveTuiAction> {
+    fn handle_key_event(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        key: crossterm::event::KeyEvent,
+    ) -> Result<LiveTuiAction> {
         let mut queued_submit: Option<(String, Vec<codex_protocol::user_input::TextElement>)> =
             None;
         let mut queued_command: Option<(
@@ -616,19 +646,19 @@ impl App {
             ui.drain_bottom_pane_events()
         };
         for event in pending_widget_events {
-            self.handle_widget_app_event(event)?;
+            self.handle_widget_app_event(tui, event)?;
         }
 
         while let Ok(event) = self.widget_event_rx.try_recv() {
-            self.handle_widget_app_event(event)?;
+            self.handle_widget_app_event(tui, event)?;
         }
 
         if queued_external_editor_launch {
-            self.handle_widget_app_event(WidgetAppEvent::LaunchExternalEditor)?;
+            self.handle_widget_app_event(tui, WidgetAppEvent::LaunchExternalEditor)?;
         }
 
         if let Some((cmd, args, text_elements)) = queued_command {
-            self.dispatch_slash_command(cmd, args, text_elements)?;
+            self.dispatch_slash_command(tui, cmd, args, text_elements)?;
         } else if let Some((input, text_elements)) = queued_submit {
             let mention_bindings = self
                 .widget
@@ -643,7 +673,11 @@ impl App {
         Ok(LiveTuiAction::Continue)
     }
 
-    fn handle_widget_app_event(&mut self, event: WidgetAppEvent) -> Result<()> {
+    fn handle_widget_app_event(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        event: WidgetAppEvent,
+    ) -> Result<()> {
         match event {
             WidgetAppEvent::CodexEvent(event) => {
                 self.widget.ui_mut().apply_codex_event(event);
@@ -697,7 +731,7 @@ impl App {
                     .apply_file_search_result(query, matches);
             }
             WidgetAppEvent::OpenResumePicker => {
-                self.open_resume_picker()?;
+                self.open_resume_picker(tui)?;
             }
             WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
                 self.open_permissions_picker()?;
@@ -747,6 +781,16 @@ impl App {
                     self.widget
                         .ui_mut()
                         .set_status_message(Some("resume returned no thread id".to_string()));
+                }
+            }
+            WidgetAppEvent::ForkFromThread(thread_id) => {
+                let selected_thread_id = thread_id.to_string();
+                if let Some(forked_thread_id) = fork_thread(&self.state, &selected_thread_id)? {
+                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("fork returned no thread id".to_string()));
                 }
             }
             WidgetAppEvent::UpdateModel(model) => {
@@ -869,6 +913,7 @@ impl App {
 
     fn dispatch_slash_command(
         &mut self,
+        tui: &mut crate::tui::Tui,
         cmd: SlashCommand,
         args: Option<String>,
         _text_elements: Vec<codex_protocol::user_input::TextElement>,
@@ -888,7 +933,7 @@ impl App {
         match cmd {
             SlashCommand::Model => self.open_model_picker()?,
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
-            SlashCommand::Resume => self.open_resume_picker()?,
+            SlashCommand::Resume => self.open_resume_picker(tui)?,
             SlashCommand::Status => self.emit_status_summary(),
             SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(),
             SlashCommand::DebugConfig => self
@@ -1242,6 +1287,7 @@ impl App {
     /// Handle submitted user input (from Enter key or programmatic submit).
     fn handle_submit(
         &mut self,
+        tui: &mut crate::tui::Tui,
         input: &str,
         text_elements: Vec<codex_protocol::user_input::TextElement>,
         mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
@@ -1280,7 +1326,7 @@ impl App {
                 return Ok(LiveTuiAction::Continue);
             }
             "/resume" => {
-                self.open_resume_picker()?;
+                self.open_resume_picker(tui)?;
                 return Ok(LiveTuiAction::Continue);
             }
             _ => {}
@@ -1307,7 +1353,7 @@ impl App {
             let args = parts.next().unwrap_or_default().trim().to_string();
             if let Some(cmd) = find_builtin_command(command, true, true, true, true) {
                 let args = if args.is_empty() { None } else { Some(args) };
-                self.dispatch_slash_command(cmd, args, text_elements)?;
+                self.dispatch_slash_command(tui, cmd, args, text_elements)?;
                 return Ok(LiveTuiAction::Continue);
             }
         }
@@ -1420,61 +1466,55 @@ impl App {
         self.widget.ui_mut().add_history_cell(Box::new(cell));
     }
 
-    fn open_resume_picker(&mut self) -> Result<()> {
-        let threads = fetch_resume_threads(&self.state)?;
-        if threads.is_empty() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("no saved chats to resume".to_string()));
-            return Ok(());
-        }
+    fn open_resume_picker(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
+        self.open_thread_picker(tui, false, true)
+    }
 
-        let current_session_id = self.widget.ui_mut().session_id.clone();
-        let items = threads
-            .into_iter()
-            .filter_map(|thread| {
-                let thread_id_text = thread.thread_id.clone();
-                let thread_id =
-                    codex_protocol::ThreadId::from_string(thread_id_text.clone()).ok()?;
-                let display_name = thread
-                    .thread_name
-                    .filter(|name| !name.trim().is_empty())
-                    .unwrap_or_else(|| thread_id_text.clone());
-                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::SelectAgentThread(thread_id.clone()));
-                });
-                Some(crate::bottom_pane::SelectionItem {
-                    name: display_name,
-                    description: Some(thread_id_text.clone()),
-                    is_current: current_session_id == thread_id_text,
-                    actions: vec![action],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                })
+    fn open_thread_picker(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        fork: bool,
+        show_all: bool,
+    ) -> Result<()> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|err| anyhow::anyhow!("initialize picker runtime: {err}"))?;
+        let selection = runtime
+            .block_on(async {
+                if fork {
+                    crate::resume_picker::run_fork_picker(tui, &self.state, show_all).await
+                } else {
+                    crate::resume_picker::run_resume_picker(tui, &self.state, show_all).await
+                }
             })
-            .collect::<Vec<_>>();
-
-        if items.is_empty() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("no saved chats to resume".to_string()));
-            return Ok(());
+            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        match selection {
+            SessionSelection::Resume(thread_id) => {
+                if let Some(resumed_thread_id) = resume_thread(&self.state, &thread_id)? {
+                    self.switch_to_thread(resumed_thread_id, "thread resumed", false);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("resume returned no thread id".to_string()));
+                }
+            }
+            SessionSelection::Fork(thread_id) => {
+                if let Some(forked_thread_id) = fork_thread(&self.state, &thread_id)? {
+                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                } else {
+                    self.widget
+                        .ui_mut()
+                        .set_status_message(Some("fork returned no thread id".to_string()));
+                }
+            }
+            SessionSelection::StartFresh | SessionSelection::Exit => {}
         }
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                view_id: Some("resume-session-picker"),
-                title: Some("Resume Chat".to_string()),
-                subtitle: Some("Select a saved chat to resume.".to_string()),
-                items,
-                ..Default::default()
-            });
         Ok(())
     }
 
     fn open_agent_picker(&mut self) -> Result<()> {
-        let threads = fetch_resume_threads(&self.state)?;
+        let threads = fetch_resume_threads(&self.state, true)?;
         if threads.is_empty() {
             self.widget
                 .ui_mut()
@@ -2856,16 +2896,20 @@ struct PermissionsPresetEntry {
     sandbox: codex_core::protocol::SandboxPolicy,
 }
 
-fn fetch_resume_threads(state: &CliState) -> Result<Vec<ResumeThreadEntry>> {
+fn fetch_resume_threads(state: &CliState, show_all: bool) -> Result<Vec<ResumeThreadEntry>> {
+    let mut params = json!({
+        "sortKey": "updated_at",
+        "limit": 50,
+        "archived": false,
+    });
+    if !show_all && let Ok(cwd) = std::env::current_dir() {
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "thread/list",
-        json!({
-            "sortKey": "updated_at",
-            "limit": 50,
-            "archived": false,
-        }),
+        params,
     )?;
 
     let Some(threads) = response.result.get("data").and_then(Value::as_array) else {

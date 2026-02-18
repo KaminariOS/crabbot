@@ -1821,6 +1821,14 @@ pub struct CliState {
 pub struct TuiArgs {
     pub thread_id: Option<String>,
     pub no_alt_screen: bool,
+    pub startup_picker: Option<StartupPicker>,
+    pub startup_picker_show_all: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum StartupPicker {
+    Resume,
+    Fork,
 }
 
 pub enum CommandOutput {
@@ -1867,6 +1875,7 @@ mod mention_codec;
 mod model_migration;
 mod notifications;
 mod render;
+mod resume_picker;
 mod selection_list;
 mod session_log;
 mod shimmer;
@@ -1889,6 +1898,36 @@ mod wrapping;
 
 pub use app::handle_attach_tui_interactive;
 pub use app::handle_tui;
+
+pub async fn run_startup_picker(
+    mode: StartupPicker,
+    show_all: bool,
+    state: &CliState,
+) -> Result<Option<String>> {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        return Ok(None);
+    }
+
+    let terminal = crate::tui::init().context("initialize tui terminal for startup picker")?;
+    let mut tui = crate::tui::Tui::new(terminal);
+    let selection = match mode {
+        StartupPicker::Resume => resume_picker::run_resume_picker(&mut tui, state, show_all)
+            .await
+            .map_err(|err| anyhow!("{err}"))?,
+        StartupPicker::Fork => resume_picker::run_fork_picker(&mut tui, state, show_all)
+            .await
+            .map_err(|err| anyhow!("{err}"))?,
+    };
+    let _ = crate::tui::restore();
+
+    match selection {
+        resume_picker::SessionSelection::Resume(thread_id)
+        | resume_picker::SessionSelection::Fork(thread_id) => Ok(Some(thread_id)),
+        resume_picker::SessionSelection::StartFresh | resume_picker::SessionSelection::Exit => {
+            Ok(None)
+        }
+    }
+}
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {
         return String::new();
