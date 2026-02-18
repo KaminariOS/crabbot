@@ -236,7 +236,7 @@ impl App {
     ///
     /// This mirrors upstream `App::run()` — sets up the terminal, enters the
     /// main loop, then restores the terminal on exit.
-    pub(crate) fn run(&mut self) -> Result<AppExitInfo> {
+    pub(crate) async fn run(&mut self) -> Result<AppExitInfo> {
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(AppExitInfo {
                 thread_id: Some(self.thread_id.clone()),
@@ -255,15 +255,17 @@ impl App {
         if let Some(mode) = self.startup_picker.take() {
             match mode {
                 StartupPicker::Resume => {
-                    self.open_thread_picker(&mut tui, false, self.startup_picker_show_all)?
+                    self.open_thread_picker(&mut tui, false, self.startup_picker_show_all)
+                        .await?
                 }
                 StartupPicker::Fork => {
-                    self.open_thread_picker(&mut tui, true, self.startup_picker_show_all)?
+                    self.open_thread_picker(&mut tui, true, self.startup_picker_show_all)
+                        .await?
                 }
             }
         }
 
-        let loop_result = self.event_loop(&mut tui);
+        let loop_result = self.event_loop(&mut tui).await;
         if entered_alt_screen {
             let _ = tui.leave_alt_screen();
         }
@@ -288,7 +290,7 @@ impl App {
     // Event loop — mirrors upstream `App::run()` main loop body
     // -----------------------------------------------------------------------
 
-    fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
+    async fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
         loop {
             if self.pending_thread_switch_clear {
                 tui.terminal.clear_scrollback()?;
@@ -331,25 +333,25 @@ impl App {
                     _ => continue,
                 };
 
-                match self.handle_event(tui, app_event)? {
+                match self.handle_event(tui, app_event).await? {
                     LiveTuiAction::Continue => {}
                     LiveTuiAction::Detach => return Ok(()),
                 }
                 should_redraw = true;
             }
 
-            let drained = self.drain_pending_app_events(tui)?;
+            let drained = self.drain_pending_app_events(tui).await?;
             if drained.detach {
                 return Ok(());
             }
             should_redraw |= drained.redraw;
 
             // Tick: poll stream for app-server events.
-            match self.handle_event(tui, AppEvent::Tick)? {
+            match self.handle_event(tui, AppEvent::Tick).await? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => return Ok(()),
             }
-            let drained = self.drain_pending_app_events(tui)?;
+            let drained = self.drain_pending_app_events(tui).await?;
             if drained.detach {
                 return Ok(());
             }
@@ -365,10 +367,10 @@ impl App {
         }
     }
 
-    fn drain_pending_app_events(&mut self, tui: &mut crate::tui::Tui) -> Result<DrainResult> {
+    async fn drain_pending_app_events(&mut self, tui: &mut crate::tui::Tui) -> Result<DrainResult> {
         let mut handled_any = false;
         while let Ok(app_event) = self.app_event_rx.try_recv() {
-            match self.handle_event(tui, app_event)? {
+            match self.handle_event(tui, app_event).await? {
                 LiveTuiAction::Continue => {}
                 LiveTuiAction::Detach => {
                     return Ok(DrainResult {
@@ -439,13 +441,13 @@ impl App {
     /// This is the central dispatch point, mirroring upstream's enormous
     /// `handle_event`. Currently handles the essential events; additional
     /// upstream event types will be added incrementally.
-    fn handle_event(
+    async fn handle_event(
         &mut self,
         tui: &mut crate::tui::Tui,
         event: AppEvent,
     ) -> Result<LiveTuiAction> {
         match event {
-            AppEvent::Key(key_event) => self.handle_key_event(tui, key_event),
+            AppEvent::Key(key_event) => self.handle_key_event(tui, key_event).await,
             AppEvent::Mouse(mouse_event) => {
                 self.widget.ui_mut().handle_mouse_event(mouse_event);
                 Ok(LiveTuiAction::Continue)
@@ -477,7 +479,10 @@ impl App {
                 text,
                 text_elements,
                 mention_bindings,
-            } => self.handle_submit(tui, &text, text_elements, mention_bindings),
+            } => {
+                self.handle_submit(tui, &text, text_elements, mention_bindings)
+                    .await
+            }
             AppEvent::StartTurn {
                 text,
                 text_elements,
@@ -535,7 +540,7 @@ impl App {
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ResumeSession => {
-                self.open_resume_picker(tui)?;
+                self.open_resume_picker(tui).await?;
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::ApprovalDecision { arg, approve } => {
@@ -557,7 +562,7 @@ impl App {
     }
 
     /// Handle a key press event — mirrors upstream `App::handle_key_event`.
-    fn handle_key_event(
+    async fn handle_key_event(
         &mut self,
         tui: &mut crate::tui::Tui,
         key: crossterm::event::KeyEvent,
@@ -646,19 +651,21 @@ impl App {
             ui.drain_bottom_pane_events()
         };
         for event in pending_widget_events {
-            self.handle_widget_app_event(tui, event)?;
+            self.handle_widget_app_event(tui, event).await?;
         }
 
         while let Ok(event) = self.widget_event_rx.try_recv() {
-            self.handle_widget_app_event(tui, event)?;
+            self.handle_widget_app_event(tui, event).await?;
         }
 
         if queued_external_editor_launch {
-            self.handle_widget_app_event(tui, WidgetAppEvent::LaunchExternalEditor)?;
+            self.handle_widget_app_event(tui, WidgetAppEvent::LaunchExternalEditor)
+                .await?;
         }
 
         if let Some((cmd, args, text_elements)) = queued_command {
-            self.dispatch_slash_command(tui, cmd, args, text_elements)?;
+            self.dispatch_slash_command(tui, cmd, args, text_elements)
+                .await?;
         } else if let Some((input, text_elements)) = queued_submit {
             let mention_bindings = self
                 .widget
@@ -673,7 +680,7 @@ impl App {
         Ok(LiveTuiAction::Continue)
     }
 
-    fn handle_widget_app_event(
+    async fn handle_widget_app_event(
         &mut self,
         tui: &mut crate::tui::Tui,
         event: WidgetAppEvent,
@@ -731,7 +738,7 @@ impl App {
                     .apply_file_search_result(query, matches);
             }
             WidgetAppEvent::OpenResumePicker => {
-                self.open_resume_picker(tui)?;
+                self.open_resume_picker(tui).await?;
             }
             WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
                 self.open_permissions_picker()?;
@@ -911,7 +918,7 @@ impl App {
         Ok(())
     }
 
-    fn dispatch_slash_command(
+    async fn dispatch_slash_command(
         &mut self,
         tui: &mut crate::tui::Tui,
         cmd: SlashCommand,
@@ -933,7 +940,7 @@ impl App {
         match cmd {
             SlashCommand::Model => self.open_model_picker()?,
             SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
-            SlashCommand::Resume => self.open_resume_picker(tui)?,
+            SlashCommand::Resume => self.open_resume_picker(tui).await?,
             SlashCommand::Status => self.emit_status_summary(),
             SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(),
             SlashCommand::DebugConfig => self
@@ -1285,7 +1292,7 @@ impl App {
     }
 
     /// Handle submitted user input (from Enter key or programmatic submit).
-    fn handle_submit(
+    async fn handle_submit(
         &mut self,
         tui: &mut crate::tui::Tui,
         input: &str,
@@ -1326,7 +1333,7 @@ impl App {
                 return Ok(LiveTuiAction::Continue);
             }
             "/resume" => {
-                self.open_resume_picker(tui)?;
+                self.open_resume_picker(tui).await?;
                 return Ok(LiveTuiAction::Continue);
             }
             _ => {}
@@ -1353,7 +1360,8 @@ impl App {
             let args = parts.next().unwrap_or_default().trim().to_string();
             if let Some(cmd) = find_builtin_command(command, true, true, true, true) {
                 let args = if args.is_empty() { None } else { Some(args) };
-                self.dispatch_slash_command(tui, cmd, args, text_elements)?;
+                self.dispatch_slash_command(tui, cmd, args, text_elements)
+                    .await?;
                 return Ok(LiveTuiAction::Continue);
             }
         }
@@ -1466,29 +1474,22 @@ impl App {
         self.widget.ui_mut().add_history_cell(Box::new(cell));
     }
 
-    fn open_resume_picker(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
-        self.open_thread_picker(tui, false, true)
+    async fn open_resume_picker(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
+        self.open_thread_picker(tui, false, true).await
     }
 
-    fn open_thread_picker(
+    async fn open_thread_picker(
         &mut self,
         tui: &mut crate::tui::Tui,
         fork: bool,
         show_all: bool,
     ) -> Result<()> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|err| anyhow::anyhow!("initialize picker runtime: {err}"))?;
-        let selection = runtime
-            .block_on(async {
-                if fork {
-                    crate::resume_picker::run_fork_picker(tui, &self.state, show_all).await
-                } else {
-                    crate::resume_picker::run_resume_picker(tui, &self.state, show_all).await
-                }
-            })
-            .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+        let selection = if fork {
+            crate::resume_picker::run_fork_picker(tui, &self.state, show_all).await
+        } else {
+            crate::resume_picker::run_resume_picker(tui, &self.state, show_all).await
+        }
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         match selection {
             SessionSelection::Resume(thread_id) => {
                 if let Some(resumed_thread_id) = resume_thread(&self.state, &thread_id)? {
@@ -2481,7 +2482,7 @@ fn resolve_initial_thread_id(
 // Public entry points — backward compatible with existing callers
 // ---------------------------------------------------------------------------
 
-pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
     let mut app = App::new(args, state.clone())?;
 
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
@@ -2494,7 +2495,7 @@ pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> 
         })));
     }
 
-    let exit_info = app.run()?;
+    let exit_info = app.run().await?;
     *state = app.into_state();
     Ok(CommandOutput::Text(format!(
         "thread={} detached",
@@ -2502,13 +2503,13 @@ pub fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> 
     )))
 }
 
-pub fn handle_attach_tui_interactive(
+pub async fn handle_attach_tui_interactive(
     session_id: String,
     initial_events: Vec<DaemonStreamEnvelope>,
     state: &mut CliState,
 ) -> Result<CommandOutput> {
     let mut app = App::attach(session_id, initial_events, state.clone())?;
-    let exit_info = app.run()?;
+    let exit_info = app.run().await?;
     *state = app.into_state();
     Ok(CommandOutput::Text(format!(
         "session={} detached",

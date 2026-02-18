@@ -398,6 +398,7 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
             },
             &mut tui_state,
         )
+        .await
     })?;
     *state = convert_state_from_tui(tui_state)?;
     Ok(convert_output_from_tui(output))
@@ -427,7 +428,7 @@ fn handle_attach_tui_interactive_with_crate(
         .build()
         .context("initialize tokio runtime for attach tui")?;
     let output = runtime.block_on(async {
-        crabbot_tui::handle_attach_tui_interactive(session_id, initial_events, &mut tui_state)
+        crabbot_tui::handle_attach_tui_interactive(session_id, initial_events, &mut tui_state).await
     })?;
     *state = convert_state_from_tui(tui_state)?;
     Ok(convert_output_from_tui(output))
