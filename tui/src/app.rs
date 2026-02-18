@@ -766,7 +766,7 @@ impl App {
             WidgetAppEvent::StartReviewUncommitted => {
                 self.start_review_uncommitted()?;
             }
-            WidgetAppEvent::StartReviewBaseBranch { branch } => {
+            WidgetAppEvent::StartReviewBaseBranch(branch) => {
                 self.start_review_base_branch(&branch)?;
             }
             WidgetAppEvent::StartReviewCommit { sha, title } => {
@@ -799,16 +799,6 @@ impl App {
                     self.widget
                         .ui_mut()
                         .set_status_message(Some("resume returned no thread id".to_string()));
-                }
-            }
-            WidgetAppEvent::ForkFromThread(thread_id) => {
-                let selected_thread_id = thread_id.to_string();
-                if let Some(forked_thread_id) = fork_thread(&self.state, &selected_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("fork returned no thread id".to_string()));
                 }
             }
             WidgetAppEvent::UpdateModel(model) => {

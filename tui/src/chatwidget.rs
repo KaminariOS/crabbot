@@ -2388,8 +2388,11 @@ impl LiveAttachTui {
 
     pub(crate) fn open_status_line_setup(&mut self) {
         let configured_status_line_items = self.configured_status_line_items();
-        self.bottom_pane
-            .open_status_line_setup(Some(configured_status_line_items.as_slice()));
+        let view = crate::bottom_pane::StatusLineSetupView::new(
+            Some(configured_status_line_items.as_slice()),
+            self.bottom_pane_event_tx.clone(),
+        );
+        self.bottom_pane.show_view(Box::new(view));
     }
 
     pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
@@ -2699,9 +2702,7 @@ impl LiveAttachTui {
                 crate::bottom_pane::SelectionItem {
                     name: format!("{current_branch} -> {branch}"),
                     actions: vec![Box::new(move |sender| {
-                        sender.send(UiAppEvent::StartReviewBaseBranch {
-                            branch: branch.clone(),
-                        });
+                        sender.send(UiAppEvent::StartReviewBaseBranch(branch.clone()));
                     })],
                     dismiss_on_select: true,
                     search_value: Some(search_value),

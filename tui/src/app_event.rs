@@ -50,8 +50,6 @@ pub(crate) enum AppEvent {
     OpenAgentPicker,
     /// Switch the active thread to the selected agent.
     SelectAgentThread(ThreadId),
-    /// Fork from the selected thread in the picker.
-    ForkFromThread(ThreadId),
 
     /// Start a new session.
     NewSession,
@@ -316,21 +314,19 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Start a review on uncommitted changes.
+    /// Start review for uncommitted changes through app-server shim.
     StartReviewUncommitted,
 
-    /// Start a review against a selected base branch.
-    StartReviewBaseBranch {
-        branch: String,
-    },
+    /// Start review against a base branch through app-server shim.
+    StartReviewBaseBranch(String),
 
-    /// Start a review for a selected commit.
+    /// Start review for a specific commit through app-server shim.
     StartReviewCommit {
         sha: String,
         title: Option<String>,
     },
 
-    /// Start a custom-instructions review.
+    /// Start review with custom instructions through app-server shim.
     StartReviewCustomInstructions(String),
 
     /// Submit a user message with an explicit collaboration mask.
