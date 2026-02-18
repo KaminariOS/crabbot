@@ -54,15 +54,6 @@ impl FrameRequester {
     pub fn schedule_frame_in(&self, dur: Duration) {
         let _ = self.frame_schedule_tx.send(Instant::now() + dur);
     }
-
-    /// Create a no-op frame requester for call sites that do not run the
-    /// async scheduler loop but still need a `FrameRequester` value.
-    pub fn no_op() -> Self {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        Self {
-            frame_schedule_tx: tx,
-        }
-    }
 }
 
 #[cfg(test)]

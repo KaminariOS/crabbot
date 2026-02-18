@@ -261,9 +261,10 @@ impl LiveAttachTui {
     pub(crate) fn new(session_id: String, latest_state: String) -> Self {
         let (ui_event_tx_raw, ui_event_rx) = tokio::sync::mpsc::unbounded_channel::<UiAppEvent>();
         let ui_event_tx = UiAppEventSender::new(ui_event_tx_raw);
+        let (draw_tx, _draw_rx) = tokio::sync::broadcast::channel(1);
         let bottom_pane = BottomPane::new(BottomPaneParams {
             app_event_tx: ui_event_tx.clone(),
-            frame_requester: crate::tui::FrameRequester::no_op(),
+            frame_requester: crate::tui::FrameRequester::new(draw_tx),
             has_input_focus: true,
             enhanced_keys_supported: true,
             placeholder_text: TUI_COMPOSER_PLACEHOLDER.to_string(),

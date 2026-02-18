@@ -824,6 +824,22 @@ pub mod git_info {
     }
 }
 
+pub mod path_utils {
+    use std::path::Path;
+    use std::path::PathBuf;
+
+    /// Compatibility shim for upstream `codex_core::path_utils::normalize_for_path_comparison`.
+    pub fn normalize_for_path_comparison(path: impl AsRef<Path>) -> std::io::Result<PathBuf> {
+        path.as_ref().canonicalize()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThreadSortKey {
+    CreatedAt,
+    UpdatedAt,
+}
+
 pub mod parse_command {
     use serde::Deserialize;
     use serde::Serialize;

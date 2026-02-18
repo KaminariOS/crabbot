@@ -13,6 +13,8 @@ use crate::tui::TuiEvent;
 use chrono::DateTime;
 use chrono::TimeZone;
 use chrono::Utc;
+use codex_core::ThreadSortKey;
+use codex_core::path_utils;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -36,12 +38,6 @@ pub enum SessionSelection {
     Resume(String),
     Fork(String),
     Exit,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ThreadSortKey {
-    CreatedAt,
-    UpdatedAt,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -79,7 +75,7 @@ struct PageLoadRequest {
     request_token: usize,
     search_token: Option<usize>,
     sort_key: ThreadSortKey,
-    show_all: bool,
+    filter_cwd: Option<PathBuf>,
     app_server_endpoint: String,
     auth_token: Option<String>,
 }
@@ -159,6 +155,11 @@ async fn run_session_picker(
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+    let filter_cwd = if show_all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
 
     let app_server_endpoint = state.config.app_server_endpoint.clone();
     let auth_token = state.config.auth_token.clone();
@@ -176,9 +177,7 @@ async fn run_session_picker(
                 "sortKey": sort_key,
                 "archived": false,
             });
-            if !request.show_all
-                && let Ok(cwd) = std::env::current_dir()
-            {
+            if let Some(cwd) = request.filter_cwd.as_ref() {
                 params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().to_string());
             }
             let page = app_server_rpc_request_raw(
@@ -221,6 +220,7 @@ async fn run_session_picker(
         alt.tui.frame_requester(),
         page_loader,
         show_all,
+        filter_cwd,
         action,
         app_server_endpoint,
         auth_token,
@@ -306,6 +306,7 @@ struct PickerState {
     page_loader: PageLoader,
     view_rows: Option<usize>,
     show_all: bool,
+    filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
     app_server_endpoint: String,
@@ -392,6 +393,7 @@ impl PickerState {
         requester: FrameRequester,
         page_loader: PageLoader,
         show_all: bool,
+        filter_cwd: Option<PathBuf>,
         action: SessionPickerAction,
         app_server_endpoint: String,
         auth_token: Option<String>,
@@ -416,6 +418,7 @@ impl PickerState {
             page_loader,
             view_rows: None,
             show_all,
+            filter_cwd,
             action,
             sort_key: ThreadSortKey::CreatedAt,
             app_server_endpoint,
@@ -529,7 +532,7 @@ impl PickerState {
             request_token,
             search_token,
             sort_key: self.sort_key,
-            show_all: self.show_all,
+            filter_cwd: self.filter_cwd.clone(),
             app_server_endpoint: self.app_server_endpoint.clone(),
             auth_token: self.auth_token.clone(),
         });
@@ -615,11 +618,13 @@ impl PickerState {
         if self.show_all {
             return true;
         }
-        row.cwd.as_ref().is_some_and(|row_cwd| {
-            std::env::current_dir()
-                .ok()
-                .is_some_and(|cwd| row_cwd == &cwd)
-        })
+        let Some(filter_cwd) = self.filter_cwd.as_ref() else {
+            return true;
+        };
+        let Some(row_cwd) = row.cwd.as_ref() else {
+            return false;
+        };
+        paths_match(row_cwd, filter_cwd)
     }
 
     fn set_query(&mut self, new_query: String) {
@@ -756,7 +761,7 @@ impl PickerState {
             request_token,
             search_token,
             sort_key: self.sort_key,
-            show_all: self.show_all,
+            filter_cwd: self.filter_cwd.clone(),
             app_server_endpoint: self.app_server_endpoint.clone(),
             auth_token: self.auth_token.clone(),
         });
@@ -819,6 +824,16 @@ fn head_to_row(item: &ApiThread) -> Row {
         cwd: Some(item.cwd.clone()),
         git_branch: item.git_info.as_ref().and_then(|g| g.branch.clone()),
     }
+}
+
+fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+    if let (Ok(ca), Ok(cb)) = (
+        path_utils::normalize_for_path_comparison(a),
+        path_utils::normalize_for_path_comparison(b),
+    ) {
+        return ca == cb;
+    }
+    a == b
 }
 
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
