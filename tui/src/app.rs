@@ -318,26 +318,43 @@ impl App {
             })?;
             let mut should_redraw = false;
 
-            // Poll terminal for input events.
+            // Poll terminal for input events and drain all ready events so
+            // repeated input is processed with the same responsiveness as upstream.
             if event::poll(TUI_EVENT_WAIT_STEP).context("poll tui input event")? {
-                let app_event = match event::read().context("read tui input event")? {
-                    Event::Key(key_event) => {
-                        if key_event.kind != KeyEventKind::Press {
+                loop {
+                    let app_event = match event::read().context("read tui input event")? {
+                        Event::Key(key_event) => {
+                            // Match upstream key handling: ignore only key releases so
+                            // repeated keypresses (e.g., holding `d`) continue to flow.
+                            if key_event.kind == KeyEventKind::Release {
+                                if !event::poll(Duration::ZERO).context("poll tui input event")? {
+                                    break;
+                                }
+                                continue;
+                            }
+                            AppEvent::Key(key_event)
+                        }
+                        Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
+                        Event::Paste(pasted) => AppEvent::Paste(pasted),
+                        Event::Resize(_, _) => AppEvent::Resize,
+                        _ => {
+                            if !event::poll(Duration::ZERO).context("poll tui input event")? {
+                                break;
+                            }
                             continue;
                         }
-                        AppEvent::Key(key_event)
-                    }
-                    Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
-                    Event::Paste(pasted) => AppEvent::Paste(pasted),
-                    Event::Resize(_, _) => AppEvent::Resize,
-                    _ => continue,
-                };
+                    };
 
-                match self.handle_event(tui, app_event).await? {
-                    LiveTuiAction::Continue => {}
-                    LiveTuiAction::Detach => return Ok(()),
+                    match self.handle_event(tui, app_event).await? {
+                        LiveTuiAction::Continue => {}
+                        LiveTuiAction::Detach => return Ok(()),
+                    }
+                    should_redraw = true;
+
+                    if !event::poll(Duration::ZERO).context("poll tui input event")? {
+                        break;
+                    }
                 }
-                should_redraw = true;
             }
 
             let drained = self.drain_pending_app_events(tui).await?;
