@@ -48,6 +48,13 @@ pub(crate) struct UiApprovalRequest {
 
 #[derive(Debug, Clone)]
 pub(crate) enum UiEvent {
+    SessionConfigured {
+        session_id: String,
+        model: String,
+        reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+        history_log_id: u64,
+        history_entry_count: usize,
+    },
     SessionState(String),
     ThreadStarted {
         thread_id: String,
@@ -336,6 +343,9 @@ pub(crate) fn map_rpc_stream_events(stream_events: &[DaemonRpcStreamEnvelope]) -
 
 fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
     match notification.method.as_str() {
+        "codex/event/session_configured" | "session/configured" => {
+            map_session_configured_notification(&notification.params)
+        }
         "thread/started" => notification
             .params
             .get("thread")
@@ -973,15 +983,7 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
         .unwrap_or_default();
 
     match msg_type {
-        "session_configured" => {
-            let model = msg
-                .get("model")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown-model");
-            vec![UiEvent::StatusMessage(format!(
-                "session configured ({model})"
-            ))]
-        }
+        "session_configured" => map_session_configured_notification(msg),
         "thread_name_updated" => msg
             .get("thread_name")
             .or_else(|| msg.get("threadName"))
@@ -1246,6 +1248,83 @@ fn map_codex_event_notification(params: &Value) -> Vec<UiEvent> {
             vec![UiEvent::CollabEvent(format!("[collab] {other}"))]
         }
         _ => Vec::new(),
+    }
+}
+
+fn map_session_configured_notification(payload: &Value) -> Vec<UiEvent> {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-model")
+        .to_string();
+    let session_id = payload
+        .get("session_id")
+        .or_else(|| payload.get("sessionId"))
+        .or_else(|| payload.get("thread_id"))
+        .or_else(|| payload.get("threadId"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let history_log_id = payload
+        .get("history_log_id")
+        .or_else(|| payload.get("historyLogId"))
+        .and_then(value_to_u64)
+        .unwrap_or_default();
+    let history_entry_count = payload
+        .get("history_entry_count")
+        .or_else(|| payload.get("historyEntryCount"))
+        .and_then(value_to_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or_default();
+    let reasoning_effort = payload
+        .get("reasoning_effort")
+        .or_else(|| payload.get("reasoningEffort"))
+        .and_then(parse_reasoning_effort_value);
+
+    let mut events = vec![UiEvent::SessionConfigured {
+        session_id,
+        model,
+        reasoning_effort,
+        history_log_id,
+        history_entry_count,
+    }];
+
+    if let Some(initial_messages) = payload
+        .get("initial_messages")
+        .or_else(|| payload.get("initialMessages"))
+        .and_then(Value::as_array)
+    {
+        for message in initial_messages {
+            events.extend(map_codex_event_notification(
+                &json!({ "event": { "msg": message } }),
+            ));
+        }
+    }
+
+    events
+}
+
+fn value_to_u64(value: &Value) -> Option<u64> {
+    value
+        .as_u64()
+        .or_else(|| value.as_i64().and_then(|v| u64::try_from(v).ok()))
+        .or_else(|| value.as_str().and_then(|v| v.parse::<u64>().ok()))
+}
+
+fn parse_reasoning_effort_value(
+    value: &Value,
+) -> Option<codex_protocol::openai_models::ReasoningEffort> {
+    let normalized = value.as_str()?.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "none" => Some(codex_protocol::openai_models::ReasoningEffort::None),
+        "minimal" => Some(codex_protocol::openai_models::ReasoningEffort::Minimal),
+        "low" => Some(codex_protocol::openai_models::ReasoningEffort::Low),
+        "medium" => Some(codex_protocol::openai_models::ReasoningEffort::Medium),
+        "high" => Some(codex_protocol::openai_models::ReasoningEffort::High),
+        "xhigh" | "x-high" | "very_high" | "very-high" | "veryhigh" => {
+            Some(codex_protocol::openai_models::ReasoningEffort::XHigh)
+        }
+        _ => None,
     }
 }
 
@@ -1956,7 +2035,16 @@ pub(crate) fn interrupt_turn(state: &CliState, thread_id: &str, turn_id: &str) -
     Ok(())
 }
 
-pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<String>> {
+#[derive(Debug, Default, Clone)]
+pub(crate) struct ThreadResumeResult {
+    pub(crate) thread_id: Option<String>,
+    pub(crate) replay_events: Vec<UiEvent>,
+}
+
+pub(crate) fn resume_thread_detailed(
+    state: &CliState,
+    thread_id: &str,
+) -> Result<ThreadResumeResult> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
@@ -1965,7 +2053,11 @@ pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<
             "threadId": thread_id,
         }),
     )?;
-    Ok(extract_thread_id_from_rpc_result(&response.result))
+    Ok(parse_thread_resume_result(&response.result))
+}
+
+pub(crate) fn resume_thread(state: &CliState, thread_id: &str) -> Result<Option<String>> {
+    Ok(resume_thread_detailed(state, thread_id)?.thread_id)
 }
 
 pub(crate) fn fork_thread(state: &CliState, thread_id: &str) -> Result<Option<String>> {
@@ -2124,6 +2216,99 @@ pub(crate) fn decode_app_server_wire_line(
         sequence: fallback_sequence,
         event,
     }))
+}
+
+fn parse_thread_resume_result(result: &Value) -> ThreadResumeResult {
+    let thread_id = extract_thread_id_from_rpc_result(result);
+    let model = result
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown-model")
+        .to_string();
+    let reasoning_effort = result
+        .get("reasoningEffort")
+        .or_else(|| result.get("reasoning_effort"))
+        .and_then(parse_reasoning_effort_value);
+
+    let mut replay_events = vec![UiEvent::SessionConfigured {
+        session_id: thread_id.clone().unwrap_or_default(),
+        model,
+        reasoning_effort,
+        history_log_id: 0,
+        history_entry_count: 0,
+    }];
+
+    if let Some(initial_messages) = result
+        .get("initialMessages")
+        .or_else(|| result.get("initial_messages"))
+        .and_then(Value::as_array)
+    {
+        for message in initial_messages {
+            replay_events.extend(map_codex_event_notification(&json!({
+                "event": { "msg": message }
+            })));
+        }
+    } else if let Some(thread) = result.get("thread") {
+        replay_events.extend(parse_thread_turn_items_to_ui_events(thread));
+    }
+
+    ThreadResumeResult {
+        thread_id,
+        replay_events,
+    }
+}
+
+fn parse_thread_turn_items_to_ui_events(thread: &Value) -> Vec<UiEvent> {
+    let mut events = Vec::new();
+    let Some(turns) = thread.get("turns").and_then(Value::as_array) else {
+        return events;
+    };
+    for turn in turns {
+        let Some(items) = turn.get("items").and_then(Value::as_array) else {
+            continue;
+        };
+        for item in items {
+            if let Some((text, text_elements)) = parse_user_message_item(item) {
+                events.push(UiEvent::UserMessage {
+                    text,
+                    text_elements,
+                });
+                continue;
+            }
+            if let Some(message) = parse_agent_message_text(item) {
+                events.push(UiEvent::AgentMessage { message });
+            }
+        }
+    }
+    events
+}
+
+fn parse_agent_message_text(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    if item_type != "agent_message" && item_type != "agentMessage" {
+        return None;
+    }
+
+    let text = item
+        .get("text")
+        .or_else(|| item.get("message"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| {
+            item.get("content")
+                .and_then(Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|entry| entry.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+        })?;
+    if text.is_empty() {
+        return None;
+    }
+    Some(text)
 }
 
 // ---------------------------------------------------------------------------

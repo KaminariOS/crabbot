@@ -14,7 +14,7 @@ pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::fork_thread;
 pub(super) use crate::core_compat::interrupt_turn;
 pub(super) use crate::core_compat::respond_to_approval;
-pub(super) use crate::core_compat::resume_thread;
+pub(super) use crate::core_compat::resume_thread_detailed;
 pub(super) use crate::core_compat::set_thread_name;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements_and_collaboration;
@@ -98,7 +98,7 @@ impl App {
     /// ready, starts or reuses a thread, and creates the initial `ChatWidget`.
     pub(crate) fn new(args: TuiArgs, mut state: CliState) -> Result<Self> {
         ensure_app_server_ready(&state)?;
-        let (thread_id, status_message) =
+        let (thread_id, status_message, resume_replay_events) =
             resolve_initial_thread_id(&state, args.thread_id, state.last_thread_id.clone())?;
         state.last_thread_id = Some(thread_id.clone());
 
@@ -120,6 +120,9 @@ impl App {
                     err
                 )));
             }
+        }
+        if !resume_replay_events.is_empty() {
+            widget.ui_mut().apply_replay_ui_events(resume_replay_events);
         }
         if !widget.ui_mut().has_history_cells() {
             let model = status_runtime
@@ -404,7 +407,13 @@ impl App {
         })
     }
 
-    fn switch_to_thread(&mut self, thread_id: String, status_message: &str, announce_switch: bool) {
+    fn switch_to_thread(
+        &mut self,
+        thread_id: String,
+        status_message: &str,
+        announce_switch: bool,
+        replay_events: Vec<crate::core_compat::UiEvent>,
+    ) {
         let previous_thread = self.widget.ui_mut().session_id.clone();
         let changed = previous_thread != thread_id;
 
@@ -422,19 +431,24 @@ impl App {
                     .ui_mut()
                     .apply_rpc_stream_events_with_replay(&events, true);
             }
-            let model = self
-                .status_runtime
-                .session_model
-                .clone()
-                .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-            self.widget
-                .ui_mut()
-                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
-                    model,
-                    self.status_runtime.session_reasoning_effort,
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    CODEX_CLI_VERSION,
-                )));
+            if !replay_events.is_empty() {
+                self.widget.ui_mut().apply_replay_ui_events(replay_events);
+            }
+            if !self.widget.ui_mut().has_history_cells() {
+                let model = self
+                    .status_runtime
+                    .session_model
+                    .clone()
+                    .unwrap_or_else(|| "gpt-5.3-codex".to_string());
+                self.widget
+                    .ui_mut()
+                    .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
+                        model,
+                        self.status_runtime.session_reasoning_effort,
+                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+                        CODEX_CLI_VERSION,
+                    )));
+            }
         }
 
         if announce_switch && changed {
@@ -532,7 +546,7 @@ impl App {
             }
             AppEvent::NewSession => {
                 let thread_id = start_thread(&self.state)?;
-                self.switch_to_thread(thread_id, "started new thread", true);
+                self.switch_to_thread(thread_id, "started new thread", true, Vec::new());
                 Ok(LiveTuiAction::Continue)
             }
             AppEvent::Interrupt => {
@@ -790,7 +804,7 @@ impl App {
             WidgetAppEvent::ForkCurrentSession => {
                 let active_thread_id = self.widget.ui_mut().session_id.clone();
                 if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
                 } else {
                     self.widget
                         .ui_mut()
@@ -799,8 +813,14 @@ impl App {
             }
             WidgetAppEvent::SelectAgentThread(thread_id) => {
                 let selected_thread_id = thread_id.to_string();
-                if let Some(resumed_thread_id) = resume_thread(&self.state, &selected_thread_id)? {
-                    self.switch_to_thread(resumed_thread_id, "thread resumed", false);
+                let resumed = resume_thread_detailed(&self.state, &selected_thread_id)?;
+                if let Some(resumed_thread_id) = resumed.thread_id {
+                    self.switch_to_thread(
+                        resumed_thread_id,
+                        "thread resumed",
+                        false,
+                        resumed.replay_events,
+                    );
                 } else {
                     self.widget
                         .ui_mut()
@@ -810,7 +830,7 @@ impl App {
             WidgetAppEvent::ForkFromThread(thread_id) => {
                 let selected_thread_id = thread_id.to_string();
                 if let Some(forked_thread_id) = fork_thread(&self.state, &selected_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
                 } else {
                     self.widget
                         .ui_mut()
@@ -967,7 +987,7 @@ impl App {
             SlashCommand::Fork => {
                 let active_thread_id = self.widget.ui_mut().session_id.clone();
                 if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
                 } else {
                     self.widget
                         .ui_mut()
@@ -1509,8 +1529,14 @@ impl App {
         .map_err(|err| anyhow::anyhow!(err.to_string()))?;
         match selection {
             SessionSelection::Resume(thread_id) => {
-                if let Some(resumed_thread_id) = resume_thread(&self.state, &thread_id)? {
-                    self.switch_to_thread(resumed_thread_id, "thread resumed", false);
+                let resumed = resume_thread_detailed(&self.state, &thread_id)?;
+                if let Some(resumed_thread_id) = resumed.thread_id {
+                    self.switch_to_thread(
+                        resumed_thread_id,
+                        "thread resumed",
+                        false,
+                        resumed.replay_events,
+                    );
                 } else {
                     self.widget
                         .ui_mut()
@@ -1519,7 +1545,7 @@ impl App {
             }
             SessionSelection::Fork(thread_id) => {
                 if let Some(forked_thread_id) = fork_thread(&self.state, &thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true);
+                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
                 } else {
                     self.widget
                         .ui_mut()
@@ -2457,30 +2483,36 @@ fn resolve_initial_thread_id(
     state: &CliState,
     explicit_thread_id: Option<String>,
     cached_thread_id: Option<String>,
-) -> Result<(String, String)> {
+) -> Result<(String, String, Vec<crate::core_compat::UiEvent>)> {
     if let Some(thread_id) = explicit_thread_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        let resumed = resume_thread(state, &thread_id).with_context(|| {
+        let resumed = resume_thread_detailed(state, &thread_id).with_context(|| {
             format!("resume explicit thread id before tui startup: {thread_id}")
         })?;
-        let resolved = resumed.unwrap_or(thread_id);
-        return Ok((resolved, "connected to app-server websocket".to_string()));
+        let resolved = resumed.thread_id.unwrap_or(thread_id);
+        return Ok((
+            resolved,
+            "connected to app-server websocket".to_string(),
+            resumed.replay_events,
+        ));
     }
 
     if let Some(thread_id) = cached_thread_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
     {
-        match resume_thread(state, &thread_id) {
-            Ok(Some(resumed_thread_id)) => {
-                return Ok((
-                    resumed_thread_id,
-                    "connected to app-server websocket".to_string(),
-                ));
+        match resume_thread_detailed(state, &thread_id) {
+            Ok(resumed) => {
+                if let Some(resumed_thread_id) = resumed.thread_id {
+                    return Ok((
+                        resumed_thread_id,
+                        "connected to app-server websocket".to_string(),
+                        resumed.replay_events,
+                    ));
+                }
             }
-            Ok(None) => {}
             Err(_) => {}
         }
 
@@ -2488,11 +2520,16 @@ fn resolve_initial_thread_id(
         return Ok((
             new_thread_id,
             "cached thread was unavailable; started a new thread".to_string(),
+            Vec::new(),
         ));
     }
 
     let thread_id = start_thread(state)?;
-    Ok((thread_id, "connected to app-server websocket".to_string()))
+    Ok((
+        thread_id,
+        "connected to app-server websocket".to_string(),
+        Vec::new(),
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -417,6 +417,10 @@ impl LiveAttachTui {
         }
     }
 
+    pub(crate) fn apply_replay_ui_events(&mut self, events: Vec<UiEvent>) {
+        self.apply_ui_events(events, true);
+    }
+
     fn apply_ui_event(&mut self, event: UiEvent, from_replay: bool) {
         let is_stream_error = matches!(&event, UiEvent::StreamError { .. });
         if !is_stream_error {
@@ -424,6 +428,20 @@ impl LiveAttachTui {
         }
 
         match event {
+            UiEvent::SessionConfigured {
+                session_id,
+                model,
+                reasoning_effort: _,
+                history_log_id,
+                history_entry_count,
+            } => {
+                if !session_id.is_empty() {
+                    self.session_id = session_id;
+                }
+                self.bottom_pane
+                    .set_history_metadata(history_log_id, history_entry_count);
+                self.status_message = Some(format!("session configured ({model})"));
+            }
             UiEvent::SessionState(state) => {
                 if self.previous_state.as_deref() != Some(state.as_str()) {
                     if state == "interrupted" {
