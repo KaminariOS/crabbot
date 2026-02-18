@@ -77,9 +77,6 @@ struct PageLoadRequest {
     request_token: usize,
     search_token: Option<usize>,
     sort_key: ThreadSortKey,
-    filter_cwd: Option<PathBuf>,
-    app_server_endpoint: String,
-    auth_token: Option<String>,
 }
 
 type PageLoader = Arc<dyn Fn(PageLoadRequest) + Send + Sync>;
@@ -138,27 +135,19 @@ async fn run_session_picker(
         std::env::current_dir().ok()
     };
 
-    let app_server_endpoint = state.config.app_server_endpoint.clone();
-    let auth_token = state.config.auth_token.clone();
+    let state = state.clone();
     let loader_tx = bg_tx.clone();
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
+        let state = state.clone();
         tokio::spawn(async move {
-            let state = CliState {
-                config: crate::CliConfig {
-                    app_server_endpoint: request.app_server_endpoint,
-                    auth_token: request.auth_token,
-                    ..Default::default()
-                },
-                ..Default::default()
-            };
             let page = list_threads_page_for_picker(
                 &state,
                 request.cursor,
                 PAGE_SIZE,
                 request.sort_key,
                 false,
-                request.filter_cwd,
+                None,
             )
             .map_err(std::io::Error::other);
             let _ = tx.send(BackgroundEvent::PageLoaded {
@@ -175,8 +164,6 @@ async fn run_session_picker(
         show_all,
         filter_cwd,
         action,
-        app_server_endpoint,
-        auth_token,
     );
     state.start_initial_load();
     state.request_frame();
@@ -262,8 +249,6 @@ struct PickerState {
     filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
-    app_server_endpoint: String,
-    auth_token: Option<String>,
 }
 
 struct PaginationState {
@@ -348,8 +333,6 @@ impl PickerState {
         show_all: bool,
         filter_cwd: Option<PathBuf>,
         action: SessionPickerAction,
-        app_server_endpoint: String,
-        auth_token: Option<String>,
     ) -> Self {
         Self {
             requester,
@@ -374,8 +357,6 @@ impl PickerState {
             filter_cwd,
             action,
             sort_key: ThreadSortKey::CreatedAt,
-            app_server_endpoint,
-            auth_token,
         }
     }
 
@@ -485,9 +466,6 @@ impl PickerState {
             request_token,
             search_token,
             sort_key: self.sort_key,
-            filter_cwd: self.filter_cwd.clone(),
-            app_server_endpoint: self.app_server_endpoint.clone(),
-            auth_token: self.auth_token.clone(),
         });
     }
 
@@ -714,9 +692,6 @@ impl PickerState {
             request_token,
             search_token,
             sort_key: self.sort_key,
-            filter_cwd: self.filter_cwd.clone(),
-            app_server_endpoint: self.app_server_endpoint.clone(),
-            auth_token: self.auth_token.clone(),
         });
     }
 
