@@ -2148,15 +2148,143 @@ pub(crate) fn list_collaboration_modes(
 }
 
 pub(crate) fn read_config_snapshot(state: &CliState) -> Result<Option<Value>> {
+    read_config_snapshot_for_cwd(state, None)
+}
+
+pub(crate) fn read_config_snapshot_for_cwd(
+    state: &CliState,
+    cwd: Option<&std::path::Path>,
+) -> Result<Option<Value>> {
+    let mut params = json!({
+        "includeLayers": false,
+    });
+    if let Some(cwd) = cwd {
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "config/read",
-        json!({
-            "includeLayers": false,
-        }),
+        params,
     )?;
     Ok(response.result.get("config").cloned())
+}
+
+pub(crate) fn write_config_value(state: &CliState, key_path: &str, value: Value) -> Result<()> {
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "config/value/write",
+        json!({
+            "keyPath": key_path,
+            "value": value,
+            "mergeStrategy": "replace",
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn write_skill_enabled(
+    state: &CliState,
+    path: std::path::PathBuf,
+    enabled: bool,
+) -> Result<()> {
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "skills/config/write",
+        json!({
+            "path": path,
+            "enabled": enabled,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn respond_to_request_json(
+    state: &CliState,
+    request_id: Value,
+    response: Value,
+) -> Result<()> {
+    app_server_rpc_respond(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        request_id,
+        response,
+    )?;
+    Ok(())
+}
+
+pub(crate) fn start_compaction(state: &CliState, thread_id: &str) -> Result<()> {
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/compact/start",
+        json!({
+            "threadId": thread_id,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn start_review(
+    state: &CliState,
+    thread_id: &str,
+    target: Value,
+) -> Result<Option<String>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "review/start",
+        json!({
+            "threadId": thread_id,
+            "target": target,
+        }),
+    )?;
+    Ok(response
+        .result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string))
+}
+
+pub(crate) fn clean_background_terminals(state: &CliState, thread_id: &str) -> Result<()> {
+    let _ = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/backgroundTerminals/clean",
+        json!({
+            "threadId": thread_id,
+        }),
+    )?;
+    Ok(())
+}
+
+pub(crate) fn read_rate_limits(state: &CliState) -> Result<Value> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "account/rateLimits/read",
+        json!({}),
+    )?;
+    Ok(response.result)
+}
+
+pub(crate) fn read_account(state: &CliState, refresh_token: bool) -> Result<Option<Value>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "account/read",
+        json!({
+            "refreshToken": refresh_token,
+        }),
+    )?;
+    Ok(response
+        .result
+        .get("account")
+        .cloned()
+        .or(Some(response.result)))
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -2253,6 +2381,150 @@ pub(crate) fn list_models(
         });
     }
     Ok(out)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct SkillListEntry {
+    pub(crate) name: String,
+    pub(crate) description: String,
+    pub(crate) short_description: Option<String>,
+    pub(crate) path: std::path::PathBuf,
+    pub(crate) enabled: bool,
+}
+
+pub(crate) fn list_skills_for_cwd(
+    state: &CliState,
+    cwd: &std::path::Path,
+    force_reload: bool,
+) -> Result<Vec<SkillListEntry>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "skills/list",
+        json!({
+            "cwds": [cwd],
+            "forceReload": force_reload
+        }),
+    )?;
+
+    let mut out = Vec::new();
+    let data = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    for entry in data {
+        let Some(skills) = entry.get("skills").and_then(Value::as_array) else {
+            continue;
+        };
+        for skill in skills {
+            let Some(name) = skill.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            let description = skill
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let path = skill
+                .get("path")
+                .and_then(Value::as_str)
+                .map(std::path::PathBuf::from)
+                .unwrap_or_default();
+            let short_description = skill
+                .get("shortDescription")
+                .and_then(Value::as_str)
+                .map(ToString::to_string);
+            let enabled = skill
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(true);
+            out.push(SkillListEntry {
+                name: name.to_string(),
+                description,
+                short_description,
+                path,
+                enabled,
+            });
+        }
+    }
+    Ok(out)
+}
+
+pub(crate) fn list_connectors(state: &CliState) -> Result<Vec<codex_chatgpt::connectors::AppInfo>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "app/list",
+        json!({}),
+    )?;
+
+    let connectors = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|app| {
+            Some(codex_chatgpt::connectors::AppInfo {
+                id: app.get("id")?.as_str()?.to_string(),
+                name: app.get("name")?.as_str()?.to_string(),
+                description: app
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                logo_url: app
+                    .get("logoUrl")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                logo_url_dark: app
+                    .get("logoUrlDark")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                distribution_channel: app
+                    .get("distributionChannel")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                branding: app.get("branding").cloned(),
+                app_metadata: app.get("appMetadata").cloned(),
+                labels: app
+                    .get("labels")
+                    .and_then(|labels| serde_json::from_value(labels.clone()).ok()),
+                install_url: app
+                    .get("installUrl")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string),
+                is_accessible: app
+                    .get("isAccessible")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+                is_enabled: app
+                    .get("isEnabled")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
+            })
+        })
+        .collect();
+    Ok(connectors)
+}
+
+pub(crate) fn list_mcp_server_statuses(state: &CliState, limit: usize) -> Result<Vec<Value>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "mcpServerStatus/list",
+        json!({
+            "limit": limit,
+        }),
+    )?;
+    Ok(response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default())
 }
 
 pub(crate) fn resume_thread_detailed(

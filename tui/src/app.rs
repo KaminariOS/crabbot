@@ -11,19 +11,31 @@ pub(super) use crate::core_compat::AppExitInfo;
 pub(super) use crate::core_compat::ExitMode;
 pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
+pub(super) use crate::core_compat::clean_background_terminals;
 pub(super) use crate::core_compat::fork_thread;
 pub(super) use crate::core_compat::interrupt_turn;
 pub(super) use crate::core_compat::list_collaboration_modes;
+pub(super) use crate::core_compat::list_connectors;
 pub(super) use crate::core_compat::list_experimental_features_page;
+pub(super) use crate::core_compat::list_mcp_server_statuses;
 pub(super) use crate::core_compat::list_models;
+pub(super) use crate::core_compat::list_skills_for_cwd;
 pub(super) use crate::core_compat::list_threads_page;
+pub(super) use crate::core_compat::read_account as read_account_snapshot;
 pub(super) use crate::core_compat::read_config_snapshot;
+pub(super) use crate::core_compat::read_config_snapshot_for_cwd;
+pub(super) use crate::core_compat::read_rate_limits;
 pub(super) use crate::core_compat::respond_to_approval;
+pub(super) use crate::core_compat::respond_to_request_json;
 pub(super) use crate::core_compat::resume_thread_detailed;
 pub(super) use crate::core_compat::set_thread_name;
+pub(super) use crate::core_compat::start_compaction;
+pub(super) use crate::core_compat::start_review;
 pub(super) use crate::core_compat::start_thread;
 pub(super) use crate::core_compat::start_turn_with_elements_and_collaboration;
 pub(super) use crate::core_compat::stream_events;
+pub(super) use crate::core_compat::write_config_value;
+pub(super) use crate::core_compat::write_skill_enabled;
 use crate::exec_cell::CommandOutput as ExecCommandOutput;
 use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
@@ -1310,9 +1322,8 @@ impl App {
                     codex_core::protocol::ElicitationAction::Decline => "decline",
                     codex_core::protocol::ElicitationAction::Cancel => "cancel",
                 };
-                app_server_rpc_respond(
-                    &self.state.config.app_server_endpoint,
-                    self.state.config.auth_token.as_deref(),
+                respond_to_request_json(
+                    &self.state,
                     request.request_id,
                     json!({ "decision": decision_text }),
                 )?;
@@ -1328,9 +1339,8 @@ impl App {
                         .push_line("No pending request_user_input request found.");
                     return Ok(());
                 };
-                app_server_rpc_respond(
-                    &self.state.config.app_server_endpoint,
-                    self.state.config.auth_token.as_deref(),
+                respond_to_request_json(
+                    &self.state,
                     request.request_id,
                     serde_json::to_value(response)?,
                 )?;
@@ -1726,16 +1736,7 @@ impl App {
     }
 
     fn apply_model_selection(&mut self, model: String) -> Result<()> {
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": "model",
-                "value": model,
-                "mergeStrategy": "replace",
-            }),
-        )?;
+        write_config_value(&self.state, "model", Value::String(model.clone()))?;
         self.status_runtime.session_model = Some(model.clone());
         self.widget
             .ui_mut()
@@ -1747,17 +1748,11 @@ impl App {
         &mut self,
         effort: Option<codex_protocol::openai_models::ReasoningEffort>,
     ) -> Result<()> {
-        let effort_value = effort.map(|v| v.to_string());
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": "modelReasoningEffort",
-                "value": effort_value,
-                "mergeStrategy": "replace",
-            }),
-        )?;
+        let effort_value = effort
+            .map(|v| v.to_string())
+            .map(Value::String)
+            .unwrap_or(Value::Null);
+        write_config_value(&self.state, "modelReasoningEffort", effort_value)?;
         self.status_runtime.session_reasoning_effort = effort;
         self.widget.ui_mut().set_status_message(Some(match effort {
             Some(level) => format!("reasoning effort updated to {level}"),
@@ -1831,15 +1826,10 @@ impl App {
         &mut self,
         personality: codex_protocol::config_types::Personality,
     ) -> Result<()> {
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": "personality",
-                "value": personality_config_value(personality),
-                "mergeStrategy": "replace",
-            }),
+        write_config_value(
+            &self.state,
+            "personality",
+            Value::String(personality_config_value(personality).to_string()),
         )?;
         self.widget.ui_mut().set_status_message(Some(format!(
             "personality set to {}",
@@ -1857,15 +1847,10 @@ impl App {
         }
 
         for (feature, enabled) in updates {
-            app_server_rpc_request(
-                &self.state.config.app_server_endpoint,
-                self.state.config.auth_token.as_deref(),
-                "config/value/write",
-                json!({
-                    "keyPath": format!("features.{}", feature.key()),
-                    "value": enabled,
-                    "mergeStrategy": "replace",
-                }),
+            write_config_value(
+                &self.state,
+                &format!("features.{}", feature.key()),
+                Value::Bool(enabled),
             )?;
         }
 
@@ -1876,39 +1861,25 @@ impl App {
     }
 
     fn apply_skill_enabled(&mut self, path: std::path::PathBuf, enabled: bool) -> Result<()> {
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "skills/config/write",
-            json!({
-                "path": path,
-                "enabled": enabled,
-            }),
-        )?;
+        write_skill_enabled(&self.state, path, enabled)?;
         self.refresh_skills_snapshot()?;
         Ok(())
     }
 
     fn apply_app_enabled(&mut self, id: String, enabled: bool) -> Result<()> {
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": format!("apps.{id}.enabled"),
-                "value": enabled,
-                "mergeStrategy": "replace",
-            }),
+        write_config_value(
+            &self.state,
+            &format!("apps.{id}.enabled"),
+            Value::Bool(enabled),
         )?;
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": format!("apps.{id}.disabled_reason"),
-                "value": if enabled { Value::Null } else { Value::String("user".to_string()) },
-                "mergeStrategy": "replace",
-            }),
+        write_config_value(
+            &self.state,
+            &format!("apps.{id}.disabled_reason"),
+            if enabled {
+                Value::Null
+            } else {
+                Value::String("user".to_string())
+            },
         )?;
         if let Ok(snapshot) = fetch_connectors(&self.state) {
             self.widget.ui_mut().set_connectors_snapshot(Some(snapshot));
@@ -2016,14 +1987,7 @@ impl App {
 
     fn start_compaction(&mut self) -> Result<()> {
         let thread_id = self.widget.ui_mut().session_id.clone();
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "thread/compact/start",
-            json!({
-                "threadId": thread_id,
-            }),
-        )?;
+        start_compaction(&self.state, &thread_id)?;
         self.widget
             .ui_mut()
             .set_status_message(Some("compacting context...".to_string()));
@@ -2054,23 +2018,7 @@ impl App {
 
     fn start_review_with_target(&mut self, target: Value) -> Result<()> {
         let thread_id = self.widget.ui_mut().session_id.clone();
-        let response = app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "review/start",
-            json!({
-                "threadId": thread_id,
-                "target": target,
-            }),
-        )?;
-
-        if let Some(turn_id) = response
-            .result
-            .get("turn")
-            .and_then(|turn| turn.get("id"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-        {
+        if let Some(turn_id) = start_review(&self.state, &thread_id, target)? {
             self.widget.ui_mut().active_turn_id = Some(turn_id);
         }
         self.widget
@@ -2083,15 +2031,10 @@ impl App {
         &mut self,
         approval_policy: codex_core::protocol::AskForApproval,
     ) -> Result<()> {
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": "approval_policy",
-                "value": approval_policy.to_string(),
-                "mergeStrategy": "replace",
-            }),
+        write_config_value(
+            &self.state,
+            "approval_policy",
+            Value::String(approval_policy.to_string()),
         )?;
         self.widget.ui_mut().set_status_message(Some(format!(
             "approval policy updated to {}",
@@ -2111,15 +2054,10 @@ impl App {
             codex_core::protocol::SandboxPolicy::ExternalSandbox { .. } => "workspace-write",
         };
 
-        app_server_rpc_request(
-            &self.state.config.app_server_endpoint,
-            self.state.config.auth_token.as_deref(),
-            "config/value/write",
-            json!({
-                "keyPath": "sandbox_mode",
-                "value": sandbox_mode,
-                "mergeStrategy": "replace",
-            }),
+        write_config_value(
+            &self.state,
+            "sandbox_mode",
+            Value::String(sandbox_mode.to_string()),
         )?;
         self.widget
             .ui_mut()
@@ -2180,23 +2118,11 @@ impl StatusRuntime {
     }
 
     fn refresh_from_server(&mut self, state: &CliState, config: &mut crate::config::Config) {
-        if let Ok(response) = app_server_rpc_request(
-            &state.config.app_server_endpoint,
-            state.config.auth_token.as_deref(),
-            "config/read",
-            json!({
-                "includeLayers": false,
-                "cwd": config.cwd.display().to_string(),
-            }),
-        ) {
-            let cfg = response.result.get("config");
-            if let Some(model) = cfg.and_then(|c| c.get("model")).and_then(Value::as_str) {
+        if let Ok(Some(cfg)) = read_config_snapshot_for_cwd(state, Some(config.cwd.as_path())) {
+            if let Some(model) = cfg.get("model").and_then(Value::as_str) {
                 config.model = Some(model.to_string());
             }
-            if let Some(summary) = cfg
-                .and_then(|c| c.get("modelReasoningSummary"))
-                .and_then(Value::as_str)
-            {
+            if let Some(summary) = cfg.get("modelReasoningSummary").and_then(Value::as_str) {
                 config.model_reasoning_summary = match summary.to_ascii_lowercase().as_str() {
                     "auto" => codex_core::config::ReasoningSummary::Auto,
                     "concise" => codex_core::config::ReasoningSummary::Concise,
@@ -2205,45 +2131,36 @@ impl StatusRuntime {
                 };
             }
             if let Some(approval) = cfg
-                .and_then(|c| c.get("approval_policy").or_else(|| c.get("approvalPolicy")))
+                .get("approval_policy")
+                .or_else(|| cfg.get("approvalPolicy"))
                 .and_then(parse_approval_policy_value)
             {
                 config.permissions.approval_policy.0 = approval;
             }
             if let Some(sandbox) = cfg
-                .and_then(|c| c.get("sandbox_mode").or_else(|| c.get("sandboxMode")))
+                .get("sandbox_mode")
+                .or_else(|| cfg.get("sandboxMode"))
                 .and_then(parse_sandbox_policy_value)
             {
                 config.permissions.sandbox_policy.0 = sandbox;
             }
-            if let Some(reasoning_effort) = parse_reasoning_effort(
-                response
-                    .result
-                    .get("config")
-                    .and_then(|cfg| cfg.get("modelReasoningEffort")),
-            ) {
+            if let Some(reasoning_effort) = parse_reasoning_effort(cfg.get("modelReasoningEffort"))
+            {
                 self.session_reasoning_effort = Some(reasoning_effort);
             }
         }
 
-        if let Ok(response) = app_server_rpc_request(
-            &state.config.app_server_endpoint,
-            state.config.auth_token.as_deref(),
-            "account/rateLimits/read",
-            json!({}),
-        ) {
-            if let Some(by_limit_id) = response
-                .result
+        if let Ok(rate_limits) = read_rate_limits(state) {
+            if let Some(by_limit_id) = rate_limits
                 .get("rateLimitsByLimitId")
                 .and_then(Value::as_object)
             {
                 for snapshot in by_limit_id.values() {
                     self.apply_rate_limit_snapshot(snapshot);
                 }
-            } else if let Some(snapshot) = response
-                .result
+            } else if let Some(snapshot) = rate_limits
                 .get("rateLimits")
-                .or_else(|| response.result.get("rate_limits"))
+                .or_else(|| rate_limits.get("rate_limits"))
             {
                 self.apply_rate_limit_snapshot(snapshot);
             }
@@ -2257,18 +2174,9 @@ impl StatusRuntime {
         crate::AuthManager,
         Option<codex_protocol::account::PlanType>,
     ) {
-        let Ok(response) = app_server_rpc_request(
-            &state.config.app_server_endpoint,
-            state.config.auth_token.as_deref(),
-            "account/read",
-            json!({
-                "refreshToken": false
-            }),
-        ) else {
+        let Ok(Some(account)) = read_account_snapshot(state, false) else {
             return (crate::AuthManager::default(), None);
         };
-
-        let account = response.result.get("account").unwrap_or(&response.result);
         if !account.is_object() {
             return (crate::AuthManager::default(), None);
         }
@@ -2651,54 +2559,17 @@ fn handle_app_server_approval_decision(
 
 fn fetch_skills_for_cwd(state: &CliState) -> Result<Vec<codex_core::skills::model::SkillMetadata>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "skills/list",
-        json!({
-            "cwds": [cwd],
-            "forceReload": false
-        }),
-    )?;
-    let mut out = Vec::new();
-    let data = response
-        .result
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for entry in data {
-        let Some(skills) = entry.get("skills").and_then(Value::as_array) else {
-            continue;
-        };
-        for skill in skills {
-            let Some(name) = skill.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let description = skill
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let path = skill
-                .get("path")
-                .and_then(Value::as_str)
-                .map(PathBuf::from)
-                .unwrap_or_default();
-            out.push(codex_core::skills::model::SkillMetadata {
-                name: name.to_string(),
-                description,
-                short_description: skill
-                    .get("shortDescription")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                interface: None,
-                path,
-                scope: codex_core::protocol::SkillScope::User,
-            });
-        }
-    }
-    Ok(out)
+    Ok(list_skills_for_cwd(state, &cwd, false)?
+        .into_iter()
+        .map(|skill| codex_core::skills::model::SkillMetadata {
+            name: skill.name,
+            description: skill.description,
+            short_description: skill.short_description,
+            interface: None,
+            path: skill.path,
+            scope: codex_core::protocol::SkillScope::User,
+        })
+        .collect())
 }
 
 struct SkillToggleEntry {
@@ -2710,122 +2581,20 @@ struct SkillToggleEntry {
 
 fn fetch_skills_toggle_entries(state: &CliState) -> Result<Vec<SkillToggleEntry>> {
     let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "skills/list",
-        json!({
-            "cwds": [cwd],
-            "forceReload": false
-        }),
-    )?;
-    let mut out = Vec::new();
-    let data = response
-        .result
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for entry in data {
-        let Some(skills) = entry.get("skills").and_then(Value::as_array) else {
-            continue;
-        };
-        for skill in skills {
-            let Some(name) = skill.get("name").and_then(Value::as_str) else {
-                continue;
-            };
-            let path = skill
-                .get("path")
-                .and_then(Value::as_str)
-                .map(std::path::PathBuf::from)
-                .unwrap_or_default();
-            let description = skill
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let enabled = skill
-                .get("enabled")
-                .and_then(Value::as_bool)
-                .unwrap_or(true);
-            out.push(SkillToggleEntry {
-                path,
-                name: name.to_string(),
-                description,
-                enabled,
-            });
-        }
-    }
-    Ok(out)
+    Ok(list_skills_for_cwd(state, &cwd, false)?
+        .into_iter()
+        .map(|skill| SkillToggleEntry {
+            path: skill.path,
+            name: skill.name,
+            description: skill.description,
+            enabled: skill.enabled,
+        })
+        .collect())
 }
 
 fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnapshot> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "app/list",
-        json!({}),
-    )?;
-    let connectors = response
-        .result
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|app| {
-            Some(codex_chatgpt::connectors::AppInfo {
-                id: app.get("id")?.as_str()?.to_string(),
-                name: app.get("name")?.as_str()?.to_string(),
-                description: app
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                logo_url: app
-                    .get("logoUrl")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                logo_url_dark: app
-                    .get("logoUrlDark")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                distribution_channel: app
-                    .get("distributionChannel")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                branding: app.get("branding").cloned(),
-                app_metadata: app.get("appMetadata").cloned(),
-                labels: app
-                    .get("labels")
-                    .and_then(|labels| serde_json::from_value(labels.clone()).ok()),
-                install_url: app
-                    .get("installUrl")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
-                is_accessible: app
-                    .get("isAccessible")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                is_enabled: app
-                    .get("isEnabled")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-            })
-        })
-        .collect();
+    let connectors = list_connectors(state)?;
     Ok(crate::app_event::ConnectorsSnapshot { connectors })
-}
-
-fn clean_background_terminals(state: &CliState, thread_id: &str) -> Result<()> {
-    app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "thread/backgroundTerminals/clean",
-        json!({
-            "threadId": thread_id,
-        }),
-    )?;
-    Ok(())
 }
 
 #[derive(Clone)]
@@ -2895,21 +2664,7 @@ fn git_recent_commits(cwd: &std::path::Path, limit: usize) -> Vec<CommitPickerEn
 }
 
 fn fetch_mcp_tools_output(state: &CliState) -> Result<crate::history_cell::PlainHistoryCell> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "mcpServerStatus/list",
-        json!({
-            "limit": 200,
-        }),
-    )?;
-
-    let statuses = response
-        .result
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let statuses = list_mcp_server_statuses(state, 200)?;
     if statuses.is_empty() {
         return Ok(crate::history_cell::empty_mcp_output());
     }
