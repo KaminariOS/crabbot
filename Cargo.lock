@@ -352,6 +352,7 @@ dependencies = [
 [[package]]
 name = "codex-utils-fuzzy-match"
 version = "0.0.0"
+source = "git+https://github.com/openai/codex.git?rev=82d82d9ca#82d82d9ca5b73f6ebc62c3eba1e499a8f58bbcd6"
 
 [[package]]
 name = "color-eyre"

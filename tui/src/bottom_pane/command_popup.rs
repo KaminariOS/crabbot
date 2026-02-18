@@ -569,4 +569,22 @@ mod tests {
             other => panic!("expected personality to be selected for exact match, got {other:?}"),
         }
     }
+
+    #[test]
+    fn debug_commands_are_hidden_from_popup() {
+        let popup = CommandPopup::new(Vec::new(), CommandPopupFlags::default());
+        let cmds: Vec<&str> = popup
+            .filtered_items()
+            .into_iter()
+            .filter_map(|item| match item {
+                CommandItem::Builtin(cmd) => Some(cmd.command()),
+                CommandItem::UserPrompt(_) => None,
+            })
+            .collect();
+
+        assert!(
+            !cmds.iter().any(|name| name.starts_with("debug")),
+            "expected no /debug* command in popup menu, got {cmds:?}"
+        );
+    }
 }

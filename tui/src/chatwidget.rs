@@ -119,6 +119,9 @@ impl UnifiedExecWaitState {
     }
 }
 
+const DEFAULT_STATUS_LINE_ITEMS: [&str; 3] =
+    ["model-with-reasoning", "context-remaining", "current-dir"];
+
 #[derive(Clone, Debug)]
 struct UnifiedExecWaitStreak {
     process_id: String,
@@ -273,6 +276,7 @@ impl LiveAttachTui {
         });
         let mut bottom_pane = bottom_pane;
         bottom_pane.set_collaboration_modes_enabled(true);
+        bottom_pane.set_status_line_enabled(!DEFAULT_STATUS_LINE_ITEMS.is_empty());
         Self {
             session_id,
             history_cells: Vec::new(),
@@ -2383,8 +2387,9 @@ impl LiveAttachTui {
     }
 
     pub(crate) fn open_status_line_setup(&mut self) {
+        let configured_status_line_items = self.configured_status_line_items();
         self.bottom_pane
-            .open_status_line_setup(self.status_line_items.as_deref());
+            .open_status_line_setup(Some(configured_status_line_items.as_slice()));
     }
 
     pub(crate) fn show_selection_view(&mut self, params: crate::bottom_pane::SelectionViewParams) {
@@ -3028,7 +3033,7 @@ impl LiveAttachTui {
 
     pub(crate) fn setup_status_line(&mut self, items: Vec<crate::bottom_pane::StatusLineItem>) {
         let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
-        self.status_line_items = if ids.is_empty() { None } else { Some(ids) };
+        self.status_line_items = Some(ids);
         self.status_line_invalid_items_warned = false;
         self.refresh_status_line();
         self.status_message = Some("status line updated".to_string());
@@ -3054,7 +3059,7 @@ impl LiveAttachTui {
             self.status_line_invalid_items_warned = true;
         }
 
-        let enabled = !items.is_empty();
+        let enabled = !self.configured_status_line_items().is_empty();
         self.bottom_pane.set_status_line_enabled(enabled);
         if !enabled {
             self.bottom_pane.set_status_line(None);
@@ -3255,18 +3260,30 @@ impl LiveAttachTui {
     fn status_line_items_with_invalids(
         &self,
     ) -> (Vec<crate::bottom_pane::StatusLineItem>, Vec<String>) {
+        let configured_items = self.configured_status_line_items();
         let mut items = Vec::new();
         let mut invalid = Vec::new();
-        let Some(config_items) = self.status_line_items.as_ref() else {
-            return (items, invalid);
-        };
-        for item_id in config_items {
+        let mut invalid_seen = HashSet::new();
+        for item_id in configured_items {
             match item_id.parse::<crate::bottom_pane::StatusLineItem>() {
                 Ok(item) => items.push(item),
-                Err(_) => invalid.push(item_id.clone()),
+                Err(_) => {
+                    if invalid_seen.insert(item_id.clone()) {
+                        invalid.push(format!(r#""{item_id}""#));
+                    }
+                }
             }
         }
         (items, invalid)
+    }
+
+    fn configured_status_line_items(&self) -> Vec<String> {
+        self.status_line_items.clone().unwrap_or_else(|| {
+            DEFAULT_STATUS_LINE_ITEMS
+                .iter()
+                .map(ToString::to_string)
+                .collect()
+        })
     }
 
     fn status_line_cwd(&self) -> PathBuf {

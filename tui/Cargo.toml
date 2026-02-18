@@ -12,7 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
-codex-utils-fuzzy-match = { path = "/home/kosumi/repos/codex/codex-rs/utils/fuzzy-match" }
+codex-utils-fuzzy-match = { git = "https://github.com/openai/codex.git", rev = "82d82d9ca", package = "codex-utils-fuzzy-match" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 dunce = "1.0.5"
