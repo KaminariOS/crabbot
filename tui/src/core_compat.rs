@@ -2128,6 +2128,133 @@ pub(crate) fn list_threads_page(
     Ok(ThreadListPage { items, next_cursor })
 }
 
+pub(crate) fn list_collaboration_modes(
+    state: &CliState,
+) -> Result<Vec<codex_protocol::config_types::CollaborationModeMask>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "collaborationMode/list",
+        json!({}),
+    )?;
+    let data = response
+        .result
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let modes: Vec<codex_protocol::config_types::CollaborationModeMask> =
+        serde_json::from_value(data)?;
+    Ok(modes)
+}
+
+pub(crate) fn read_config_snapshot(state: &CliState) -> Result<Option<Value>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "config/read",
+        json!({
+            "includeLayers": false,
+        }),
+    )?;
+    Ok(response.result.get("config").cloned())
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExperimentalFeatureEntry {
+    pub(crate) name: String,
+    pub(crate) stage: String,
+    pub(crate) display_name: Option<String>,
+    pub(crate) description: Option<String>,
+    pub(crate) enabled: bool,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ExperimentalFeaturePage {
+    pub(crate) data: Vec<ExperimentalFeatureEntry>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+pub(crate) fn list_experimental_features_page(
+    state: &CliState,
+    cursor: Option<String>,
+) -> Result<ExperimentalFeaturePage> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "experimentalFeature/list",
+        json!({
+            "cursor": cursor,
+        }),
+    )?;
+    let payload: ExperimentalFeaturePage = serde_json::from_value(response.result)?;
+    Ok(payload)
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ModelListEntry {
+    pub(crate) slug: String,
+    pub(crate) display_name: String,
+    pub(crate) description: String,
+}
+
+pub(crate) fn list_models(
+    state: &CliState,
+    include_hidden: bool,
+    limit: usize,
+) -> Result<Vec<ModelListEntry>> {
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "model/list",
+        json!({
+            "includeHidden": include_hidden,
+            "limit": limit,
+        }),
+    )?;
+
+    let models = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let mut out = Vec::new();
+    for model in models {
+        let slug = model
+            .get("model")
+            .or_else(|| model.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if slug.is_empty() {
+            continue;
+        }
+
+        let display_name = model
+            .get("displayName")
+            .or_else(|| model.get("display_name"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| slug.clone());
+        let description = model
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        out.push(ModelListEntry {
+            slug,
+            display_name,
+            description,
+        });
+    }
+    Ok(out)
+}
+
 pub(crate) fn resume_thread_detailed(
     state: &CliState,
     thread_id: &str,

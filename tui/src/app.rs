@@ -13,7 +13,11 @@ pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::fork_thread;
 pub(super) use crate::core_compat::interrupt_turn;
+pub(super) use crate::core_compat::list_collaboration_modes;
+pub(super) use crate::core_compat::list_experimental_features_page;
+pub(super) use crate::core_compat::list_models;
 pub(super) use crate::core_compat::list_threads_page;
+pub(super) use crate::core_compat::read_config_snapshot;
 pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread_detailed;
 pub(super) use crate::core_compat::set_thread_name;
@@ -3030,38 +3034,9 @@ fn fetch_resume_threads(state: &CliState, show_all: bool) -> Result<Vec<ResumeTh
 fn fetch_collaboration_modes(
     state: &CliState,
 ) -> Result<Vec<codex_protocol::config_types::CollaborationModeMask>> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "collaborationMode/list",
-        json!({}),
-    )?;
-    let data = response
-        .result
-        .get("data")
-        .cloned()
-        .unwrap_or(Value::Array(Vec::new()));
-    let mut modes: Vec<codex_protocol::config_types::CollaborationModeMask> =
-        serde_json::from_value(data)?;
+    let mut modes = list_collaboration_modes(state)?;
     modes.retain(|mask| mask.mode.is_some_and(|mode| mode.is_tui_visible()));
     Ok(modes)
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExperimentalFeatureListResponsePayload {
-    data: Vec<ExperimentalFeaturePayload>,
-    next_cursor: Option<String>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ExperimentalFeaturePayload {
-    name: String,
-    stage: String,
-    display_name: Option<String>,
-    description: Option<String>,
-    enabled: bool,
 }
 
 fn fetch_experimental_features(
@@ -3070,16 +3045,7 @@ fn fetch_experimental_features(
     let mut cursor: Option<String> = None;
     let mut out = Vec::new();
     loop {
-        let response = app_server_rpc_request(
-            &state.config.app_server_endpoint,
-            state.config.auth_token.as_deref(),
-            "experimentalFeature/list",
-            json!({
-                "cursor": cursor,
-            }),
-        )?;
-        let payload: ExperimentalFeatureListResponsePayload =
-            serde_json::from_value(response.result.clone())?;
+        let payload = list_experimental_features_page(state, cursor)?;
 
         for feature in payload.data {
             let Some(mapped_feature) = codex_core::features::Feature::from_key(&feature.name)
@@ -3106,71 +3072,20 @@ fn fetch_experimental_features(
 }
 
 fn fetch_model_picker_entries(state: &CliState) -> Result<Vec<ModelPickerEntry>> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "model/list",
-        json!({
-            "includeHidden": false,
-            "limit": 100,
-        }),
-    )?;
-
-    let models = response
-        .result
-        .get("data")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-
-    let mut out = Vec::new();
-    for model in models {
-        let slug = model
-            .get("model")
-            .or_else(|| model.get("id"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .trim()
-            .to_string();
-        if slug.is_empty() {
-            continue;
-        }
-
-        let display_name = model
-            .get("displayName")
-            .or_else(|| model.get("display_name"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string)
-            .unwrap_or_else(|| slug.clone());
-        let description = model
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        out.push(ModelPickerEntry {
-            slug,
-            display_name,
-            description,
-        });
-    }
-    Ok(out)
+    Ok(list_models(state, false, 100)?
+        .into_iter()
+        .map(|model| ModelPickerEntry {
+            slug: model.slug,
+            display_name: model.display_name,
+            description: model.description,
+        })
+        .collect())
 }
 
 fn fetch_current_model_from_config(state: &CliState) -> Option<String> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "config/read",
-        json!({
-            "includeLayers": false,
-        }),
-    )
-    .ok()?;
-
-    response
-        .result
-        .get("config")
-        .and_then(|cfg| cfg.get("model"))
+    let config = read_config_snapshot(state).ok().flatten()?;
+    config
+        .get("model")
         .and_then(Value::as_str)
         .map(ToString::to_string)
 }
@@ -3210,17 +3125,7 @@ fn fetch_current_permissions_from_config(
     codex_core::protocol::AskForApproval,
     codex_core::protocol::SandboxPolicy,
 )> {
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "config/read",
-        json!({
-            "includeLayers": false,
-        }),
-    )
-    .ok()?;
-
-    let config = response.result.get("config")?;
+    let config = read_config_snapshot(state).ok().flatten()?;
     let approval = config
         .get("approval_policy")
         .or_else(|| config.get("approvalPolicy"))
