@@ -5,37 +5,6 @@ use crate::app_event_sender::AppEventSender as WidgetAppEventSender;
 use crate::bottom_pane::InputResult;
 use crate::chatwidget::ChatWidget;
 use crate::chatwidget::LiveAttachTui;
-pub(super) use crate::core_compat::AppEvent;
-pub(super) use crate::core_compat::AppEventSender;
-pub(super) use crate::core_compat::AppExitInfo;
-pub(super) use crate::core_compat::ExitMode;
-pub(super) use crate::core_compat::ExitReason;
-pub(super) use crate::core_compat::LiveTuiAction;
-pub(super) use crate::core_compat::clean_background_terminals;
-pub(super) use crate::core_compat::fork_thread;
-pub(super) use crate::core_compat::interrupt_turn;
-pub(super) use crate::core_compat::list_collaboration_modes;
-pub(super) use crate::core_compat::list_connectors;
-pub(super) use crate::core_compat::list_experimental_features_page;
-pub(super) use crate::core_compat::list_mcp_server_statuses;
-pub(super) use crate::core_compat::list_models;
-pub(super) use crate::core_compat::list_skills_for_cwd;
-pub(super) use crate::core_compat::list_threads_page;
-pub(super) use crate::core_compat::read_account as read_account_snapshot;
-pub(super) use crate::core_compat::read_config_snapshot;
-pub(super) use crate::core_compat::read_config_snapshot_for_cwd;
-pub(super) use crate::core_compat::read_rate_limits;
-pub(super) use crate::core_compat::respond_to_approval;
-pub(super) use crate::core_compat::respond_to_request_json;
-pub(super) use crate::core_compat::resume_thread_detailed;
-pub(super) use crate::core_compat::set_thread_name;
-pub(super) use crate::core_compat::start_compaction;
-pub(super) use crate::core_compat::start_review;
-pub(super) use crate::core_compat::start_thread;
-pub(super) use crate::core_compat::start_turn_with_elements_and_collaboration;
-pub(super) use crate::core_compat::stream_events;
-pub(super) use crate::core_compat::write_config_value;
-pub(super) use crate::core_compat::write_skill_enabled;
 use crate::exec_cell::CommandOutput as ExecCommandOutput;
 use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
@@ -46,7 +15,38 @@ use crate::resume_picker::SessionSelection;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
 use crate::version::CODEX_CLI_VERSION;
+pub(super) use codex_core::AppEvent;
+pub(super) use codex_core::AppEventSender;
+pub(super) use codex_core::AppExitInfo;
+pub(super) use codex_core::ExitMode;
+pub(super) use codex_core::ExitReason;
+pub(super) use codex_core::LiveTuiAction;
+pub(super) use codex_core::clean_background_terminals;
+pub(super) use codex_core::fork_thread;
+pub(super) use codex_core::interrupt_turn;
+pub(super) use codex_core::list_collaboration_modes;
+pub(super) use codex_core::list_connectors;
+pub(super) use codex_core::list_experimental_features_page;
+pub(super) use codex_core::list_mcp_server_statuses;
+pub(super) use codex_core::list_models;
+pub(super) use codex_core::list_skills_for_cwd;
+pub(super) use codex_core::list_threads_page;
 use codex_core::protocol::ExecCommandSource;
+pub(super) use codex_core::read_account as read_account_snapshot;
+pub(super) use codex_core::read_config_snapshot;
+pub(super) use codex_core::read_config_snapshot_for_cwd;
+pub(super) use codex_core::read_rate_limits;
+pub(super) use codex_core::respond_to_approval;
+pub(super) use codex_core::respond_to_request_json;
+pub(super) use codex_core::resume_thread_detailed;
+pub(super) use codex_core::set_thread_name;
+pub(super) use codex_core::start_compaction;
+pub(super) use codex_core::start_review;
+pub(super) use codex_core::start_thread;
+pub(super) use codex_core::start_turn_with_elements_and_collaboration;
+pub(super) use codex_core::stream_events;
+pub(super) use codex_core::write_config_value;
+pub(super) use codex_core::write_skill_enabled;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
@@ -70,7 +70,7 @@ fn determine_alt_screen_mode(no_alt_screen: bool) -> bool {
 ///
 /// Mirrors upstream `App` from `app.rs` in structure: owns the `ChatWidget`,
 /// tracks the active thread, and drives the terminal event loop. All backend
-/// calls go through `core_compat` instead of `codex-core`.
+/// calls go through the `codex_core::app_server_shim` transport seam.
 pub(crate) struct App {
     /// The active chat widget.
     widget: ChatWidget,
@@ -461,7 +461,7 @@ impl App {
         thread_id: String,
         status_message: &str,
         announce_switch: bool,
-        replay_events: Vec<crate::core_compat::UiEvent>,
+        replay_events: Vec<codex_core::UiEvent>,
     ) {
         let previous_thread = self.widget.ui_mut().session_id.clone();
         let changed = previous_thread != thread_id;
@@ -2441,7 +2441,7 @@ fn resolve_initial_thread_id(
     state: &CliState,
     explicit_thread_id: Option<String>,
     cached_thread_id: Option<String>,
-) -> Result<(String, String, Vec<crate::core_compat::UiEvent>)> {
+) -> Result<(String, String, Vec<codex_core::UiEvent>)> {
     if let Some(thread_id) = explicit_thread_id
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())

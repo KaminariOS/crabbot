@@ -1904,6 +1904,43 @@ mod cli;
 mod clipboard_paste;
 mod color;
 mod core_compat;
+pub(crate) use crate::core_compat::AppEvent;
+pub(crate) use crate::core_compat::AppEventSender;
+pub(crate) use crate::core_compat::AppExitInfo;
+pub(crate) use crate::core_compat::ExitMode;
+pub(crate) use crate::core_compat::ExitReason;
+pub(crate) use crate::core_compat::LiveTuiAction;
+pub(crate) use crate::core_compat::UiApprovalRequest;
+pub(crate) use crate::core_compat::UiEvent;
+pub(crate) use crate::core_compat::clean_background_terminals;
+pub(crate) use crate::core_compat::decode_app_server_wire_line;
+pub(crate) use crate::core_compat::fork_thread;
+pub(crate) use crate::core_compat::interrupt_turn;
+pub(crate) use crate::core_compat::list_collaboration_modes;
+pub(crate) use crate::core_compat::list_connectors;
+pub(crate) use crate::core_compat::list_experimental_features_page;
+pub(crate) use crate::core_compat::list_mcp_server_statuses;
+pub(crate) use crate::core_compat::list_models;
+pub(crate) use crate::core_compat::list_skills_for_cwd;
+pub(crate) use crate::core_compat::list_threads_page;
+pub(crate) use crate::core_compat::map_codex_protocol_event;
+pub(crate) use crate::core_compat::map_legacy_stream_events;
+pub(crate) use crate::core_compat::map_rpc_stream_events;
+pub(crate) use crate::core_compat::read_account;
+pub(crate) use crate::core_compat::read_config_snapshot;
+pub(crate) use crate::core_compat::read_config_snapshot_for_cwd;
+pub(crate) use crate::core_compat::read_rate_limits;
+pub(crate) use crate::core_compat::respond_to_approval;
+pub(crate) use crate::core_compat::respond_to_request_json;
+pub(crate) use crate::core_compat::resume_thread_detailed;
+pub(crate) use crate::core_compat::set_thread_name;
+pub(crate) use crate::core_compat::start_compaction;
+pub(crate) use crate::core_compat::start_review;
+pub(crate) use crate::core_compat::start_thread;
+pub(crate) use crate::core_compat::start_turn_with_elements_and_collaboration;
+pub(crate) use crate::core_compat::stream_events;
+pub(crate) use crate::core_compat::write_config_value;
+pub(crate) use crate::core_compat::write_skill_enabled;
 mod custom_terminal;
 mod cwd_prompt;
 mod diff_render;
@@ -2253,9 +2290,7 @@ impl AppServerWsClient {
     }
 
     fn ingest_wire_line(&mut self, raw_line: &str) -> Result<()> {
-        if let Some(envelope) =
-            crate::core_compat::decode_app_server_wire_line(raw_line, self.next_sequence)?
-        {
+        if let Some(envelope) = crate::decode_app_server_wire_line(raw_line, self.next_sequence)? {
             if let DaemonRpcStreamEvent::ServerRequest(request) = &envelope.event {
                 self.respond_to_server_request(request)?;
             }
