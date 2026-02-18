@@ -13,6 +13,7 @@ pub(super) use crate::core_compat::ExitReason;
 pub(super) use crate::core_compat::LiveTuiAction;
 pub(super) use crate::core_compat::fork_thread;
 pub(super) use crate::core_compat::interrupt_turn;
+pub(super) use crate::core_compat::list_threads_page;
 pub(super) use crate::core_compat::respond_to_approval;
 pub(super) use crate::core_compat::resume_thread_detailed;
 pub(super) use crate::core_compat::set_thread_name;
@@ -3002,38 +3003,26 @@ struct PermissionsPresetEntry {
 }
 
 fn fetch_resume_threads(state: &CliState, show_all: bool) -> Result<Vec<ResumeThreadEntry>> {
-    let mut params = json!({
-        "sortKey": "updated_at",
-        "limit": 50,
-        "archived": false,
-    });
-    if !show_all && let Ok(cwd) = std::env::current_dir() {
-        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
-    }
-    let response = app_server_rpc_request(
-        &state.config.app_server_endpoint,
-        state.config.auth_token.as_deref(),
-        "thread/list",
-        params,
+    let filter_cwd = if show_all {
+        None
+    } else {
+        std::env::current_dir().ok()
+    };
+    let page = list_threads_page(
+        state,
+        None,
+        50,
+        codex_core::ThreadSortKey::UpdatedAt,
+        false,
+        filter_cwd,
     )?;
 
-    let Some(threads) = response.result.get("data").and_then(Value::as_array) else {
-        return Ok(Vec::new());
-    };
-
-    Ok(threads
-        .iter()
-        .filter_map(|thread| {
-            let thread_id = thread.get("id").and_then(Value::as_str)?.to_string();
-            let thread_name = thread
-                .get("threadName")
-                .or_else(|| thread.get("name"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string);
-            Some(ResumeThreadEntry {
-                thread_id,
-                thread_name,
-            })
+    Ok(page
+        .items
+        .into_iter()
+        .map(|thread| ResumeThreadEntry {
+            thread_id: thread.id,
+            thread_name: thread.thread_name,
         })
         .collect())
 }

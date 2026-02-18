@@ -2059,6 +2059,75 @@ pub(crate) struct ThreadResumeResult {
     pub(crate) replay_events: Vec<UiEvent>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct ThreadListEntry {
+    pub(crate) id: String,
+    pub(crate) thread_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ThreadListPage {
+    pub(crate) items: Vec<ThreadListEntry>,
+    pub(crate) next_cursor: Option<String>,
+}
+
+pub(crate) fn list_threads_page(
+    state: &CliState,
+    cursor: Option<String>,
+    limit: usize,
+    sort_key: codex_core::ThreadSortKey,
+    archived: bool,
+    filter_cwd: Option<std::path::PathBuf>,
+) -> Result<ThreadListPage> {
+    let sort_key = match sort_key {
+        codex_core::ThreadSortKey::CreatedAt => "created_at",
+        codex_core::ThreadSortKey::UpdatedAt => "updated_at",
+    };
+    let mut params = json!({
+        "cursor": cursor,
+        "limit": limit,
+        "sortKey": sort_key,
+        "archived": archived,
+    });
+    if let Some(cwd) = filter_cwd {
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
+
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/list",
+        params,
+    )?;
+
+    let items = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .map(|threads| {
+            threads
+                .iter()
+                .filter_map(|thread| {
+                    let id = thread.get("id").and_then(Value::as_str)?.to_string();
+                    let thread_name = thread
+                        .get("threadName")
+                        .or_else(|| thread.get("name"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string);
+                    Some(ThreadListEntry { id, thread_name })
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let next_cursor = response
+        .result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    Ok(ThreadListPage { items, next_cursor })
+}
+
 pub(crate) fn resume_thread_detailed(
     state: &CliState,
     thread_id: &str,
