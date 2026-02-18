@@ -37,41 +37,11 @@ use tokio_stream::StreamExt;
 
 const COMMIT_ANIMATION_TICK: Duration = crate::tui::TARGET_FRAME_INTERVAL;
 
-fn input_debug_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var("CRABBOT_INPUT_DEBUG")
-                .ok()
-                .as_deref()
-                .map(str::to_ascii_lowercase)
-                .as_deref(),
-            Some("1") | Some("true") | Some("yes") | Some("on")
-        )
-    })
-}
-
-fn log_app_input_debug(line: &str) {
-    if !input_debug_enabled() {
-        return;
-    }
-    use std::io::Write as _;
-    if let Ok(mut file) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open("/tmp/crabbot-input-debug-app.log")
-    {
-        let _ = writeln!(file, "{line}");
-    }
-}
-
-fn input_result_label(result: &InputResult) -> &'static str {
-    match result {
-        InputResult::Submitted { .. } => "Submitted",
-        InputResult::Queued { .. } => "Queued",
-        InputResult::Command(_) => "Command",
-        InputResult::CommandWithArgs(_, _, _) => "CommandWithArgs",
-        InputResult::None => "None",
+fn determine_alt_screen_mode(no_alt_screen: bool) -> bool {
+    if no_alt_screen {
+        false
+    } else {
+        std::env::var_os("ZELLIJ").is_none()
     }
 }
 
@@ -285,14 +255,6 @@ impl App {
     /// This mirrors upstream `App::run()` — sets up the terminal, enters the
     /// main loop, then restores the terminal on exit.
     pub(crate) async fn run(&mut self) -> Result<AppExitInfo> {
-        if input_debug_enabled() {
-            let _ = std::fs::remove_file("/tmp/crabbot-input-debug-app.log");
-            log_app_input_debug(&format!(
-                "[startup] debug enabled pid={} thread={}",
-                std::process::id(),
-                self.thread_id
-            ));
-        }
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(AppExitInfo {
                 thread_id: Some(self.thread_id.clone()),
@@ -302,6 +264,7 @@ impl App {
 
         let terminal = crate::tui::init().context("initialize tui terminal")?;
         let mut tui = crate::tui::Tui::new(terminal);
+        tui.set_alt_screen_enabled(determine_alt_screen_mode(self.no_alt_screen));
         if let Some(mode) = self.startup_picker.take() {
             match mode {
                 StartupPicker::Resume => {
@@ -383,7 +346,6 @@ impl App {
         tui: &mut crate::tui::Tui,
         event: crate::tui::TuiEvent,
     ) -> Result<LiveTuiAction> {
-        log_app_input_debug(&format!("[app] tui_event {:?}", event));
         if self.overlay.is_some() {
             if let Some(overlay) = self.overlay.as_mut() {
                 overlay.handle_event(tui, event)?;
@@ -664,7 +626,6 @@ impl App {
         tui: &mut crate::tui::Tui,
         key: crossterm::event::KeyEvent,
     ) -> Result<LiveTuiAction> {
-        log_app_input_debug(&format!("[app] key {:?}", key));
         if key.kind == KeyEventKind::Press
             && key.code == KeyCode::Esc
             && self.widget.ui_mut().bottom_pane_no_modal_or_popup_active()
@@ -731,14 +692,7 @@ impl App {
                     {
                         ui.toggle_shortcuts_overlay();
                     } else {
-                        let result = ui.handle_bottom_pane_key_event(key);
-                        log_app_input_debug(&format!(
-                            "[app] bottom_pane key={:?} kind={:?} result={}",
-                            key.code,
-                            key.kind,
-                            input_result_label(&result)
-                        ));
-                        match result {
+                        match ui.handle_bottom_pane_key_event(key) {
                             InputResult::Submitted {
                                 text,
                                 text_elements,
@@ -759,41 +713,27 @@ impl App {
                         }
                     }
                 }
-                _ => {
-                    let result = ui.handle_bottom_pane_key_event(key);
-                    log_app_input_debug(&format!(
-                        "[app] bottom_pane key={:?} kind={:?} result={}",
-                        key.code,
-                        key.kind,
-                        input_result_label(&result)
-                    ));
-                    match result {
-                        InputResult::Submitted {
-                            text,
-                            text_elements,
-                        }
-                        | InputResult::Queued {
-                            text,
-                            text_elements,
-                        } => {
-                            queued_submit = Some((text, text_elements));
-                        }
-                        InputResult::Command(cmd) => {
-                            queued_command = Some((cmd, None, Vec::new()));
-                        }
-                        InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                            queued_command = Some((cmd, Some(args), text_elements));
-                        }
-                        InputResult::None => {}
+                _ => match ui.handle_bottom_pane_key_event(key) {
+                    InputResult::Submitted {
+                        text,
+                        text_elements,
                     }
-                }
+                    | InputResult::Queued {
+                        text,
+                        text_elements,
+                    } => {
+                        queued_submit = Some((text, text_elements));
+                    }
+                    InputResult::Command(cmd) => {
+                        queued_command = Some((cmd, None, Vec::new()));
+                    }
+                    InputResult::CommandWithArgs(cmd, args, text_elements) => {
+                        queued_command = Some((cmd, Some(args), text_elements));
+                    }
+                    InputResult::None => {}
+                },
             }
-            let pending_events = ui.drain_bottom_pane_events();
-            log_app_input_debug(&format!(
-                "[app] drained_widget_events count={}",
-                pending_events.len()
-            ));
-            pending_events
+            ui.drain_bottom_pane_events()
         };
         for event in pending_widget_events {
             self.handle_widget_app_event(tui, event).await?;
