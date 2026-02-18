@@ -2707,6 +2707,11 @@ fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnap
                     .get("distributionChannel")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
+                branding: app.get("branding").cloned(),
+                app_metadata: app.get("appMetadata").cloned(),
+                labels: app
+                    .get("labels")
+                    .and_then(|labels| serde_json::from_value(labels.clone()).ok()),
                 install_url: app
                     .get("installUrl")
                     .and_then(Value::as_str)

@@ -991,6 +991,12 @@ mod codex_chatgpt_stub {
             pub logo_url: Option<String>,
             pub logo_url_dark: Option<String>,
             pub distribution_channel: Option<String>,
+            #[serde(default)]
+            pub branding: Option<serde_json::Value>,
+            #[serde(default)]
+            pub app_metadata: Option<serde_json::Value>,
+            #[serde(default)]
+            pub labels: Option<std::collections::HashMap<String, String>>,
             pub install_url: Option<String>,
             #[serde(default)]
             pub is_accessible: bool,
