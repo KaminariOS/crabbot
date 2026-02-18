@@ -495,6 +495,30 @@ pub mod protocol {
         Abort,
     }
 
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(tag = "type", rename_all = "camelCase")]
+    pub enum ReviewTarget {
+        UncommittedChanges,
+        BaseBranch {
+            branch: String,
+        },
+        Commit {
+            sha: String,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            title: Option<String>,
+        },
+        Custom {
+            instructions: String,
+        },
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub struct ReviewRequest {
+        pub target: ReviewTarget,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub user_facing_hint: Option<String>,
+    }
+
     /// Source of an exec command.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     #[serde(rename_all = "snake_case")]
@@ -527,6 +551,9 @@ pub mod protocol {
         UpdateMemories,
         UserInput {
             items: Vec<serde_json::Value>,
+        },
+        Review {
+            review_request: ReviewRequest,
         },
         ExecApproval {
             id: String,

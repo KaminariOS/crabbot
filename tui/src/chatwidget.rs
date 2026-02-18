@@ -2633,7 +2633,14 @@ impl LiveAttachTui {
                 if trimmed.is_empty() {
                     return;
                 }
-                tx.send(UiAppEvent::StartReviewCustomInstructions(trimmed));
+                tx.send(UiAppEvent::CodexOp(codex_core::protocol::Op::Review {
+                    review_request: codex_core::protocol::ReviewRequest {
+                        target: codex_core::protocol::ReviewTarget::Custom {
+                            instructions: trimmed,
+                        },
+                        user_facing_hint: None,
+                    },
+                }));
             }),
         );
         self.bottom_pane.show_view(Box::new(view));
@@ -2657,7 +2664,12 @@ impl LiveAttachTui {
             crate::bottom_pane::SelectionItem {
                 name: "Review uncommitted changes".to_string(),
                 actions: vec![Box::new(move |sender| {
-                    sender.send(UiAppEvent::StartReviewUncommitted);
+                    sender.send(UiAppEvent::CodexOp(codex_core::protocol::Op::Review {
+                        review_request: codex_core::protocol::ReviewRequest {
+                            target: codex_core::protocol::ReviewTarget::UncommittedChanges,
+                            user_facing_hint: None,
+                        },
+                    }));
                 })],
                 dismiss_on_select: true,
                 ..Default::default()
@@ -2702,7 +2714,14 @@ impl LiveAttachTui {
                 crate::bottom_pane::SelectionItem {
                     name: format!("{current_branch} -> {branch}"),
                     actions: vec![Box::new(move |sender| {
-                        sender.send(UiAppEvent::StartReviewBaseBranch(branch.clone()));
+                        sender.send(UiAppEvent::CodexOp(codex_core::protocol::Op::Review {
+                            review_request: codex_core::protocol::ReviewRequest {
+                                target: codex_core::protocol::ReviewTarget::BaseBranch {
+                                    branch: branch.clone(),
+                                },
+                                user_facing_hint: None,
+                            },
+                        }));
                     })],
                     dismiss_on_select: true,
                     search_value: Some(search_value),
@@ -2731,10 +2750,15 @@ impl LiveAttachTui {
                 crate::bottom_pane::SelectionItem {
                     name: subject.clone(),
                     actions: vec![Box::new(move |sender| {
-                        sender.send(UiAppEvent::StartReviewCommit {
-                            sha: sha.clone(),
-                            title: Some(subject.clone()),
-                        });
+                        sender.send(UiAppEvent::CodexOp(codex_core::protocol::Op::Review {
+                            review_request: codex_core::protocol::ReviewRequest {
+                                target: codex_core::protocol::ReviewTarget::Commit {
+                                    sha: sha.clone(),
+                                    title: Some(subject.clone()),
+                                },
+                                user_facing_hint: None,
+                            },
+                        }));
                     })],
                     dismiss_on_select: true,
                     search_value: Some(search_value),

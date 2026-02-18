@@ -4161,10 +4161,10 @@ async fn review_commit_picker_shows_subjects_without_timestamps() {
     );
 }
 
-/// Submitting the custom prompt view sends a shimmed review-start app event
-/// with trimmed instructions.
+/// Submitting the custom prompt view sends Op::Review with the typed prompt
+/// and uses the same text for the user-facing hint.
 #[tokio::test]
-async fn custom_prompt_submit_sends_review_start_event() {
+async fn custom_prompt_submit_sends_review_op() {
     let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
 
     chat.show_review_custom_prompt();
@@ -4172,11 +4172,19 @@ async fn custom_prompt_submit_sends_review_start_event() {
     chat.handle_paste("  please audit dependencies  ".to_string());
     chat.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
-    // Expect shimmed review-start event with trimmed prompt
+    // Expect AppEvent::CodexOp(Op::Review { .. }) with trimmed prompt
     let evt = rx.try_recv().expect("expected one app event");
     match evt {
-        AppEvent::StartReviewCustomInstructions(instructions) => {
-            assert_eq!(instructions, "please audit dependencies".to_string());
+        AppEvent::CodexOp(Op::Review { review_request }) => {
+            assert_eq!(
+                review_request,
+                ReviewRequest {
+                    target: ReviewTarget::Custom {
+                        instructions: "please audit dependencies".to_string(),
+                    },
+                    user_facing_hint: None,
+                }
+            );
         }
         other => panic!("unexpected app event: {other:?}"),
     }

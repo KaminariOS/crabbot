@@ -314,21 +314,6 @@ pub(crate) enum AppEvent {
     /// Open the custom prompt option from the review popup.
     OpenReviewCustomPrompt,
 
-    /// Start review for uncommitted changes through app-server shim.
-    StartReviewUncommitted,
-
-    /// Start review against a base branch through app-server shim.
-    StartReviewBaseBranch(String),
-
-    /// Start review for a specific commit through app-server shim.
-    StartReviewCommit {
-        sha: String,
-        title: Option<String>,
-    },
-
-    /// Start review with custom instructions through app-server shim.
-    StartReviewCustomInstructions(String),
-
     /// Submit a user message with an explicit collaboration mask.
     SubmitUserMessageWithMode {
         text: String,

@@ -763,18 +763,6 @@ impl App {
             WidgetAppEvent::OpenReviewCustomPrompt => {
                 self.widget.ui_mut().show_review_custom_prompt();
             }
-            WidgetAppEvent::StartReviewUncommitted => {
-                self.start_review_uncommitted()?;
-            }
-            WidgetAppEvent::StartReviewBaseBranch(branch) => {
-                self.start_review_base_branch(&branch)?;
-            }
-            WidgetAppEvent::StartReviewCommit { sha, title } => {
-                self.start_review_commit(&sha, title.as_deref())?;
-            }
-            WidgetAppEvent::StartReviewCustomInstructions(instructions) => {
-                self.start_review_custom(&instructions)?;
-            }
             WidgetAppEvent::ForkCurrentSession => {
                 let active_thread_id = self.widget.ui_mut().session_id.clone();
                 if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
@@ -1157,6 +1145,23 @@ impl App {
             }
             codex_core::protocol::Op::Compact => {
                 self.start_compaction()?;
+            }
+            codex_core::protocol::Op::Review { review_request } => {
+                let target = match review_request.target {
+                    codex_core::protocol::ReviewTarget::UncommittedChanges => {
+                        json!({ "type": "uncommittedChanges" })
+                    }
+                    codex_core::protocol::ReviewTarget::BaseBranch { branch } => {
+                        json!({ "type": "baseBranch", "branch": branch })
+                    }
+                    codex_core::protocol::ReviewTarget::Commit { sha, title } => {
+                        json!({ "type": "commit", "sha": sha, "title": title })
+                    }
+                    codex_core::protocol::ReviewTarget::Custom { instructions } => {
+                        json!({ "type": "custom", "instructions": instructions })
+                    }
+                };
+                self.start_review_with_target(target)?;
             }
             codex_core::protocol::Op::ExecApproval { id, decision, .. } => {
                 let Some(request) = self.widget.ui_mut().take_pending_approval_for_operation(
