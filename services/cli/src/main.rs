@@ -77,11 +77,15 @@ const TUI_SLASH_PICKER_MAX_ROWS: usize = 4;
 #[command(
     name = "crabbot",
     about = "Crabbot Linux CLI",
-    version,
+    disable_version_flag = true,
     subcommand_negates_reqs = true,
     override_usage = "crabbot [OPTIONS] [PROMPT]\n       crabbot [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct Cli {
+    /// Print version
+    #[arg(short = 'V', long = "version", action = ArgAction::SetTrue)]
+    version: bool,
+
     #[command(flatten)]
     interactive: InteractiveArgs,
 
@@ -425,6 +429,10 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
+    if cli.version {
+        return Ok(version_output());
+    }
+
     let mut state = load_state(state_path)?;
     let mut should_persist = false;
 
@@ -451,6 +459,28 @@ fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
     }
 
     output.into_string()
+}
+
+fn version_output() -> String {
+    let crabbot = env!("CARGO_PKG_VERSION");
+    let codex = detect_codex_version().unwrap_or_else(|| "unavailable".to_string());
+    format!("crabbot {crabbot}\ncodex {codex}")
+}
+
+fn detect_codex_version() -> Option<String> {
+    let output = Command::new("codex").arg("--version").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())?;
+    if let Some(stripped) = line.strip_prefix("codex ") {
+        return Some(stripped.to_string());
+    }
+    Some(line.to_string())
 }
 
 fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
