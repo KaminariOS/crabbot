@@ -1438,7 +1438,7 @@ fn parse_user_message_item(
     let is_user_item = matches!(
         item_type.as_str(),
         "usermessage" | "user_message" | "user-message"
-    ) || role == "user";
+    ) || (item_type == "message" && role == "user");
     if !is_user_item {
         return None;
     }
@@ -2302,9 +2302,7 @@ fn parse_thread_turn_items_to_ui_events(thread: &Value) -> Vec<UiEvent> {
                     text,
                     text_elements,
                 });
-                continue;
-            }
-            if let Some(message) = parse_agent_message_text(item) {
+            } else if let Some(message) = parse_agent_message_text(item) {
                 last_agent_message = Some(message.clone());
                 events.push(UiEvent::AgentMessage { message });
             }
@@ -2336,7 +2334,7 @@ fn parse_agent_message_text(item: &Value) -> Option<String> {
     let is_agent_item = matches!(
         item_type.as_str(),
         "agentmessage" | "agent_message" | "agent-message"
-    ) || role == "assistant";
+    ) || (item_type == "message" && role == "assistant");
     if !is_agent_item {
         return None;
     }
