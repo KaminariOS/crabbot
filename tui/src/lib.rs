@@ -1907,6 +1907,7 @@ mod markdown_stream;
 mod mention_codec;
 mod model_migration;
 mod notifications;
+mod pager_overlay;
 mod render;
 mod resume_picker;
 mod selection_list;

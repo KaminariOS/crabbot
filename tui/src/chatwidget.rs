@@ -52,8 +52,6 @@ use crate::*;
 use codex_file_search::FileMatch;
 use codex_utils_fuzzy_match::fuzzy_match;
 use crossterm::event::KeyEvent;
-use crossterm::event::MouseEvent;
-use crossterm::event::MouseEventKind;
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use std::any::TypeId;
@@ -217,7 +215,6 @@ pub(crate) struct LiveAttachTui {
     shortcuts_overlay_visible: bool,
     kill_buffer: String,
     bottom_pane: BottomPane,
-    history_scroll_offset: u16,
     active_collaboration_mask: Option<codex_protocol::config_types::CollaborationModeMask>,
     token_info: Option<codex_core::protocol::TokenUsageInfo>,
     total_token_usage: codex_core::protocol::TokenUsage,
@@ -303,7 +300,6 @@ impl LiveAttachTui {
             shortcuts_overlay_visible: false,
             kill_buffer: String::new(),
             bottom_pane,
-            history_scroll_offset: 0,
             active_collaboration_mask: None,
             token_info: None,
             total_token_usage: codex_core::protocol::TokenUsage::default(),
@@ -2316,28 +2312,6 @@ impl LiveAttachTui {
         self.as_renderable().cursor_pos(area)
     }
 
-    pub(crate) fn scroll_history_page_up(&mut self) {
-        let step = 10u16;
-        self.history_scroll_offset = self.history_scroll_offset.saturating_add(step);
-    }
-
-    pub(crate) fn scroll_history_page_down(&mut self) {
-        let step = 10u16;
-        self.history_scroll_offset = self.history_scroll_offset.saturating_sub(step);
-    }
-
-    pub(crate) fn handle_mouse_event(&mut self, mouse_event: MouseEvent) {
-        match mouse_event.kind {
-            MouseEventKind::ScrollUp => {
-                self.history_scroll_offset = self.history_scroll_offset.saturating_add(3);
-            }
-            MouseEventKind::ScrollDown => {
-                self.history_scroll_offset = self.history_scroll_offset.saturating_sub(3);
-            }
-            _ => {}
-        }
-    }
-
     pub(crate) fn handle_bottom_pane_key_event(&mut self, key: KeyEvent) -> InputResult {
         self.bottom_pane.handle_key_event(key)
     }
@@ -2978,7 +2952,6 @@ impl LiveAttachTui {
         self.active_turn_id = None;
         self.pending_approvals.clear();
         self.pending_prompt = None;
-        self.history_scroll_offset = 0;
         self.status_message = None;
         self.previous_state = None;
         self.latest_state = "active".to_string();
@@ -3231,7 +3204,7 @@ impl LiveAttachTui {
         RenderableItem::Owned(Box::new(flex))
     }
 
-    fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
+    pub(crate) fn history_view_lines(&self, width: u16) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
         for cell in self
             .history_cells

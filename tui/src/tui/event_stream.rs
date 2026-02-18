@@ -35,6 +35,34 @@ use tokio_stream::wrappers::errors::BroadcastStreamRecvError;
 
 use super::TuiEvent;
 
+fn input_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CRABBOT_INPUT_DEBUG")
+                .ok()
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+fn log_input_debug(line: &str) {
+    if !input_debug_enabled() {
+        return;
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/crabbot-input-debug.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
 /// Result type produced by an event source.
 pub type EventResult = std::io::Result<Event>;
 
@@ -235,27 +263,45 @@ impl<S: EventSource + Default + Unpin> TuiEventStream<S> {
 
     /// Map a crossterm event to a [`TuiEvent`], skipping events we don't use (mouse events, etc.).
     fn map_crossterm_event(&mut self, event: Event) -> Option<TuiEvent> {
+        log_input_debug(&format!("[raw] {:?}", event));
         match event {
             Event::Key(key_event) => {
                 #[cfg(unix)]
                 if crate::tui::job_control::SUSPEND_KEY.is_press(key_event) {
                     let _ = self.suspend_context.suspend(&self.alt_screen_active);
+                    log_input_debug("[mapped] Draw (suspend key)");
                     return Some(TuiEvent::Draw);
                 }
+                log_input_debug(&format!("[mapped] Key {:?}", key_event));
                 Some(TuiEvent::Key(key_event))
             }
-            Event::Resize(_, _) => Some(TuiEvent::Draw),
-            Event::Paste(pasted) => Some(TuiEvent::Paste(pasted)),
+            Event::Resize(_, _) => {
+                log_input_debug("[mapped] Draw (resize)");
+                Some(TuiEvent::Draw)
+            }
+            Event::Paste(pasted) => {
+                log_input_debug(&format!("[mapped] Paste len={}", pasted.len()));
+                Some(TuiEvent::Paste(pasted))
+            }
             Event::FocusGained => {
                 self.terminal_focused.store(true, Ordering::Relaxed);
                 crate::terminal_palette::requery_default_colors();
+                log_input_debug("[mapped] Draw (focus gained)");
                 Some(TuiEvent::Draw)
             }
             Event::FocusLost => {
                 self.terminal_focused.store(false, Ordering::Relaxed);
+                log_input_debug("[mapped] None (focus lost)");
                 None
             }
-            _ => None,
+            Event::Mouse(mouse_event) => {
+                log_input_debug(&format!("[mapped] None (mouse {:?})", mouse_event));
+                None
+            }
+            _ => {
+                log_input_debug("[mapped] None (other)");
+                None
+            }
         }
     }
 }

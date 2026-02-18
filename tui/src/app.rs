@@ -24,6 +24,7 @@ use crate::exec_cell::new_active_exec_command;
 use crate::file_search::FileSearchManager;
 use crate::get_git_diff::get_git_diff;
 use crate::history_cell::SessionHeaderHistoryCell;
+use crate::pager_overlay::Overlay;
 use crate::resume_picker::SessionSelection;
 use crate::slash_command::SlashCommand;
 use crate::slash_commands::find_builtin_command;
@@ -32,8 +33,47 @@ use codex_core::protocol::ExecCommandSource;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
+use tokio_stream::StreamExt;
 
 const COMMIT_ANIMATION_TICK: Duration = crate::tui::TARGET_FRAME_INTERVAL;
+
+fn input_debug_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("CRABBOT_INPUT_DEBUG")
+                .ok()
+                .as_deref()
+                .map(str::to_ascii_lowercase)
+                .as_deref(),
+            Some("1") | Some("true") | Some("yes") | Some("on")
+        )
+    })
+}
+
+fn log_app_input_debug(line: &str) {
+    if !input_debug_enabled() {
+        return;
+    }
+    use std::io::Write as _;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open("/tmp/crabbot-input-debug-app.log")
+    {
+        let _ = writeln!(file, "{line}");
+    }
+}
+
+fn input_result_label(result: &InputResult) -> &'static str {
+    match result {
+        InputResult::Submitted { .. } => "Submitted",
+        InputResult::Queued { .. } => "Queued",
+        InputResult::Command(_) => "Command",
+        InputResult::CommandWithArgs(_, _, _) => "CommandWithArgs",
+        InputResult::None => "None",
+    }
+}
 
 // ---------------------------------------------------------------------------
 // App struct — mirrors upstream `app::App` but backed by app-server transport
@@ -67,6 +107,8 @@ pub(crate) struct App {
     pending_thread_switch_clear: bool,
     /// Controls the animation thread that sends commit tick events.
     commit_anim_running: Arc<AtomicBool>,
+    /// Optional pager overlay (transcript/static) shown above main chat UI.
+    overlay: Option<Overlay>,
     /// Run without alternate screen mode when requested by CLI.
     no_alt_screen: bool,
     /// Optional startup picker mode requested by CLI.
@@ -167,6 +209,7 @@ impl App {
             status_runtime,
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
+            overlay: None,
             no_alt_screen: args.no_alt_screen,
             startup_picker: args.startup_picker,
             startup_picker_show_all: args.startup_picker_show_all,
@@ -230,6 +273,7 @@ impl App {
             status_runtime,
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
+            overlay: None,
             no_alt_screen: false,
             startup_picker: None,
             startup_picker_show_all: false,
@@ -241,6 +285,14 @@ impl App {
     /// This mirrors upstream `App::run()` — sets up the terminal, enters the
     /// main loop, then restores the terminal on exit.
     pub(crate) async fn run(&mut self) -> Result<AppExitInfo> {
+        if input_debug_enabled() {
+            let _ = std::fs::remove_file("/tmp/crabbot-input-debug-app.log");
+            log_app_input_debug(&format!(
+                "[startup] debug enabled pid={} thread={}",
+                std::process::id(),
+                self.thread_id
+            ));
+        }
         if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
             return Ok(AppExitInfo {
                 thread_id: Some(self.thread_id.clone()),
@@ -250,12 +302,6 @@ impl App {
 
         let terminal = crate::tui::init().context("initialize tui terminal")?;
         let mut tui = crate::tui::Tui::new(terminal);
-        let entered_alt_screen = if self.no_alt_screen {
-            false
-        } else {
-            let _ = tui.enter_alt_screen();
-            true
-        };
         if let Some(mode) = self.startup_picker.take() {
             match mode {
                 StartupPicker::Resume => {
@@ -270,9 +316,6 @@ impl App {
         }
 
         let loop_result = self.event_loop(&mut tui).await;
-        if entered_alt_screen {
-            let _ = tui.leave_alt_screen();
-        }
         let _ = crate::tui::restore();
 
         loop_result?;
@@ -295,82 +338,123 @@ impl App {
     // -----------------------------------------------------------------------
 
     async fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
+        let tui_events = tui.event_stream();
+        tokio::pin!(tui_events);
+        tui.frame_requester().schedule_frame();
+        let mut stream_poll_tick = tokio::time::interval(TUI_STREAM_POLL_INTERVAL);
+        stream_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         loop {
-            if self.pending_thread_switch_clear {
-                tui.terminal.clear_scrollback()?;
-                tui.terminal.clear()?;
-                self.pending_thread_switch_clear = false;
-            }
-            let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
-            let in_paste_burst = self.widget.ui_mut().bottom_pane_is_in_paste_burst();
-            let _ = self.widget.ui_mut().commit_assistant_stream_tick();
-            let history_width = tui.terminal.size()?.width;
-            let new_history_lines = self
-                .widget
-                .ui_mut()
-                .take_new_history_lines_for_scrollback(history_width);
-            if !new_history_lines.is_empty() {
-                tui.insert_history_lines(new_history_lines);
-            }
-            let width = tui.terminal.size()?.width;
-            let desired_height = self.widget.desired_height(width);
-            tui.draw(desired_height, |frame| {
-                self.widget.render(frame.area(), frame.buffer_mut());
-                if let Some((x, y)) = self.widget.cursor_pos(frame.area()) {
-                    frame.set_cursor_position((x, y));
-                }
-            })?;
-            let mut should_redraw = false;
-
-            // Poll terminal for input events.
-            if event::poll(TUI_EVENT_WAIT_STEP).context("poll tui input event")? {
-                let app_event = match event::read().context("read tui input event")? {
-                    Event::Key(key_event) => {
-                        // Match upstream key handling: ignore only key releases so
-                        // repeated keypresses (e.g., holding `d`) continue to flow.
-                        if key_event.kind == KeyEventKind::Release {
-                            continue;
-                        }
-                        AppEvent::Key(key_event)
+            let control = tokio::select! {
+                Some(event) = tui_events.next() => self.handle_tui_event(tui, event).await?,
+                _ = stream_poll_tick.tick() => {
+                    let control = self.handle_event(tui, AppEvent::Tick).await?;
+                    if matches!(control, LiveTuiAction::Continue) {
+                        tui.frame_requester().schedule_frame();
                     }
-                    Event::Mouse(mouse_event) => AppEvent::Mouse(mouse_event),
-                    Event::Paste(pasted) => AppEvent::Paste(pasted),
-                    Event::Resize(_, _) => AppEvent::Resize,
-                    _ => continue,
-                };
-
-                match self.handle_event(tui, app_event).await? {
-                    LiveTuiAction::Continue => {}
-                    LiveTuiAction::Detach => return Ok(()),
+                    control
                 }
-                should_redraw = true;
+            };
+
+            if matches!(control, LiveTuiAction::Detach) {
+                return Ok(());
+            }
+
+            let drained_widget = self.drain_pending_widget_events(tui).await?;
+            if drained_widget.detach {
+                return Ok(());
+            }
+            if drained_widget.redraw {
+                tui.frame_requester().schedule_frame();
             }
 
             let drained = self.drain_pending_app_events(tui).await?;
             if drained.detach {
                 return Ok(());
             }
-            should_redraw |= drained.redraw;
-
-            // Tick: poll stream for app-server events.
-            match self.handle_event(tui, AppEvent::Tick).await? {
-                LiveTuiAction::Continue => {}
-                LiveTuiAction::Detach => return Ok(()),
-            }
-            let drained = self.drain_pending_app_events(tui).await?;
-            if drained.detach {
-                return Ok(());
-            }
-            should_redraw |= drained.redraw;
-
-            if !should_redraw {
-                if in_paste_burst {
-                    thread::sleep(Duration::from_millis(5));
-                    continue;
-                }
-                thread::sleep(TUI_STREAM_POLL_INTERVAL);
+            if drained.redraw {
+                tui.frame_requester().schedule_frame();
             }
         }
+    }
+
+    async fn handle_tui_event(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+        event: crate::tui::TuiEvent,
+    ) -> Result<LiveTuiAction> {
+        log_app_input_debug(&format!("[app] tui_event {:?}", event));
+        if self.overlay.is_some() {
+            if let Some(overlay) = self.overlay.as_mut() {
+                overlay.handle_event(tui, event)?;
+                if overlay.is_done() {
+                    self.overlay = None;
+                    tui.frame_requester().schedule_frame();
+                }
+            }
+            return Ok(LiveTuiAction::Continue);
+        }
+
+        match event {
+            crate::tui::TuiEvent::Key(key_event) => {
+                if key_event.kind == KeyEventKind::Release {
+                    return Ok(LiveTuiAction::Continue);
+                }
+                let control = self.handle_event(tui, AppEvent::Key(key_event)).await?;
+                if matches!(control, LiveTuiAction::Continue) {
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(control)
+            }
+            crate::tui::TuiEvent::Paste(pasted) => {
+                let control = self.handle_event(tui, AppEvent::Paste(pasted)).await?;
+                if matches!(control, LiveTuiAction::Continue) {
+                    tui.frame_requester().schedule_frame();
+                }
+                Ok(control)
+            }
+            crate::tui::TuiEvent::Draw => {
+                if self.pending_thread_switch_clear {
+                    tui.terminal.clear_scrollback()?;
+                    tui.terminal.clear()?;
+                    self.pending_thread_switch_clear = false;
+                }
+                let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
+                let _ = self.widget.ui_mut().commit_assistant_stream_tick();
+                let history_width = tui.terminal.size()?.width;
+                let new_history_lines = self
+                    .widget
+                    .ui_mut()
+                    .take_new_history_lines_for_scrollback(history_width);
+                if !new_history_lines.is_empty() {
+                    tui.insert_history_lines(new_history_lines);
+                }
+                let width = tui.terminal.size()?.width;
+                let desired_height = self.widget.desired_height(width);
+                tui.draw(desired_height, |frame| {
+                    self.widget.render(frame.area(), frame.buffer_mut());
+                    if let Some((x, y)) = self.widget.cursor_pos(frame.area()) {
+                        frame.set_cursor_position((x, y));
+                    }
+                })?;
+                Ok(LiveTuiAction::Continue)
+            }
+        }
+    }
+
+    async fn drain_pending_widget_events(
+        &mut self,
+        tui: &mut crate::tui::Tui,
+    ) -> Result<DrainResult> {
+        let mut handled_any = false;
+        while let Ok(event) = self.widget_event_rx.try_recv() {
+            self.handle_widget_app_event(tui, event).await?;
+            handled_any = true;
+        }
+        Ok(DrainResult {
+            redraw: handled_any,
+            detach: false,
+        })
     }
 
     async fn drain_pending_app_events(&mut self, tui: &mut crate::tui::Tui) -> Result<DrainResult> {
@@ -580,6 +664,41 @@ impl App {
         tui: &mut crate::tui::Tui,
         key: crossterm::event::KeyEvent,
     ) -> Result<LiveTuiAction> {
+        log_app_input_debug(&format!("[app] key {:?}", key));
+        if key.kind == KeyEventKind::Press
+            && key.code == KeyCode::Esc
+            && self.widget.ui_mut().bottom_pane_no_modal_or_popup_active()
+            && self
+                .widget
+                .ui_mut()
+                .bottom_pane_composer_text()
+                .trim()
+                .is_empty()
+        {
+            let width = tui.terminal.size()?.width;
+            let lines = self.widget.ui_mut().history_view_lines(width);
+            self.overlay = Some(Overlay::new_static_with_lines(
+                lines,
+                "Transcript".to_string(),
+            ));
+            tui.frame_requester().schedule_frame();
+            return Ok(LiveTuiAction::Continue);
+        }
+
+        if key.kind == KeyEventKind::Press
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+        {
+            let width = tui.terminal.size()?.width;
+            let lines = self.widget.ui_mut().history_view_lines(width);
+            self.overlay = Some(Overlay::new_static_with_lines(
+                lines,
+                "Transcript".to_string(),
+            ));
+            tui.frame_requester().schedule_frame();
+            return Ok(LiveTuiAction::Continue);
+        }
+
         let mut queued_submit: Option<(String, Vec<codex_protocol::user_input::TextElement>)> =
             None;
         let mut queued_command: Option<(
@@ -612,7 +731,14 @@ impl App {
                     {
                         ui.toggle_shortcuts_overlay();
                     } else {
-                        match ui.handle_bottom_pane_key_event(key) {
+                        let result = ui.handle_bottom_pane_key_event(key);
+                        log_app_input_debug(&format!(
+                            "[app] bottom_pane key={:?} kind={:?} result={}",
+                            key.code,
+                            key.kind,
+                            input_result_label(&result)
+                        ));
+                        match result {
                             InputResult::Submitted {
                                 text,
                                 text_elements,
@@ -633,33 +759,43 @@ impl App {
                         }
                     }
                 }
-                _ => match ui.handle_bottom_pane_key_event(key) {
-                    InputResult::Submitted {
-                        text,
-                        text_elements,
+                _ => {
+                    let result = ui.handle_bottom_pane_key_event(key);
+                    log_app_input_debug(&format!(
+                        "[app] bottom_pane key={:?} kind={:?} result={}",
+                        key.code,
+                        key.kind,
+                        input_result_label(&result)
+                    ));
+                    match result {
+                        InputResult::Submitted {
+                            text,
+                            text_elements,
+                        }
+                        | InputResult::Queued {
+                            text,
+                            text_elements,
+                        } => {
+                            queued_submit = Some((text, text_elements));
+                        }
+                        InputResult::Command(cmd) => {
+                            queued_command = Some((cmd, None, Vec::new()));
+                        }
+                        InputResult::CommandWithArgs(cmd, args, text_elements) => {
+                            queued_command = Some((cmd, Some(args), text_elements));
+                        }
+                        InputResult::None => {}
                     }
-                    | InputResult::Queued {
-                        text,
-                        text_elements,
-                    } => {
-                        queued_submit = Some((text, text_elements));
-                    }
-                    InputResult::Command(cmd) => {
-                        queued_command = Some((cmd, None, Vec::new()));
-                    }
-                    InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                        queued_command = Some((cmd, Some(args), text_elements));
-                    }
-                    InputResult::None => {}
-                },
+                }
             }
-            ui.drain_bottom_pane_events()
+            let pending_events = ui.drain_bottom_pane_events();
+            log_app_input_debug(&format!(
+                "[app] drained_widget_events count={}",
+                pending_events.len()
+            ));
+            pending_events
         };
         for event in pending_widget_events {
-            self.handle_widget_app_event(tui, event).await?;
-        }
-
-        while let Ok(event) = self.widget_event_rx.try_recv() {
             self.handle_widget_app_event(tui, event).await?;
         }
 
