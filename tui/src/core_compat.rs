@@ -2071,6 +2071,31 @@ pub(crate) struct ThreadListPage {
     pub(crate) next_cursor: Option<String>,
 }
 
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PickerGitInfo {
+    pub(crate) branch: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PickerThreadEntry {
+    pub(crate) id: String,
+    pub(crate) preview: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) cwd: std::path::PathBuf,
+    pub(crate) git_info: Option<PickerGitInfo>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PickerThreadPage {
+    pub(crate) items: Vec<PickerThreadEntry>,
+    pub(crate) next_cursor: Option<String>,
+    pub(crate) num_scanned_files: usize,
+    pub(crate) reached_scan_cap: bool,
+}
+
 pub(crate) fn list_threads_page(
     state: &CliState,
     cursor: Option<String>,
@@ -2126,6 +2151,54 @@ pub(crate) fn list_threads_page(
         .map(ToString::to_string);
 
     Ok(ThreadListPage { items, next_cursor })
+}
+
+pub(crate) fn list_threads_page_for_picker(
+    state: &CliState,
+    cursor: Option<String>,
+    limit: usize,
+    sort_key: codex_core::ThreadSortKey,
+    archived: bool,
+    filter_cwd: Option<std::path::PathBuf>,
+) -> Result<PickerThreadPage> {
+    let sort_key = match sort_key {
+        codex_core::ThreadSortKey::CreatedAt => "created_at",
+        codex_core::ThreadSortKey::UpdatedAt => "updated_at",
+    };
+    let mut params = json!({
+        "cursor": cursor,
+        "limit": limit,
+        "sortKey": sort_key,
+        "archived": archived,
+    });
+    if let Some(cwd) = filter_cwd {
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
+
+    let response = app_server_rpc_request(
+        &state.config.app_server_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/list",
+        params,
+    )?;
+    let data = response
+        .result
+        .get("data")
+        .cloned()
+        .unwrap_or(Value::Array(Vec::new()));
+    let items: Vec<PickerThreadEntry> = serde_json::from_value(data)?;
+    let next_cursor = response
+        .result
+        .get("nextCursor")
+        .and_then(Value::as_str)
+        .map(ToString::to_string);
+
+    Ok(PickerThreadPage {
+        num_scanned_files: items.len(),
+        items,
+        next_cursor,
+        reached_scan_cap: false,
+    })
 }
 
 pub(crate) fn list_collaboration_modes(

@@ -70,7 +70,7 @@ fn determine_alt_screen_mode(no_alt_screen: bool) -> bool {
 ///
 /// Mirrors upstream `App` from `app.rs` in structure: owns the `ChatWidget`,
 /// tracks the active thread, and drives the terminal event loop. All backend
-/// calls go through the `codex_core::app_server_shim` transport seam.
+/// calls go through the `codex_core` transport shim seam.
 pub(crate) struct App {
     /// The active chat widget.
     widget: ChatWidget,

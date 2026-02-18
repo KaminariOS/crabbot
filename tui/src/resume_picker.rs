@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::CliState;
-use crate::app_server_rpc_request_raw;
 use crate::diff_render::display_path_for;
 use crate::key_hint;
 use crate::text_formatting::truncate_text;
@@ -13,7 +12,10 @@ use crate::tui::TuiEvent;
 use chrono::DateTime;
 use chrono::TimeZone;
 use chrono::Utc;
+use codex_core::PickerThreadEntry as ApiThread;
+use codex_core::PickerThreadPage as ThreadsPage;
 use codex_core::ThreadSortKey;
+use codex_core::list_threads_page_for_picker;
 use codex_core::path_utils;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
@@ -82,90 +84,12 @@ struct PageLoadRequest {
 
 type PageLoader = Arc<dyn Fn(PageLoadRequest) + Send + Sync>;
 
-#[derive(Clone)]
-struct ListThreadsRequest {
-    cursor: Option<String>,
-    limit: usize,
-    sort_key: ThreadSortKey,
-    archived: bool,
-    filter_cwd: Option<PathBuf>,
-}
-
 enum BackgroundEvent {
     PageLoaded {
         request_token: usize,
         search_token: Option<usize>,
         page: std::io::Result<ThreadsPage>,
     },
-}
-
-#[derive(Clone)]
-struct ThreadsPage {
-    items: Vec<ApiThread>,
-    next_cursor: Option<String>,
-    num_scanned_files: usize,
-    reached_scan_cap: bool,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiThread {
-    id: String,
-    preview: String,
-    created_at: i64,
-    updated_at: i64,
-    cwd: PathBuf,
-    git_info: Option<ApiGitInfo>,
-}
-
-#[derive(Debug, Clone, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ApiGitInfo {
-    branch: Option<String>,
-}
-
-fn list_threads_via_app_server(
-    app_server_endpoint: &str,
-    auth_token: Option<&str>,
-    request: ListThreadsRequest,
-) -> std::io::Result<ThreadsPage> {
-    let sort_key = match request.sort_key {
-        ThreadSortKey::CreatedAt => "created_at",
-        ThreadSortKey::UpdatedAt => "updated_at",
-    };
-    let mut params = serde_json::json!({
-        "cursor": request.cursor,
-        "limit": request.limit,
-        "sortKey": sort_key,
-        "archived": request.archived,
-    });
-    if let Some(cwd) = request.filter_cwd.as_ref() {
-        params["cwd"] = serde_json::Value::String(cwd.to_string_lossy().to_string());
-    }
-
-    app_server_rpc_request_raw(app_server_endpoint, auth_token, "thread/list", params)
-        .map_err(std::io::Error::other)
-        .and_then(|response| {
-            let data = response
-                .result
-                .get("data")
-                .cloned()
-                .unwrap_or(serde_json::Value::Array(Vec::new()));
-            let next_cursor = response
-                .result
-                .get("nextCursor")
-                .and_then(serde_json::Value::as_str)
-                .map(ToString::to_string);
-            let items: Vec<ApiThread> =
-                serde_json::from_value(data).map_err(std::io::Error::other)?;
-            let num_scanned_files = items.len();
-            Ok(ThreadsPage {
-                items,
-                next_cursor,
-                num_scanned_files,
-                reached_scan_cap: false,
-            })
-        })
 }
 
 /// Interactive session picker that lists recorded rollout files with simple
@@ -220,17 +144,23 @@ async fn run_session_picker(
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
         tokio::spawn(async move {
-            let page = list_threads_via_app_server(
-                &request.app_server_endpoint,
-                request.auth_token.as_deref(),
-                ListThreadsRequest {
-                    cursor: request.cursor,
-                    limit: PAGE_SIZE,
-                    sort_key: request.sort_key,
-                    archived: false,
-                    filter_cwd: request.filter_cwd,
+            let state = CliState {
+                config: crate::CliConfig {
+                    app_server_endpoint: request.app_server_endpoint,
+                    auth_token: request.auth_token,
+                    ..Default::default()
                 },
-            );
+                ..Default::default()
+            };
+            let page = list_threads_page_for_picker(
+                &state,
+                request.cursor,
+                PAGE_SIZE,
+                request.sort_key,
+                false,
+                request.filter_cwd,
+            )
+            .map_err(std::io::Error::other);
             let _ = tx.send(BackgroundEvent::PageLoaded {
                 request_token: request.request_token,
                 search_token: request.search_token,
