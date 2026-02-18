@@ -66,6 +66,8 @@ pub(crate) struct App {
     pending_thread_switch_clear: bool,
     /// Controls the animation thread that sends commit tick events.
     commit_anim_running: Arc<AtomicBool>,
+    /// Run without alternate screen mode when requested by CLI.
+    no_alt_screen: bool,
 }
 
 #[derive(Default)]
@@ -156,6 +158,7 @@ impl App {
             status_runtime,
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
+            no_alt_screen: args.no_alt_screen,
         })
     }
 
@@ -214,6 +217,7 @@ impl App {
             status_runtime,
             pending_thread_switch_clear: false,
             commit_anim_running: Arc::new(AtomicBool::new(false)),
+            no_alt_screen: false,
         })
     }
 
@@ -231,9 +235,16 @@ impl App {
 
         let terminal = crate::tui::init().context("initialize tui terminal")?;
         let mut tui = crate::tui::Tui::new(terminal);
-        let _ = tui.enter_alt_screen();
+        let entered_alt_screen = if self.no_alt_screen {
+            false
+        } else {
+            let _ = tui.enter_alt_screen();
+            true
+        };
         let loop_result = self.event_loop(&mut tui);
-        let _ = tui.leave_alt_screen();
+        if entered_alt_screen {
+            let _ = tui.leave_alt_screen();
+        }
         let _ = crate::tui::restore();
 
         loop_result?;

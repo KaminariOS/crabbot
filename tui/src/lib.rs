@@ -1820,6 +1820,7 @@ pub struct CliState {
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct TuiArgs {
     pub thread_id: Option<String>,
+    pub no_alt_screen: bool,
 }
 
 pub enum CommandOutput {
@@ -2339,6 +2340,22 @@ fn app_server_rpc_request(
     with_app_server_ws_client(app_server_endpoint, auth_token, |client| {
         client.request(method, params)
     })
+}
+
+pub fn app_server_rpc_request_raw(
+    app_server_endpoint: &str,
+    auth_token: Option<&str>,
+    method: &str,
+    params: Value,
+) -> Result<DaemonRpcRequestResponse> {
+    app_server_rpc_request(app_server_endpoint, auth_token, method, params)
+}
+
+pub fn ensure_app_server_ready_raw(
+    app_server_endpoint: &str,
+    auth_token: Option<&str>,
+) -> Result<()> {
+    with_app_server_ws_client(app_server_endpoint, auth_token, |_client| Ok(()))
 }
 
 fn app_server_rpc_respond(

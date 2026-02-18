@@ -16,6 +16,7 @@ serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"
 tokio = { workspace = true, features = ["rt-multi-thread", "time", "sync"] }
+toml = "0.8"
 unicode-segmentation = "1"
 unicode-width = "0.2"
 

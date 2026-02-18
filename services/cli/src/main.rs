@@ -2,6 +2,7 @@ use anyhow::Context;
 use anyhow::Result;
 use anyhow::anyhow;
 use anyhow::bail;
+use clap::ArgAction;
 use clap::Args;
 use clap::Parser;
 use clap::Subcommand;
@@ -51,6 +52,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::IsTerminal;
@@ -72,15 +74,139 @@ const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
 const TUI_SLASH_PICKER_MAX_ROWS: usize = 4;
 
 #[derive(Debug, Parser)]
-#[command(name = "crabbot", about = "Crabbot Linux CLI")]
+#[command(
+    name = "crabbot",
+    about = "Crabbot Linux CLI",
+    version,
+    subcommand_negates_reqs = true,
+    override_usage = "crabbot [OPTIONS] [PROMPT]\n       crabbot [OPTIONS] <COMMAND> [ARGS]"
+)]
 struct Cli {
+    #[command(flatten)]
+    interactive: InteractiveArgs,
+
     #[command(subcommand)]
-    command: TopLevelCommand,
+    command: Option<TopLevelCommand>,
 }
 
 #[derive(Debug, Subcommand)]
 enum TopLevelCommand {
+    /// Resume a previous interactive session (picker by default; use --last to continue the most recent).
+    Resume(ResumeCommand),
+    /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
+    Fork(ForkCommand),
+    /// Legacy compatibility subcommand.
+    #[command(hide = true)]
     Codex(CodexCommand),
+}
+
+#[derive(Debug, Args, Clone)]
+struct InteractiveArgs {
+    /// Optional user prompt to start the session.
+    #[arg(value_name = "PROMPT", value_hint = clap::ValueHint::Other)]
+    prompt: Option<String>,
+
+    /// Optional image(s) to attach to the initial prompt.
+    #[arg(
+        long = "image",
+        short = 'i',
+        value_name = "FILE",
+        value_delimiter = ',',
+        num_args = 1..
+    )]
+    images: Vec<PathBuf>,
+
+    /// Override a configuration value from `~/.codex/config.toml`.
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "key=value",
+        action = ArgAction::Append
+    )]
+    config: Vec<String>,
+
+    /// Enable a feature (repeatable). Equivalent to `-c features.<name>=true`.
+    #[arg(long = "enable", value_name = "FEATURE", action = ArgAction::Append)]
+    enable: Vec<String>,
+
+    /// Disable a feature (repeatable). Equivalent to `-c features.<name>=false`.
+    #[arg(long = "disable", value_name = "FEATURE", action = ArgAction::Append)]
+    disable: Vec<String>,
+
+    /// Model the agent should use.
+    #[arg(long, short = 'm')]
+    model: Option<String>,
+
+    /// Configuration profile from config.toml to specify default options.
+    #[arg(long = "profile", short = 'p')]
+    profile: Option<String>,
+
+    /// Select the sandbox policy to use when executing model-generated shell commands.
+    #[arg(long = "sandbox", short = 's')]
+    sandbox_mode: Option<crabbot_tui::SandboxModeCliArg>,
+
+    /// Configure when the model requires human approval before executing a command.
+    #[arg(long = "ask-for-approval", short = 'a')]
+    approval_policy: Option<crabbot_tui::ApprovalModeCliArg>,
+
+    /// Convenience alias for low-friction sandboxed automatic execution (-a on-request, --sandbox workspace-write).
+    #[arg(long = "full-auto", default_value_t = false)]
+    full_auto: bool,
+
+    /// Skip all confirmation prompts and execute commands without sandboxing.
+    #[arg(
+        long = "dangerously-bypass-approvals-and-sandbox",
+        alias = "yolo",
+        default_value_t = false,
+        conflicts_with_all = ["approval_policy", "full_auto"]
+    )]
+    dangerously_bypass_approvals_and_sandbox: bool,
+
+    /// Tell the agent to use the specified directory as its working root.
+    #[arg(long = "cd", short = 'C', value_name = "DIR")]
+    cwd: Option<PathBuf>,
+
+    /// Enable live web search.
+    #[arg(long = "search", default_value_t = false)]
+    search: bool,
+
+    /// Additional directories that should be writable alongside the primary workspace.
+    #[arg(long = "add-dir", value_name = "DIR", value_hint = clap::ValueHint::DirPath)]
+    add_dir: Vec<PathBuf>,
+
+    /// Disable alternate screen mode.
+    #[arg(long = "no-alt-screen", default_value_t = false)]
+    no_alt_screen: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ResumeCommand {
+    /// Conversation/session id (UUID) or thread name.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: Option<String>,
+    /// Continue the most recent session without showing the picker.
+    #[arg(long = "last", default_value_t = false)]
+    last: bool,
+    /// Show all sessions (disables cwd filtering and shows CWD column).
+    #[arg(long = "all", default_value_t = false)]
+    all: bool,
+    #[command(flatten)]
+    interactive: InteractiveArgs,
+}
+
+#[derive(Debug, Args, Clone)]
+struct ForkCommand {
+    /// Conversation/session id (UUID) to fork.
+    #[arg(value_name = "SESSION_ID")]
+    session_id: Option<String>,
+    /// Fork the most recent session without showing the picker.
+    #[arg(long = "last", default_value_t = false, conflicts_with = "session_id")]
+    last: bool,
+    /// Show all sessions (disables cwd filtering and shows CWD column).
+    #[arg(long = "all", default_value_t = false)]
+    all: bool,
+    #[command(flatten)]
+    interactive: InteractiveArgs,
 }
 
 #[derive(Debug, Args)]
@@ -133,6 +259,8 @@ struct AttachArgs {
 struct TuiArgs {
     #[arg(long)]
     thread_id: Option<String>,
+    #[arg(long, default_value_t = false)]
+    no_alt_screen: bool,
 }
 
 #[derive(Debug, Args)]
@@ -192,7 +320,7 @@ struct CliConfig {
 }
 
 fn default_daemon_endpoint() -> String {
-    "http://127.0.0.1:8788".to_string()
+    "ws://127.0.0.1:8765".to_string()
 }
 
 impl Default for CliConfig {
@@ -256,6 +384,7 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
         crabbot_tui::handle_tui(
             crabbot_tui::TuiArgs {
                 thread_id: args.thread_id,
+                no_alt_screen: args.no_alt_screen,
             },
             &mut tui_state,
         )
@@ -296,9 +425,32 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
-    match cli.command {
-        TopLevelCommand::Codex(command) => run_codex(command, state_path),
+    let mut state = load_state(state_path)?;
+    let mut should_persist = false;
+
+    let output = match cli.command {
+        None => {
+            should_persist = true;
+            run_interactive_default(cli.interactive, &mut state)
+        }
+        Some(TopLevelCommand::Resume(command)) => {
+            should_persist = true;
+            run_resume_command(command, &mut state)
+        }
+        Some(TopLevelCommand::Fork(command)) => {
+            should_persist = true;
+            run_fork_command(command, &mut state)
+        }
+        Some(TopLevelCommand::Codex(command)) => {
+            return run_codex(command, state_path);
+        }
+    }?;
+
+    if should_persist {
+        save_state(state_path, &state)?;
     }
+
+    output.into_string()
 }
 
 fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
@@ -354,6 +506,73 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
     output.into_string()
 }
 
+fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Result<CommandOutput> {
+    ensure_daemon_ready(state)?;
+    let overrides = build_runtime_overrides(&args)?;
+    let thread_id = if let Some(last_thread_id) = state.last_thread_id.clone() {
+        match resolve_thread_resume(
+            state,
+            &last_thread_id,
+            &overrides,
+            ThreadResolutionMode::DefaultResume,
+        ) {
+            Ok(thread_id) => Ok(thread_id),
+            Err(_) => start_thread_with_overrides(state, &overrides),
+        }
+    } else {
+        start_thread_with_overrides(state, &overrides)
+    }?;
+    maybe_send_initial_prompt(state, &thread_id, &args)?;
+    handle_tui_with_crate(
+        TuiArgs {
+            thread_id: Some(thread_id),
+            no_alt_screen: args.no_alt_screen,
+        },
+        state,
+    )
+}
+
+fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<CommandOutput> {
+    ensure_daemon_ready(state)?;
+    let overrides = build_runtime_overrides(&command.interactive)?;
+    let target = resolve_source_thread_for_resume_or_fork(
+        state,
+        command.session_id,
+        command.last,
+        command.all,
+    )?;
+    let thread_id =
+        resolve_thread_resume(state, &target, &overrides, ThreadResolutionMode::Resume)?;
+    maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
+    handle_tui_with_crate(
+        TuiArgs {
+            thread_id: Some(thread_id),
+            no_alt_screen: command.interactive.no_alt_screen,
+        },
+        state,
+    )
+}
+
+fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<CommandOutput> {
+    ensure_daemon_ready(state)?;
+    let overrides = build_runtime_overrides(&command.interactive)?;
+    let target = resolve_source_thread_for_resume_or_fork(
+        state,
+        command.session_id,
+        command.last,
+        command.all,
+    )?;
+    let thread_id = resolve_thread_fork(state, &target, &overrides)?;
+    maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
+    handle_tui_with_crate(
+        TuiArgs {
+            thread_id: Some(thread_id),
+            no_alt_screen: command.interactive.no_alt_screen,
+        },
+        state,
+    )
+}
+
 fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
     if !(io::stdin().is_terminal() && io::stdout().is_terminal()) {
         ensure_daemon_ready(state)?;
@@ -376,9 +595,366 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
             // Leave this empty so TUI can treat persisted `last_thread_id` as
             // cache (resume-or-start fallback), not as strict explicit input.
             thread_id: None,
+            no_alt_screen: false,
         },
         state,
     )
+}
+
+#[derive(Debug, Clone)]
+struct RuntimeOverrides {
+    model: Option<String>,
+    cwd: Option<String>,
+    approval_policy: Option<String>,
+    sandbox: Option<String>,
+    config: Value,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ThreadResolutionMode {
+    DefaultResume,
+    Resume,
+}
+
+fn build_runtime_overrides(args: &InteractiveArgs) -> Result<RuntimeOverrides> {
+    let (sandbox_mode, approval_policy) = if args.full_auto {
+        (
+            Some("workspace-write".to_string()),
+            Some("on-request".to_string()),
+        )
+    } else if args.dangerously_bypass_approvals_and_sandbox {
+        (
+            Some("danger-full-access".to_string()),
+            Some("never".to_string()),
+        )
+    } else {
+        (
+            args.sandbox_mode.as_ref().map(sandbox_mode_to_wire),
+            args.approval_policy.as_ref().map(approval_policy_to_wire),
+        )
+    };
+
+    let mut config = Value::Object(serde_json::Map::new());
+
+    for pair in &args.config {
+        apply_key_value_override(&mut config, pair)?;
+    }
+    for feature in &args.enable {
+        apply_dotted_value(
+            &mut config,
+            &format!("features.{feature}"),
+            Value::Bool(true),
+        )?;
+    }
+    for feature in &args.disable {
+        apply_dotted_value(
+            &mut config,
+            &format!("features.{feature}"),
+            Value::Bool(false),
+        )?;
+    }
+    if let Some(profile) = &args.profile {
+        apply_dotted_value(&mut config, "profile", Value::String(profile.clone()))?;
+    }
+    if args.search {
+        apply_dotted_value(&mut config, "web_search", Value::String("live".to_string()))?;
+    }
+    if !args.add_dir.is_empty() {
+        let writable_roots = args
+            .add_dir
+            .iter()
+            .map(|path| Value::String(path.to_string_lossy().to_string()))
+            .collect::<Vec<_>>();
+        apply_dotted_value(
+            &mut config,
+            "sandbox_workspace_write.writable_roots",
+            Value::Array(writable_roots),
+        )?;
+    }
+
+    Ok(RuntimeOverrides {
+        model: args.model.clone(),
+        cwd: args
+            .cwd
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string()),
+        approval_policy,
+        sandbox: sandbox_mode,
+        config,
+    })
+}
+
+fn approval_policy_to_wire(policy: &crabbot_tui::ApprovalModeCliArg) -> String {
+    match policy {
+        crabbot_tui::ApprovalModeCliArg::UnlessTrusted => "untrusted",
+        crabbot_tui::ApprovalModeCliArg::OnFailure => "on-failure",
+        crabbot_tui::ApprovalModeCliArg::OnRequest => "on-request",
+        crabbot_tui::ApprovalModeCliArg::Never => "never",
+    }
+    .to_string()
+}
+
+fn sandbox_mode_to_wire(mode: &crabbot_tui::SandboxModeCliArg) -> String {
+    match mode {
+        crabbot_tui::SandboxModeCliArg::ReadOnly => "read-only",
+        crabbot_tui::SandboxModeCliArg::WorkspaceWrite => "workspace-write",
+        crabbot_tui::SandboxModeCliArg::DangerFullAccess => "danger-full-access",
+    }
+    .to_string()
+}
+
+fn apply_key_value_override(config: &mut Value, pair: &str) -> Result<()> {
+    let (key, raw_value) = pair
+        .split_once('=')
+        .ok_or_else(|| anyhow!("invalid --config override `{pair}`; expected key=value"))?;
+    let parsed_value = match raw_value.parse::<toml::Value>() {
+        Ok(value) => serde_json::to_value(value).context("convert parsed toml value")?,
+        Err(_) => Value::String(raw_value.to_string()),
+    };
+    apply_dotted_value(config, key, parsed_value)
+}
+
+fn apply_dotted_value(root: &mut Value, dotted_key: &str, value: Value) -> Result<()> {
+    let mut parts = dotted_key.split('.').peekable();
+    if parts.peek().is_none() {
+        bail!("empty config key path");
+    }
+    let mut current = root;
+    while let Some(part) = parts.next() {
+        if parts.peek().is_none() {
+            match current {
+                Value::Object(map) => {
+                    map.insert(part.to_string(), value);
+                    return Ok(());
+                }
+                _ => bail!("config path `{dotted_key}` collides with non-object value"),
+            }
+        }
+        match current {
+            Value::Object(map) => {
+                current = map
+                    .entry(part.to_string())
+                    .or_insert_with(|| Value::Object(serde_json::Map::new()));
+            }
+            _ => bail!("config path `{dotted_key}` collides with non-object value"),
+        }
+    }
+    Ok(())
+}
+
+fn thread_params_for_overrides(overrides: &RuntimeOverrides) -> Value {
+    json!({
+        "model": overrides.model,
+        "cwd": overrides.cwd,
+        "approvalPolicy": overrides.approval_policy,
+        "sandbox": overrides.sandbox,
+        "config": overrides.config,
+    })
+}
+
+fn start_thread_with_overrides(
+    state: &mut CliState,
+    overrides: &RuntimeOverrides,
+) -> Result<String> {
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/start",
+        thread_params_for_overrides(overrides),
+    )?;
+    let thread_id = extract_thread_id_from_rpc_result(&response.result)
+        .ok_or_else(|| anyhow!("thread/start response missing thread.id"))?;
+    state.last_thread_id = Some(thread_id.clone());
+    Ok(thread_id)
+}
+
+fn resolve_thread_resume(
+    state: &mut CliState,
+    thread_id: &str,
+    overrides: &RuntimeOverrides,
+    mode: ThreadResolutionMode,
+) -> Result<String> {
+    let mut params = thread_params_for_overrides(overrides);
+    params["threadId"] = Value::String(thread_id.to_string());
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/resume",
+        params,
+    )?;
+    let resolved = extract_thread_id_from_rpc_result(&response.result)
+        .unwrap_or_else(|| thread_id.to_string());
+    state.last_thread_id = Some(resolved.clone());
+    if matches!(mode, ThreadResolutionMode::Resume) {
+        return Ok(resolved);
+    }
+    Ok(resolved)
+}
+
+fn resolve_thread_fork(
+    state: &mut CliState,
+    thread_id: &str,
+    overrides: &RuntimeOverrides,
+) -> Result<String> {
+    let mut params = thread_params_for_overrides(overrides);
+    params["threadId"] = Value::String(thread_id.to_string());
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/fork",
+        params,
+    )?;
+    let resolved = extract_thread_id_from_rpc_result(&response.result)
+        .ok_or_else(|| anyhow!("thread/fork response missing thread.id"))?;
+    state.last_thread_id = Some(resolved.clone());
+    Ok(resolved)
+}
+
+fn resolve_source_thread_for_resume_or_fork(
+    state: &CliState,
+    explicit: Option<String>,
+    last: bool,
+    all: bool,
+) -> Result<String> {
+    if let Some(value) = explicit {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            bail!("SESSION_ID cannot be empty");
+        }
+        return Ok(trimmed.to_string());
+    }
+    if last {
+        return latest_thread_id_for_selection(state, all);
+    }
+    pick_thread_id_from_prompt(state, all)
+}
+
+fn latest_thread_id_for_selection(state: &CliState, all: bool) -> Result<String> {
+    let mut params = json!({
+        "sortKey": "updated_at",
+        "limit": 1,
+        "archived": false,
+    });
+    if !all {
+        let cwd = std::env::current_dir().context("resolve cwd for --last thread filter")?;
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/list",
+        params,
+    )?;
+    let first = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+        .and_then(|item| item.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("no saved sessions found"))?;
+    Ok(first.to_string())
+}
+
+fn pick_thread_id_from_prompt(state: &CliState, all: bool) -> Result<String> {
+    let mut params = json!({
+        "sortKey": "updated_at",
+        "limit": 25,
+        "archived": false,
+    });
+    if !all {
+        let cwd = std::env::current_dir().context("resolve cwd for picker filter")?;
+        params["cwd"] = Value::String(cwd.to_string_lossy().to_string());
+    }
+    let response = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "thread/list",
+        params,
+    )?;
+    let rows = response
+        .result
+        .get("data")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("thread/list response missing data"))?;
+    if rows.is_empty() {
+        bail!("no saved sessions found");
+    }
+
+    let mut choices: Vec<(String, String)> = Vec::new();
+    for row in rows {
+        let Some(id) = row.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let title = row
+            .get("threadName")
+            .or_else(|| row.get("preview"))
+            .and_then(Value::as_str)
+            .unwrap_or(id)
+            .to_string();
+        choices.push((id.to_string(), title));
+    }
+    if choices.is_empty() {
+        bail!("no saved sessions found");
+    }
+
+    eprintln!("Select a thread:");
+    for (idx, (id, title)) in choices.iter().enumerate() {
+        eprintln!("  {}. {} ({})", idx + 1, title, id);
+    }
+    eprintln!("Enter selection [1-{}]:", choices.len());
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("read picker selection")?;
+    let selected_idx: usize = input
+        .trim()
+        .parse()
+        .context("invalid picker selection, expected a number")?;
+    if selected_idx == 0 || selected_idx > choices.len() {
+        bail!("picker selection out of range");
+    }
+    Ok(choices[selected_idx - 1].0.clone())
+}
+
+fn maybe_send_initial_prompt(
+    state: &CliState,
+    thread_id: &str,
+    args: &InteractiveArgs,
+) -> Result<()> {
+    if args.images.is_empty() && args.prompt.is_none() {
+        return Ok(());
+    }
+    let Some(prompt) = args.prompt.as_deref() else {
+        bail!("--image requires an initial [PROMPT]");
+    };
+    if prompt.trim().is_empty() {
+        bail!("[PROMPT] cannot be empty when provided");
+    }
+
+    let mut input = Vec::new();
+    input.push(json!({
+        "type": "text",
+        "text": prompt,
+        "text_elements": [],
+    }));
+    for image in &args.images {
+        input.push(json!({
+            "type": "localImage",
+            "path": image.to_string_lossy().to_string(),
+        }));
+    }
+
+    let _ = daemon_app_server_rpc_request(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": input,
+        }),
+    )?;
+    Ok(())
 }
 
 fn handle_start(args: StartArgs, state: &mut CliState) -> Result<Value> {
@@ -830,93 +1406,16 @@ fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
 }
 
 fn ensure_daemon_ready(state: &CliState) -> Result<()> {
-    if daemon_is_healthy(
+    crabbot_tui::ensure_app_server_ready_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
-    ) {
-        return Ok(());
-    }
-
-    auto_start_daemon_process()?;
-
-    for _ in 0..20 {
-        if daemon_is_healthy(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-        ) {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(150));
-    }
-
-    bail!(
-        "daemon is not healthy at {}; run `cargo run -p crabbot_daemon` or set CRABBOT_DAEMON_BIN",
-        state.config.daemon_endpoint
     )
-}
-
-fn auto_start_daemon_process() -> Result<()> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(explicit) = env::var_os("CRABBOT_DAEMON_BIN") {
-        if !PathBuf::from(&explicit).as_os_str().is_empty() {
-            candidates.push(PathBuf::from(explicit));
-        }
-    }
-
-    if let Ok(current_exe) = env::current_exe() {
-        if let Some(parent) = current_exe.parent() {
-            candidates.push(parent.join("crabbot_daemon"));
-        }
-    }
-    candidates.push(PathBuf::from("crabbot_daemon"));
-
-    let mut last_error: Option<anyhow::Error> = None;
-    for candidate in candidates {
-        match spawn_daemon_process(&candidate) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-    }
-
-    if spawn_daemon_via_cargo().is_ok() {
-        return Ok(());
-    }
-
-    match last_error {
-        Some(error) => Err(error),
-        None => bail!("unable to auto-start daemon"),
-    }
-}
-
-fn spawn_daemon_process(binary: &Path) -> Result<()> {
-    let mut command = Command::new(binary);
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    if let Some(bind) = env::var_os("CRABBOT_DAEMON_BIND") {
-        command.env("CRABBOT_DAEMON_BIND", bind);
-    }
-
-    command
-        .spawn()
-        .with_context(|| format!("auto-start daemon via {}", binary.display()))?;
-    Ok(())
-}
-
-fn spawn_daemon_via_cargo() -> Result<()> {
-    if !Path::new("Cargo.toml").exists() {
-        bail!("Cargo.toml not found in current working directory");
-    }
-
-    Command::new("cargo")
-        .args(["run", "-p", "crabbot_daemon"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("auto-start daemon via cargo run -p crabbot_daemon")?;
-    Ok(())
+    .with_context(|| {
+        format!(
+            "app-server is not reachable at {}; run `codex app-server --listen {}`",
+            state.config.daemon_endpoint, state.config.daemon_endpoint
+        )
+    })
 }
 
 fn daemon_start_session(
@@ -1058,20 +1557,7 @@ fn daemon_app_server_rpc_request(
     method: &str,
     params: Value,
 ) -> Result<DaemonRpcRequestResponse> {
-    let client = http_client_with_timeout(DAEMON_PROMPT_REQUEST_TIMEOUT)?;
-    let url = endpoint_url(daemon_endpoint, "/v2/app-server/request");
-    let response = apply_auth(client.post(url), auth_token)
-        .json(&DaemonRpcRequest {
-            method: method.to_string(),
-            params,
-        })
-        .send()
-        .context("request daemon app-server rpc")?
-        .error_for_status()
-        .context("daemon app-server rpc returned error status")?;
-    response
-        .json::<DaemonRpcRequestResponse>()
-        .context("parse daemon app-server rpc response")
+    crabbot_tui::app_server_rpc_request_raw(daemon_endpoint, auth_token, method, params)
 }
 
 fn daemon_app_server_rpc_respond(
@@ -1377,9 +1863,22 @@ fn load_state(path: &Path) -> Result<CliState> {
     }
 
     let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-    let state = serde_json::from_str(&raw)
+    let mut state: CliState = serde_json::from_str(&raw)
         .with_context(|| format!("parse state json from {}", path.display()))?;
+    state.config.daemon_endpoint = normalize_app_server_endpoint(&state.config.daemon_endpoint);
     Ok(state)
+}
+
+fn normalize_app_server_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if trimmed.eq_ignore_ascii_case("http://127.0.0.1:8788")
+        || trimmed.eq_ignore_ascii_case("http://localhost:8788")
+        || trimmed.eq_ignore_ascii_case("ws://127.0.0.1:8788")
+        || trimmed.eq_ignore_ascii_case("ws://localhost:8788")
+    {
+        return "ws://127.0.0.1:8765".to_string();
+    }
+    endpoint.to_string()
 }
 
 fn save_state(path: &Path, state: &CliState) -> Result<()> {

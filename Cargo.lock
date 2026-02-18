@@ -491,6 +491,7 @@ dependencies = [
  "supports-color",
  "tempfile",
  "tokio",
+ "toml",
  "unicode-segmentation",
  "unicode-width 0.2.1",
 ]
