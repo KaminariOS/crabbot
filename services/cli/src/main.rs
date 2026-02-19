@@ -265,6 +265,10 @@ struct TuiArgs {
     thread_id: Option<String>,
     #[arg(skip)]
     fork_mode: bool,
+    #[arg(skip)]
+    resume_last: bool,
+    #[arg(skip)]
+    fork_last: bool,
     #[arg(long, default_value_t = false)]
     no_alt_screen: bool,
     #[arg(skip)]
@@ -384,7 +388,11 @@ fn convert_output_from_tui(output: crabbot_tui::CommandOutput) -> CommandOutput 
     }
 }
 
-fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+fn handle_tui_with_crate(
+    args: TuiArgs,
+    interactive: Option<&InteractiveArgs>,
+    state: &mut CliState,
+) -> Result<CommandOutput> {
     crabbot_tui::set_app_server_connection_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
@@ -394,15 +402,56 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
         .build()
         .context("initialize tokio runtime for tui")?;
     let exit_info = runtime.block_on(async {
+        let (
+            prompt,
+            images,
+            model,
+            config_profile,
+            sandbox_mode,
+            approval_policy,
+            full_auto,
+            dangerously_bypass_approvals_and_sandbox,
+            cwd,
+            web_search,
+            add_dir,
+        ) = if let Some(interactive) = interactive {
+            (
+                interactive.prompt.clone(),
+                interactive.images.clone(),
+                interactive.model.clone(),
+                interactive.profile.clone(),
+                interactive.sandbox_mode,
+                interactive.approval_policy,
+                interactive.full_auto,
+                interactive.dangerously_bypass_approvals_and_sandbox,
+                interactive.cwd.clone(),
+                interactive.search,
+                interactive.add_dir.clone(),
+            )
+        } else {
+            (
+                None,
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                false,
+                false,
+                None,
+                false,
+                Vec::new(),
+            )
+        };
         crabbot_tui::run_main(
             crabbot_tui::Cli {
-                prompt: None,
-                images: Vec::new(),
+                prompt,
+                images,
                 resume_picker: matches!(
                     args.startup_picker,
                     Some(crabbot_tui::StartupPicker::Resume)
                 ),
-                resume_last: false,
+                resume_last: args.resume_last,
                 resume_session_id: if args.fork_mode {
                     None
                 } else {
@@ -414,7 +463,7 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
                         Some(crabbot_tui::StartupPicker::Resume)
                     ),
                 fork_picker: matches!(args.startup_picker, Some(crabbot_tui::StartupPicker::Fork)),
-                fork_last: false,
+                fork_last: args.fork_last,
                 fork_session_id: if args.fork_mode {
                     args.thread_id.clone()
                 } else {
@@ -422,17 +471,17 @@ fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandO
                 },
                 fork_show_all: args.startup_picker_show_all
                     && matches!(args.startup_picker, Some(crabbot_tui::StartupPicker::Fork)),
-                model: None,
+                model,
                 oss: false,
                 oss_provider: None,
-                config_profile: None,
-                sandbox_mode: None,
-                approval_policy: None,
-                full_auto: false,
-                dangerously_bypass_approvals_and_sandbox: false,
-                cwd: None,
-                web_search: false,
-                add_dir: Vec::new(),
+                config_profile,
+                sandbox_mode,
+                approval_policy,
+                full_auto,
+                dangerously_bypass_approvals_and_sandbox,
+                cwd,
+                web_search,
+                add_dir,
                 no_alt_screen: args.no_alt_screen,
                 config_overrides: crabbot_tui::CliConfigOverrides::default(),
             },
@@ -570,7 +619,7 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
         }
         Some(CodexSubcommand::Tui(args)) => {
             should_persist = true;
-            handle_tui_with_crate(args, &mut state)
+            handle_tui_with_crate(args, None, &mut state)
         }
         Some(CodexSubcommand::Attach(args)) => {
             should_persist = true;
@@ -598,95 +647,61 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
 
 fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
-    let overrides = build_runtime_overrides(&args)?;
-    let thread_id = start_thread_with_overrides(state, &overrides)?;
-    maybe_send_initial_prompt(state, &thread_id, &args)?;
     handle_tui_with_crate(
         TuiArgs {
-            thread_id: Some(thread_id),
+            thread_id: None,
             fork_mode: false,
+            resume_last: false,
+            fork_last: false,
             no_alt_screen: args.no_alt_screen,
             startup_picker: None,
             startup_picker_show_all: false,
         },
+        Some(&args),
         state,
     )
 }
 
 fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
-    let selected_from_picker = if command.session_id.is_none() && !command.last {
-        run_upstream_picker_with_tui(state, crabbot_tui::StartupPicker::Resume, command.all)?
-    } else {
-        None
-    };
-    let overrides = build_runtime_overrides(&command.interactive)?;
-    let target = if command.session_id.is_none() && !command.last {
-        let Some(selected) = selected_from_picker else {
-            return handle_tui_with_crate(
-                TuiArgs {
-                    thread_id: None,
-                    fork_mode: false,
-                    no_alt_screen: command.interactive.no_alt_screen,
-                    startup_picker: None,
-                    startup_picker_show_all: false,
-                },
-                state,
-            );
-        };
-        selected
-    } else {
-        resolve_source_thread_for_resume_or_fork(state, command.session_id, true, command.all)?
-    };
-    let thread_id = resolve_thread_resume(state, &target, &overrides)?;
-    maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
+    let has_session_id = command.session_id.is_some();
     handle_tui_with_crate(
         TuiArgs {
-            thread_id: Some(thread_id),
+            thread_id: command.session_id,
             fork_mode: false,
+            resume_last: command.last,
+            fork_last: false,
             no_alt_screen: command.interactive.no_alt_screen,
-            startup_picker: None,
-            startup_picker_show_all: false,
+            startup_picker: if command.last || has_session_id {
+                None
+            } else {
+                Some(crabbot_tui::StartupPicker::Resume)
+            },
+            startup_picker_show_all: command.all,
         },
+        Some(&command.interactive),
         state,
     )
 }
 
 fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
-    let selected_from_picker = if command.session_id.is_none() && !command.last {
-        run_upstream_picker_with_tui(state, crabbot_tui::StartupPicker::Fork, command.all)?
-    } else {
-        None
-    };
-    let overrides = build_runtime_overrides(&command.interactive)?;
-    let target = if command.session_id.is_none() && !command.last {
-        let Some(selected) = selected_from_picker else {
-            return handle_tui_with_crate(
-                TuiArgs {
-                    thread_id: None,
-                    fork_mode: true,
-                    no_alt_screen: command.interactive.no_alt_screen,
-                    startup_picker: None,
-                    startup_picker_show_all: false,
-                },
-                state,
-            );
-        };
-        selected
-    } else {
-        resolve_source_thread_for_resume_or_fork(state, command.session_id, true, command.all)?
-    };
-    let thread_id = resolve_thread_fork(state, &target, &overrides)?;
-    maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
+    let has_session_id = command.session_id.is_some();
     handle_tui_with_crate(
         TuiArgs {
-            thread_id: Some(thread_id),
+            thread_id: command.session_id,
             fork_mode: true,
+            resume_last: false,
+            fork_last: command.last,
             no_alt_screen: command.interactive.no_alt_screen,
-            startup_picker: None,
-            startup_picker_show_all: false,
+            startup_picker: if command.last || has_session_id {
+                None
+            } else {
+                Some(crabbot_tui::StartupPicker::Fork)
+            },
+            startup_picker_show_all: command.all,
         },
+        Some(&command.interactive),
         state,
     )
 }
@@ -714,10 +729,13 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
             // cache (resume-or-start fallback), not as strict explicit input.
             thread_id: None,
             fork_mode: false,
+            resume_last: false,
+            fork_last: false,
             no_alt_screen: false,
             startup_picker: None,
             startup_picker_show_all: false,
         },
+        None,
         state,
     )
 }
