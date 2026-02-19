@@ -8,8 +8,11 @@ use clap::Parser;
 use clap::Subcommand;
 use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
+#[cfg(test)]
 use crabbot_protocol::DaemonRpcRequestResponse;
+#[cfg(test)]
 use crabbot_protocol::DaemonRpcRespondRequest;
+#[cfg(test)]
 use crabbot_protocol::DaemonRpcStreamEnvelope;
 use crabbot_protocol::DaemonSessionStatusResponse;
 use crabbot_protocol::DaemonStartSessionRequest;
@@ -44,12 +47,18 @@ use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 
+#[cfg(test)]
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
+#[cfg(test)]
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
+#[cfg(test)]
 const TUI_STREAM_REQUEST_TIMEOUT: Duration = Duration::from_millis(600);
 const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
+#[cfg(test)]
 const TUI_COMPOSER_PROMPT: &str = "\u{203a} ";
+#[cfg(test)]
 const TUI_COMPOSER_PLACEHOLDER: &str = "Ask Crabbot to do anything";
+#[cfg(test)]
 const TUI_SLASH_PICKER_MAX_ROWS: usize = 4;
 
 #[derive(Debug, Parser)]
@@ -502,6 +511,7 @@ fn handle_tui_with_crate(
     Ok(CommandOutput::Text(String::new()))
 }
 
+#[cfg(test)]
 fn run_upstream_picker_with_tui(
     state: &CliState,
     mode: crabbot_tui::StartupPicker,
@@ -552,28 +562,18 @@ fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
     }
 
     let mut state = load_state(state_path)?;
-    let mut should_persist = false;
-
-    let output = match cli.command {
-        None => {
-            should_persist = true;
-            run_interactive_default(cli.interactive, &mut state)
-        }
-        Some(TopLevelCommand::Resume(command)) => {
-            should_persist = true;
-            run_resume_command(command, &mut state)
-        }
-        Some(TopLevelCommand::Fork(command)) => {
-            should_persist = true;
-            run_fork_command(command, &mut state)
-        }
+    let (output, should_persist) = match cli.command {
+        None => (run_interactive_default(cli.interactive, &mut state), true),
+        Some(TopLevelCommand::Resume(command)) => (run_resume_command(command, &mut state), true),
+        Some(TopLevelCommand::Fork(command)) => (run_fork_command(command, &mut state), true),
         Some(TopLevelCommand::Daemon(command)) => {
             return run_daemon(command, state_path);
         }
         Some(TopLevelCommand::Codex(command)) => {
             return run_codex(command, state_path);
         }
-    }?;
+    };
+    let output = output?;
 
     if should_persist {
         save_state(state_path, &state)?;
@@ -624,15 +624,13 @@ fn run_daemon(command: DaemonCommand, state_path: &Path) -> Result<String> {
 fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
     let pid_path = daemon_pid_path(state_path)?;
     let log_path = daemon_log_path(state_path)?;
+    let listen_endpoint = resolve_daemon_listen_endpoint(state_path, state)?;
 
-    if daemon_is_healthy(
-        &state.config.daemon_endpoint,
-        state.config.auth_token.as_deref(),
-    ) {
+    if daemon_is_healthy(&listen_endpoint, state.config.auth_token.as_deref()) {
         return Ok(format!(
             "daemon is already healthy at {}\n\n{}",
-            state.config.daemon_endpoint,
-            format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
+            listen_endpoint,
+            format_daemon_websocket_qr_output(&listen_endpoint)
         ));
     }
 
@@ -664,7 +662,7 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
     let child = Command::new("codex")
         .arg("app-server")
         .arg("--listen")
-        .arg(&state.config.daemon_endpoint)
+        .arg(&listen_endpoint)
         .stdin(Stdio::null())
         .stdout(Stdio::from(log_file))
         .stderr(Stdio::from(stderr_log))
@@ -676,21 +674,18 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
         &pid_path,
         &DaemonProcessState {
             pid,
-            endpoint: state.config.daemon_endpoint.clone(),
+            endpoint: listen_endpoint.clone(),
             started_at_unix_ms: now_unix_ms(),
         },
     )?;
 
     for _ in 0..30 {
-        if daemon_is_healthy(
-            &state.config.daemon_endpoint,
-            state.config.auth_token.as_deref(),
-        ) {
+        if daemon_is_healthy(&listen_endpoint, state.config.auth_token.as_deref()) {
             return Ok(format!(
                 "daemon started (pid {pid}) at {} (log: {})\n\n{}",
-                state.config.daemon_endpoint,
+                listen_endpoint,
                 log_path.display(),
-                format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
+                format_daemon_websocket_qr_output(&listen_endpoint)
             ));
         }
         if !process_exists(pid) {
@@ -705,9 +700,9 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
 
     Ok(format!(
         "daemon started (pid {pid}) but health check timed out for {}; log: {}\n\n{}",
-        state.config.daemon_endpoint,
+        listen_endpoint,
         log_path.display(),
-        format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
+        format_daemon_websocket_qr_output(&listen_endpoint)
     ))
 }
 
@@ -812,6 +807,100 @@ fn websocket_url_for_daemon_endpoint(endpoint: &str) -> String {
         return format!("wss://{rest}");
     }
     trimmed.to_string()
+}
+
+fn resolve_daemon_listen_endpoint(state_path: &Path, state: &CliState) -> Result<String> {
+    let configured = state.config.daemon_endpoint.trim().to_string();
+    let Some(tailscale_ip) = detect_tailscale_ipv4() else {
+        return Ok(configured);
+    };
+    if !endpoint_host_is_local(&configured) {
+        return Ok(configured);
+    }
+    let Some(tailscale_endpoint) = replace_endpoint_host(&configured, &tailscale_ip) else {
+        return Ok(configured);
+    };
+
+    if tailscale_endpoint != configured {
+        let mut updated = state.clone();
+        updated.config.daemon_endpoint = tailscale_endpoint.clone();
+        save_state(state_path, &updated)?;
+    }
+
+    Ok(tailscale_endpoint)
+}
+
+fn detect_tailscale_ipv4() -> Option<String> {
+    let output = Command::new("tailscale").args(["ip", "-4"]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| is_plain_ipv4(line))
+        .map(ToString::to_string)
+}
+
+fn is_plain_ipv4(value: &str) -> bool {
+    let mut parts = value.split('.');
+    for _ in 0..4 {
+        let Some(part) = parts.next() else {
+            return false;
+        };
+        if part.is_empty() || part.parse::<u8>().is_err() {
+            return false;
+        }
+    }
+    parts.next().is_none()
+}
+
+fn endpoint_host_is_local(endpoint: &str) -> bool {
+    let Some((_, authority, _)) = split_endpoint(endpoint) else {
+        return false;
+    };
+    let host = authority
+        .trim_start_matches('[')
+        .trim_end_matches(']')
+        .split(':')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    host == "localhost" || host == "127.0.0.1" || host == "::1"
+}
+
+fn replace_endpoint_host(endpoint: &str, host: &str) -> Option<String> {
+    let (scheme, authority, suffix) = split_endpoint(endpoint)?;
+    let port = if authority.starts_with('[') {
+        authority
+            .rfind("]:")
+            .and_then(|idx| authority.get(idx + 2..))
+            .filter(|port| !port.is_empty())
+            .map(ToString::to_string)?
+    } else if let Some((_, port)) = authority.rsplit_once(':') {
+        if port.is_empty() {
+            return None;
+        }
+        port.to_string()
+    } else {
+        return None;
+    };
+    Some(format!("{scheme}://{host}:{port}{suffix}"))
+}
+
+fn split_endpoint(endpoint: &str) -> Option<(String, String, String)> {
+    let trimmed = endpoint.trim();
+    let (scheme, rest) = trimmed.split_once("://")?;
+    let (authority, path_and_more) = if let Some((authority, suffix)) = rest.split_once('/') {
+        (authority, format!("/{suffix}"))
+    } else {
+        (rest, String::new())
+    };
+    if authority.is_empty() {
+        return None;
+    }
+    Some((scheme.to_string(), authority.to_string(), path_and_more))
 }
 
 fn render_qr_code(text: &str) -> String {
@@ -1141,6 +1230,7 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
 }
 
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct RuntimeOverrides {
     model: Option<String>,
     cwd: Option<String>,
@@ -1149,6 +1239,7 @@ struct RuntimeOverrides {
     config: Value,
 }
 
+#[cfg(test)]
 fn build_runtime_overrides(args: &InteractiveArgs) -> Result<RuntimeOverrides> {
     let (sandbox_mode, approval_policy) = if args.full_auto {
         (
@@ -1217,6 +1308,7 @@ fn build_runtime_overrides(args: &InteractiveArgs) -> Result<RuntimeOverrides> {
     })
 }
 
+#[cfg(test)]
 fn approval_policy_to_wire(policy: &crabbot_tui::ApprovalModeCliArg) -> String {
     match policy {
         crabbot_tui::ApprovalModeCliArg::UnlessTrusted => "untrusted",
@@ -1227,6 +1319,7 @@ fn approval_policy_to_wire(policy: &crabbot_tui::ApprovalModeCliArg) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn sandbox_mode_to_wire(mode: &crabbot_tui::SandboxModeCliArg) -> String {
     match mode {
         crabbot_tui::SandboxModeCliArg::ReadOnly => "read-only",
@@ -1236,6 +1329,7 @@ fn sandbox_mode_to_wire(mode: &crabbot_tui::SandboxModeCliArg) -> String {
     .to_string()
 }
 
+#[cfg(test)]
 fn apply_key_value_override(config: &mut Value, pair: &str) -> Result<()> {
     let (key, raw_value) = pair
         .split_once('=')
@@ -1247,6 +1341,7 @@ fn apply_key_value_override(config: &mut Value, pair: &str) -> Result<()> {
     apply_dotted_value(config, key, parsed_value)
 }
 
+#[cfg(test)]
 fn apply_dotted_value(root: &mut Value, dotted_key: &str, value: Value) -> Result<()> {
     let mut parts = dotted_key.split('.').peekable();
     if parts.peek().is_none() {
@@ -1275,6 +1370,7 @@ fn apply_dotted_value(root: &mut Value, dotted_key: &str, value: Value) -> Resul
     Ok(())
 }
 
+#[cfg(test)]
 fn thread_params_for_overrides(overrides: &RuntimeOverrides) -> Value {
     json!({
         "model": overrides.model,
@@ -1285,6 +1381,7 @@ fn thread_params_for_overrides(overrides: &RuntimeOverrides) -> Value {
     })
 }
 
+#[cfg(test)]
 fn start_thread_with_overrides(
     state: &mut CliState,
     overrides: &RuntimeOverrides,
@@ -1301,6 +1398,7 @@ fn start_thread_with_overrides(
     Ok(thread_id)
 }
 
+#[cfg(test)]
 fn resolve_thread_resume(
     state: &mut CliState,
     thread_id: &str,
@@ -1320,6 +1418,7 @@ fn resolve_thread_resume(
     Ok(resolved)
 }
 
+#[cfg(test)]
 fn resolve_thread_fork(
     state: &mut CliState,
     thread_id: &str,
@@ -1339,6 +1438,7 @@ fn resolve_thread_fork(
     Ok(resolved)
 }
 
+#[cfg(test)]
 fn resolve_source_thread_for_resume_or_fork(
     state: &CliState,
     explicit: Option<String>,
@@ -1358,6 +1458,7 @@ fn resolve_source_thread_for_resume_or_fork(
     pick_thread_id_from_prompt(state, all)
 }
 
+#[cfg(test)]
 fn latest_thread_id_for_selection(state: &CliState, all: bool) -> Result<String> {
     let mut params = json!({
         "sortKey": "updated_at",
@@ -1385,6 +1486,7 @@ fn latest_thread_id_for_selection(state: &CliState, all: bool) -> Result<String>
     Ok(first.to_string())
 }
 
+#[cfg(test)]
 fn pick_thread_id_from_prompt(state: &CliState, all: bool) -> Result<String> {
     let mut params = json!({
         "sortKey": "updated_at",
@@ -1446,6 +1548,7 @@ fn pick_thread_id_from_prompt(state: &CliState, all: bool) -> Result<String> {
     Ok(choices[selected_idx - 1].0.clone())
 }
 
+#[cfg(test)]
 fn maybe_send_initial_prompt(
     state: &CliState,
     thread_id: &str,
@@ -1989,6 +2092,29 @@ fn endpoint_has_open_listener(endpoint: &str) -> bool {
 }
 
 fn ensure_daemon_ready(state: &CliState) -> Result<()> {
+    if !endpoint_uses_websocket_transport(&state.config.daemon_endpoint) {
+        if daemon_is_healthy(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+        ) {
+            return Ok(());
+        }
+    } else {
+        crabbot_tui::ensure_app_server_ready_raw(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+        )
+        .with_context(|| {
+            format!(
+                "app-server is not reachable at {}; run `codex app-server --listen {}`",
+                state.config.daemon_endpoint, state.config.daemon_endpoint
+            )
+        })?;
+        return Ok(());
+    }
+
+    // For HTTP endpoints, surface a useful message that keeps parity with ws endpoints.
+    // The daemon HTTP API remains compatible with the app-server transport.
     crabbot_tui::ensure_app_server_ready_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
@@ -2134,6 +2260,7 @@ fn daemon_get_session_status(
         .context("parse daemon status response")
 }
 
+#[cfg(test)]
 fn daemon_app_server_rpc_request(
     daemon_endpoint: &str,
     auth_token: Option<&str>,
@@ -2143,6 +2270,7 @@ fn daemon_app_server_rpc_request(
     crabbot_tui::app_server_rpc_request_raw(daemon_endpoint, auth_token, method, params)
 }
 
+#[cfg(test)]
 fn daemon_app_server_rpc_respond(
     daemon_endpoint: &str,
     auth_token: Option<&str>,
@@ -2160,6 +2288,7 @@ fn daemon_app_server_rpc_respond(
     Ok(())
 }
 
+#[cfg(test)]
 fn fetch_daemon_app_server_stream(
     daemon_endpoint: &str,
     auth_token: Option<&str>,
@@ -2188,10 +2317,12 @@ fn fetch_daemon_app_server_stream(
         .collect::<Result<Vec<_>>>()
 }
 
+#[cfg(test)]
 fn request_id_key_for_cli(request_id: &Value) -> String {
     serde_json::to_string(request_id).unwrap_or_else(|_| request_id.to_string())
 }
 
+#[cfg(test)]
 fn extract_thread_id_from_rpc_result(result: &Value) -> Option<String> {
     result
         .get("thread")
@@ -2385,6 +2516,7 @@ fn render_attach_tui_with_columns_and_fallback(
     output
 }
 
+#[cfg(test)]
 fn cached_session_state_label<'a>(state: &'a CliState, session_id: &str) -> Option<&'a str> {
     state
         .sessions
@@ -2498,6 +2630,30 @@ mod tests {
     fn run_json(cli: Cli, state_path: &Path) -> Value {
         let output = run_with_state_path(cli, state_path).expect("run command");
         serde_json::from_str(&output).expect("parse command output")
+    }
+
+    fn test_cli(command: TopLevelCommand) -> Cli {
+        Cli {
+            version: false,
+            interactive: InteractiveArgs {
+                prompt: None,
+                images: vec![],
+                config: vec![],
+                enable: vec![],
+                disable: vec![],
+                model: None,
+                profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+                full_auto: false,
+                dangerously_bypass_approvals_and_sandbox: false,
+                cwd: None,
+                search: false,
+                add_dir: vec![],
+                no_alt_screen: false,
+            },
+            command: Some(command),
+        }
     }
 
     #[derive(Debug)]
@@ -2628,67 +2784,57 @@ mod tests {
         ]);
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let start = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Start(StartArgs {
-                        session_id: Some("sess_cli_1".to_string()),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Start(StartArgs {
+                    session_id: Some("sess_cli_1".to_string()),
+                })),
+            })),
             &state_path,
         );
         assert_eq!(start["ok"], true);
         assert_eq!(start["state"], "active");
 
         let interrupt = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Interrupt(SessionArgs {
-                        session_id: "sess_cli_1".to_string(),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Interrupt(SessionArgs {
+                    session_id: "sess_cli_1".to_string(),
+                })),
+            })),
             &state_path,
         );
         assert_eq!(interrupt["state"], "interrupted");
 
         let resume = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Resume(SessionArgs {
-                        session_id: "sess_cli_1".to_string(),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Resume(SessionArgs {
+                    session_id: "sess_cli_1".to_string(),
+                })),
+            })),
             &state_path,
         );
         assert_eq!(resume["state"], "active");
 
         let status = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Status(StatusArgs {
-                        session_id: Some("sess_cli_1".to_string()),
-                        check_api: false,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Status(StatusArgs {
+                    session_id: Some("sess_cli_1".to_string()),
+                    check_api: false,
+                })),
+            })),
             &state_path,
         );
         assert_eq!(status["state"], "active");
@@ -2713,30 +2859,26 @@ mod tests {
         ]);
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let prompt = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Prompt(PromptArgs {
-                        session_id: "sess_cli_prompt".to_string(),
-                        text: "ship it".to_string(),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Prompt(PromptArgs {
+                    session_id: "sess_cli_prompt".to_string(),
+                    text: "ship it".to_string(),
+                })),
+            })),
             &state_path,
         );
         assert_eq!(prompt["ok"], true);
@@ -2751,31 +2893,27 @@ mod tests {
         let (_dir, state_path) = temp_state_path();
 
         let set = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: Some("https://api.crabbot.local".to_string()),
-                            daemon_endpoint: Some("https://daemon.crabbot.local".to_string()),
-                            auth_token: Some("token_123".to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: Some("https://api.crabbot.local".to_string()),
+                        daemon_endpoint: Some("https://daemon.crabbot.local".to_string()),
+                        auth_token: Some("token_123".to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
         assert_eq!(set["ok"], true);
         assert_eq!(set["config"]["api_endpoint"], "https://api.crabbot.local");
 
         let show = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Show,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Show,
+                })),
+            })),
             &state_path,
         );
         assert_eq!(
@@ -2835,30 +2973,26 @@ mod tests {
         );
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: Some(api_endpoint),
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: Some(api_endpoint),
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let attach = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Attach(AttachArgs {
-                        session_id: Some("sess_cli_attach".to_string()),
-                        tui: false,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Attach(AttachArgs {
+                    session_id: Some("sess_cli_attach".to_string()),
+                    tui: false,
+                })),
+            })),
             &state_path,
         );
         assert_eq!(attach["ok"], true);
@@ -2868,14 +3002,12 @@ mod tests {
         assert_eq!(attach["stream_events"][0]["event"]["type"], "session_state");
 
         let status = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Status(StatusArgs {
-                        session_id: None,
-                        check_api: true,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Status(StatusArgs {
+                    session_id: None,
+                    check_api: true,
+                })),
+            })),
             &state_path,
         );
         assert_eq!(status["ok"], true);
@@ -2947,14 +3079,12 @@ mod tests {
         .expect("seed cli state");
 
         let attach = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Attach(AttachArgs {
-                        session_id: None,
-                        tui: false,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Attach(AttachArgs {
+                    session_id: None,
+                    tui: false,
+                })),
+            })),
             &state_path,
         );
 
@@ -2999,30 +3129,26 @@ mod tests {
         ]);
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let attach = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Attach(AttachArgs {
-                        session_id: None,
-                        tui: false,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Attach(AttachArgs {
+                    session_id: None,
+                    tui: false,
+                })),
+            })),
             &state_path,
         );
 
@@ -3074,30 +3200,26 @@ mod tests {
         ]);
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let attach = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Attach(AttachArgs {
-                        session_id: Some("sess_missing".to_string()),
-                        tui: false,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Attach(AttachArgs {
+                    session_id: Some("sess_missing".to_string()),
+                    tui: false,
+                })),
+            })),
             &state_path,
         );
 
@@ -3163,30 +3285,26 @@ mod tests {
         );
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint.clone()),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint.clone()),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let output = run_with_state_path(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Attach(AttachArgs {
-                        session_id: Some("sess_cli_tui".to_string()),
-                        tui: true,
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Attach(AttachArgs {
+                    session_id: Some("sess_cli_tui".to_string()),
+                    tui: true,
+                })),
+            })),
             &state_path,
         )
         .expect("run attach tui");
@@ -3256,25 +3374,21 @@ mod tests {
         ]);
 
         let _ = run_json(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand {
-                    command: Some(CodexSubcommand::Config(ConfigCommand {
-                        command: ConfigSubcommand::Set(ConfigSetArgs {
-                            api_endpoint: None,
-                            daemon_endpoint: Some(daemon_endpoint),
-                            auth_token: Some(auth_token.to_string()),
-                            clear_auth_token: false,
-                        }),
-                    })),
-                }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand {
+                command: Some(CodexSubcommand::Config(ConfigCommand {
+                    command: ConfigSubcommand::Set(ConfigSetArgs {
+                        api_endpoint: None,
+                        daemon_endpoint: Some(daemon_endpoint),
+                        auth_token: Some(auth_token.to_string()),
+                        clear_auth_token: false,
+                    }),
+                })),
+            })),
             &state_path,
         );
 
         let output = run_with_state_path(
-            Cli {
-                command: TopLevelCommand::Codex(CodexCommand { command: None }),
-            },
+            test_cli(TopLevelCommand::Codex(CodexCommand { command: None })),
             &state_path,
         )
         .expect("run codex default command");
@@ -3376,6 +3490,25 @@ mod tests {
         assert!(output.contains("qr:"));
         assert!(!output.contains("(qr unavailable:"));
         assert!(output.lines().count() > 3);
+    }
+
+    #[test]
+    fn replace_endpoint_host_preserves_scheme_port_and_path() {
+        assert_eq!(
+            replace_endpoint_host("ws://127.0.0.1:8765/v1/sessions", "100.64.0.2"),
+            Some("ws://100.64.0.2:8765/v1/sessions".to_string())
+        );
+        assert_eq!(
+            replace_endpoint_host("https://localhost:443", "100.64.0.2"),
+            Some("https://100.64.0.2:443".to_string())
+        );
+    }
+
+    #[test]
+    fn endpoint_host_is_local_detects_local_hosts() {
+        assert!(endpoint_host_is_local("ws://127.0.0.1:8765"));
+        assert!(endpoint_host_is_local("ws://localhost:8765"));
+        assert!(!endpoint_host_is_local("ws://100.64.0.2:8765"));
     }
 
     #[test]
