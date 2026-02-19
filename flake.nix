@@ -57,6 +57,9 @@
           cargo-audit
           pkg-config
         ];
+        nativeBuildDeps = with pkgs; [
+          openssl
+        ];
       in {
         # Pre-commit hooks configuration (mirrors your Python setup’s style)
         pre-commit.settings = {
@@ -95,6 +98,10 @@
           shellHook = ''
             # Ensure cargo/rustc/clippy all resolve from the same pinned toolchain.
             export PATH=${toolchain}/bin:$PATH
+            # Help native crates (for example openssl-sys) find OpenSSL in Nix.
+            export OPENSSL_DIR=${pkgs.openssl.dev}
+            export OPENSSL_LIB_DIR=${pkgs.openssl.out}/lib
+            export OPENSSL_INCLUDE_DIR=${pkgs.openssl.dev}/include
             ${config.pre-commit.installationScript}
             echo 1>&2 "Welcome to the development shell ($( ${rustc}/bin/rustc --version ))!"
             echo 1>&2 "  - rustc:   $(${pkgs.coreutils}/bin/printf '%s' "$(${rustc}/bin/rustc --version)")"
@@ -113,7 +120,8 @@
               clippy
               analyzer
             ]
-            ++ cargoComponents;
+            ++ cargoComponents
+            ++ nativeBuildDeps;
         };
       };
 

@@ -540,11 +540,9 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             vec![UiEvent::McpToolCallBegin {
                 call_id,
                 invocation: codex_core::protocol::McpInvocation {
-                    server: server.clone(),
-                    tool: tool.clone(),
+                    server,
+                    tool,
                     arguments: notification.params.get("arguments").cloned(),
-                    server_name: server,
-                    tool_name: tool,
                 },
             }]
         }
@@ -577,7 +575,12 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
                     .get("result")
                     .and_then(|result| result.get("isError"))
                     .and_then(Value::as_bool);
-                Ok(codex_protocol::mcp::CallToolResult { content, is_error })
+                Ok(codex_protocol::mcp::CallToolResult {
+                    content,
+                    structured_content: None,
+                    is_error,
+                    meta: None,
+                })
             };
             vec![UiEvent::McpToolCallEnd {
                 call_id,
@@ -942,12 +945,6 @@ fn map_rpc_server_request_to_ui_event(
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string(),
-                request_id: request_key.to_string(),
-                prompt: request
-                    .params
-                    .get("prompt")
-                    .and_then(Value::as_str)
-                    .map(ToString::to_string),
                 questions: Vec::new(),
             };
             if let Some(questions) = request.params.get("questions").cloned()
@@ -1349,6 +1346,7 @@ fn parse_token_usage_updated(
 
     Some((
         codex_core::protocol::TokenUsageInfo {
+            total_token_usage: total_usage.clone(),
             last_token_usage: last_usage,
             model_context_window,
         },
@@ -1547,6 +1545,7 @@ fn parse_token_usage_updated_from_info(
         .and_then(Value::as_i64);
     Some((
         codex_core::protocol::TokenUsageInfo {
+            total_token_usage: parse_token_usage_breakdown(total),
             last_token_usage: parse_token_usage_breakdown(last),
             model_context_window,
         },
@@ -1589,6 +1588,7 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::Rate
         primary,
         secondary,
         credits,
+        plan_type: None,
     })
 }
 
@@ -1644,7 +1644,7 @@ fn command_vec_from_value(value: Option<&Value>) -> Vec<String> {
 
 fn parse_exec_source(source: Option<&Value>) -> codex_core::protocol::ExecCommandSource {
     match source.and_then(Value::as_str).unwrap_or("agent") {
-        "user" => codex_core::protocol::ExecCommandSource::User,
+        "user" => codex_core::protocol::ExecCommandSource::UserShell,
         "user_shell" => codex_core::protocol::ExecCommandSource::UserShell,
         "unified_exec_startup" => codex_core::protocol::ExecCommandSource::UnifiedExecStartup,
         "unified_exec_interaction" => {
@@ -1739,11 +1739,9 @@ fn map_item_started_notification(params: &Value) -> Vec<UiEvent> {
                 .unwrap_or("tool")
                 .to_string();
             let invocation = codex_core::protocol::McpInvocation {
-                server: server.clone(),
-                tool: tool.clone(),
+                server,
+                tool,
                 arguments: item.get("arguments").cloned(),
-                server_name: server,
-                tool_name: tool,
             };
             vec![UiEvent::McpToolCallBegin {
                 call_id,
@@ -1844,12 +1842,19 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
                                 .and_then(Value::as_array)
                                 .cloned()
                                 .unwrap_or_default(),
+                            structured_content: None,
                             is_error: result_value.get("isError").and_then(Value::as_bool),
+                            meta: None,
                         }
                     });
                 Ok(call_result)
             } else {
-                Ok(codex_protocol::mcp::CallToolResult::default())
+                Ok(codex_protocol::mcp::CallToolResult {
+                    content: Vec::new(),
+                    structured_content: None,
+                    is_error: None,
+                    meta: None,
+                })
             };
             vec![UiEvent::McpToolCallEnd {
                 call_id: call_id.to_string(),
@@ -1866,10 +1871,9 @@ fn map_item_completed_notification(params: &Value) -> Vec<UiEvent> {
                 .and_then(Value::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let action = if item.get("action").is_some() {
-                codex_protocol::models::WebSearchAction::Cached
-            } else {
-                codex_protocol::models::WebSearchAction::Requested
+            let action = codex_protocol::models::WebSearchAction::Search {
+                query: None,
+                queries: None,
             };
             vec![UiEvent::WebSearchEnd {
                 call_id: call_id.to_string(),
@@ -2525,7 +2529,7 @@ pub(crate) fn list_skills_for_cwd(
     Ok(out)
 }
 
-pub(crate) fn list_connectors(state: &CliState) -> Result<Vec<codex_chatgpt::connectors::AppInfo>> {
+pub(crate) fn list_connectors(state: &CliState) -> Result<Vec<crate::connectors::AppInfo>> {
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
@@ -2541,7 +2545,7 @@ pub(crate) fn list_connectors(state: &CliState) -> Result<Vec<codex_chatgpt::con
         .unwrap_or_default()
         .into_iter()
         .filter_map(|app| {
-            Some(codex_chatgpt::connectors::AppInfo {
+            Some(crate::connectors::AppInfo {
                 id: app.get("id")?.as_str()?.to_string(),
                 name: app.get("name")?.as_str()?.to_string(),
                 description: app

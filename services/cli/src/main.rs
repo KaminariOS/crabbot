@@ -263,6 +263,8 @@ struct AttachArgs {
 struct TuiArgs {
     #[arg(long)]
     thread_id: Option<String>,
+    #[arg(skip)]
+    fork_mode: bool,
     #[arg(long, default_value_t = false)]
     no_alt_screen: bool,
     #[arg(skip)]
@@ -383,25 +385,63 @@ fn convert_output_from_tui(output: crabbot_tui::CommandOutput) -> CommandOutput 
 }
 
 fn handle_tui_with_crate(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
-    let mut tui_state = convert_state_to_tui(state)?;
+    crabbot_tui::set_app_server_connection_raw(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+    );
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .context("initialize tokio runtime for tui")?;
-    let output = runtime.block_on(async {
-        crabbot_tui::handle_tui(
-            crabbot_tui::TuiArgs {
-                thread_id: args.thread_id,
+    let exit_info = runtime.block_on(async {
+        crabbot_tui::run_main(
+            crabbot_tui::Cli {
+                prompt: None,
+                images: Vec::new(),
+                resume_picker: matches!(
+                    args.startup_picker,
+                    Some(crabbot_tui::StartupPicker::Resume)
+                ),
+                resume_last: false,
+                resume_session_id: if args.fork_mode {
+                    None
+                } else {
+                    args.thread_id.clone()
+                },
+                resume_show_all: args.startup_picker_show_all
+                    && matches!(
+                        args.startup_picker,
+                        Some(crabbot_tui::StartupPicker::Resume)
+                    ),
+                fork_picker: matches!(args.startup_picker, Some(crabbot_tui::StartupPicker::Fork)),
+                fork_last: false,
+                fork_session_id: if args.fork_mode {
+                    args.thread_id.clone()
+                } else {
+                    None
+                },
+                fork_show_all: args.startup_picker_show_all
+                    && matches!(args.startup_picker, Some(crabbot_tui::StartupPicker::Fork)),
+                model: None,
+                oss: false,
+                oss_provider: None,
+                config_profile: None,
+                sandbox_mode: None,
+                approval_policy: None,
+                full_auto: false,
+                dangerously_bypass_approvals_and_sandbox: false,
+                cwd: None,
+                web_search: false,
+                add_dir: Vec::new(),
                 no_alt_screen: args.no_alt_screen,
-                startup_picker: args.startup_picker,
-                startup_picker_show_all: args.startup_picker_show_all,
+                config_overrides: crabbot_tui::CliConfigOverrides::default(),
             },
-            &mut tui_state,
+            None,
         )
         .await
     })?;
-    *state = convert_state_from_tui(tui_state)?;
-    Ok(convert_output_from_tui(output))
+    state.last_thread_id = exit_info.thread_id.map(|id| id.to_string());
+    Ok(CommandOutput::Text(String::new()))
 }
 
 fn run_upstream_picker_with_tui(
@@ -576,6 +616,7 @@ fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Resul
     handle_tui_with_crate(
         TuiArgs {
             thread_id: Some(thread_id),
+            fork_mode: false,
             no_alt_screen: args.no_alt_screen,
             startup_picker: None,
             startup_picker_show_all: false,
@@ -597,6 +638,7 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
             return handle_tui_with_crate(
                 TuiArgs {
                     thread_id: None,
+                    fork_mode: false,
                     no_alt_screen: command.interactive.no_alt_screen,
                     startup_picker: None,
                     startup_picker_show_all: false,
@@ -614,6 +656,7 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
     handle_tui_with_crate(
         TuiArgs {
             thread_id: Some(thread_id),
+            fork_mode: false,
             no_alt_screen: command.interactive.no_alt_screen,
             startup_picker: None,
             startup_picker_show_all: false,
@@ -635,6 +678,7 @@ fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<Comman
             return handle_tui_with_crate(
                 TuiArgs {
                     thread_id: None,
+                    fork_mode: true,
                     no_alt_screen: command.interactive.no_alt_screen,
                     startup_picker: None,
                     startup_picker_show_all: false,
@@ -651,6 +695,7 @@ fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<Comman
     handle_tui_with_crate(
         TuiArgs {
             thread_id: Some(thread_id),
+            fork_mode: true,
             no_alt_screen: command.interactive.no_alt_screen,
             startup_picker: None,
             startup_picker_show_all: false,
@@ -681,6 +726,7 @@ fn handle_codex_default(state: &mut CliState) -> Result<CommandOutput> {
             // Leave this empty so TUI can treat persisted `last_thread_id` as
             // cache (resume-or-start fallback), not as strict explicit input.
             thread_id: None,
+            fork_mode: false,
             no_alt_screen: false,
             startup_picker: None,
             startup_picker_show_all: false,

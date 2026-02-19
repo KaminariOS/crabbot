@@ -13,6 +13,7 @@ path = "src/lib.rs"
 anyhow.workspace = true
 base64 = "0.22"
 codex-utils-fuzzy-match = { git = "https://github.com/openai/codex.git", rev = "82d82d9ca", package = "codex-utils-fuzzy-match" }
+codex-protocol = { path = "/home/kosumi/repos/codex/codex-rs/protocol" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 dunce = "1.0.5"
@@ -58,6 +59,7 @@ toml = "0.8"
 uuid = { version = "1.21.0", features = ["v4"] }
 tungstenite = "0.28.0"
 url.workspace = true
+webbrowser = "1.0.6"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

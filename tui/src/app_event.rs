@@ -10,7 +10,7 @@
 
 use std::path::PathBuf;
 
-use codex_chatgpt::connectors::AppInfo;
+use crate::connectors::AppInfo;
 use codex_core::protocol::Event;
 use codex_core::protocol::RateLimitSnapshot;
 use codex_file_search::FileMatch;

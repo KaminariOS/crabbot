@@ -1,8 +1,9 @@
+use std::collections::HashMap;
 use std::collections::HashSet;
+use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use crate::CliState;
 use crate::diff_render::display_path_for;
 use crate::key_hint;
 use crate::text_formatting::truncate_text;
@@ -10,13 +11,17 @@ use crate::tui::FrameRequester;
 use crate::tui::Tui;
 use crate::tui::TuiEvent;
 use chrono::DateTime;
-use chrono::TimeZone;
 use chrono::Utc;
-use codex_core::PickerThreadEntry as ApiThread;
-use codex_core::PickerThreadPage as ThreadsPage;
+use codex_core::Cursor;
+use codex_core::INTERACTIVE_SESSION_SOURCES;
+use codex_core::RolloutRecorder;
+use codex_core::ThreadItem;
 use codex_core::ThreadSortKey;
-use codex_core::list_threads_page_for_picker;
+use codex_core::ThreadsPage;
+use codex_core::config::Config;
+use codex_core::find_thread_names_by_ids;
 use codex_core::path_utils;
+use codex_protocol::ThreadId;
 use color_eyre::eyre::Result;
 use crossterm::event::KeyCode;
 use crossterm::event::KeyEvent;
@@ -37,8 +42,8 @@ const LOAD_NEAR_THRESHOLD: usize = 5;
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
-    Resume(String),
-    Fork(String),
+    Resume(PathBuf),
+    Fork(PathBuf),
     Exit,
 }
 
@@ -63,19 +68,20 @@ impl SessionPickerAction {
         }
     }
 
-    fn selection(self, thread_id: String) -> SessionSelection {
+    fn selection(self, path: PathBuf) -> SessionSelection {
         match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(thread_id),
-            SessionPickerAction::Fork => SessionSelection::Fork(thread_id),
+            SessionPickerAction::Resume => SessionSelection::Resume(path),
+            SessionPickerAction::Fork => SessionSelection::Fork(path),
         }
     }
 }
 
 #[derive(Clone)]
 struct PageLoadRequest {
-    cursor: Option<String>,
+    cursor: Option<Cursor>,
     request_token: usize,
     search_token: Option<usize>,
+    default_provider: String,
     sort_key: ThreadSortKey,
 }
 
@@ -107,49 +113,54 @@ enum BackgroundEvent {
 /// 2. Working-directory filtering at the picker (unless `--all` is passed).
 pub async fn run_resume_picker(
     tui: &mut Tui,
-    state: &CliState,
+    config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, state, show_all, SessionPickerAction::Resume).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Resume).await
 }
 
 pub async fn run_fork_picker(
     tui: &mut Tui,
-    state: &CliState,
+    config: &Config,
     show_all: bool,
 ) -> Result<SessionSelection> {
-    run_session_picker(tui, state, show_all, SessionPickerAction::Fork).await
+    run_session_picker(tui, config, show_all, SessionPickerAction::Fork).await
 }
 
 async fn run_session_picker(
     tui: &mut Tui,
-    state: &CliState,
+    config: &Config,
     show_all: bool,
     action: SessionPickerAction,
 ) -> Result<SessionSelection> {
     let alt = AltScreenGuard::enter(tui);
     let (bg_tx, bg_rx) = mpsc::unbounded_channel();
+
+    let default_provider = config.model_provider_id.to_string();
+    let codex_home = config.codex_home.as_path();
     let filter_cwd = if show_all {
         None
     } else {
         std::env::current_dir().ok()
     };
 
-    let state = state.clone();
+    let config = config.clone();
     let loader_tx = bg_tx.clone();
     let page_loader: PageLoader = Arc::new(move |request: PageLoadRequest| {
         let tx = loader_tx.clone();
-        let state = state.clone();
+        let config = config.clone();
         tokio::spawn(async move {
-            let page = list_threads_page_for_picker(
-                &state,
-                request.cursor,
+            let provider_filter = vec![request.default_provider.clone()];
+            let page = RolloutRecorder::list_threads(
+                &config,
                 PAGE_SIZE,
+                request.cursor.as_ref(),
                 request.sort_key,
-                false,
-                None,
+                INTERACTIVE_SESSION_SOURCES,
+                Some(provider_filter.as_slice()),
+                request.default_provider.as_str(),
             )
-            .map_err(std::io::Error::other);
+            .await;
             let _ = tx.send(BackgroundEvent::PageLoaded {
                 request_token: request.request_token,
                 search_token: request.search_token,
@@ -159,8 +170,10 @@ async fn run_session_picker(
     });
 
     let mut state = PickerState::new(
+        codex_home.to_path_buf(),
         alt.tui.frame_requester(),
         page_loader,
+        default_provider.clone(),
         show_all,
         filter_cwd,
         action,
@@ -232,11 +245,12 @@ impl Drop for AltScreenGuard<'_> {
 }
 
 struct PickerState {
+    codex_home: PathBuf,
     requester: FrameRequester,
     pagination: PaginationState,
     all_rows: Vec<Row>,
     filtered_rows: Vec<Row>,
-    seen_thread_ids: HashSet<String>,
+    seen_paths: HashSet<PathBuf>,
     selected: usize,
     scroll_top: usize,
     query: String,
@@ -245,14 +259,16 @@ struct PickerState {
     next_search_token: usize,
     page_loader: PageLoader,
     view_rows: Option<usize>,
+    default_provider: String,
     show_all: bool,
     filter_cwd: Option<PathBuf>,
     action: SessionPickerAction,
     sort_key: ThreadSortKey,
+    thread_name_cache: HashMap<ThreadId, Option<String>>,
 }
 
 struct PaginationState {
-    next_cursor: Option<String>,
+    next_cursor: Option<Cursor>,
     num_scanned_files: usize,
     reached_scan_cap: bool,
     loading: LoadingState,
@@ -302,8 +318,10 @@ impl SearchState {
 
 #[derive(Clone)]
 struct Row {
-    thread_id: String,
+    path: PathBuf,
     preview: String,
+    thread_id: Option<ThreadId>,
+    thread_name: Option<String>,
     created_at: Option<DateTime<Utc>>,
     updated_at: Option<DateTime<Utc>>,
     cwd: Option<PathBuf>,
@@ -312,14 +330,16 @@ struct Row {
 
 impl Row {
     fn display_preview(&self) -> &str {
-        &self.preview
+        self.thread_name.as_deref().unwrap_or(&self.preview)
     }
 
     fn matches_query(&self, query: &str) -> bool {
         if self.preview.to_lowercase().contains(query) {
             return true;
         }
-        if self.thread_id.to_lowercase().contains(query) {
+        if let Some(thread_name) = self.thread_name.as_ref()
+            && thread_name.to_lowercase().contains(query)
+        {
             return true;
         }
         false
@@ -328,13 +348,16 @@ impl Row {
 
 impl PickerState {
     fn new(
+        codex_home: PathBuf,
         requester: FrameRequester,
         page_loader: PageLoader,
+        default_provider: String,
         show_all: bool,
         filter_cwd: Option<PathBuf>,
         action: SessionPickerAction,
     ) -> Self {
         Self {
+            codex_home,
             requester,
             pagination: PaginationState {
                 next_cursor: None,
@@ -344,7 +367,7 @@ impl PickerState {
             },
             all_rows: Vec::new(),
             filtered_rows: Vec::new(),
-            seen_thread_ids: HashSet::new(),
+            seen_paths: HashSet::new(),
             selected: 0,
             scroll_top: 0,
             query: String::new(),
@@ -353,10 +376,12 @@ impl PickerState {
             next_search_token: 0,
             page_loader,
             view_rows: None,
+            default_provider,
             show_all,
             filter_cwd,
             action,
             sort_key: ThreadSortKey::CreatedAt,
+            thread_name_cache: HashMap::new(),
         }
     }
 
@@ -376,7 +401,7 @@ impl PickerState {
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    return Ok(Some(self.action.selection(row.thread_id.clone())));
+                    return Ok(Some(self.action.selection(row.path.clone())));
                 }
             }
             KeyCode::Up => {
@@ -442,7 +467,7 @@ impl PickerState {
         self.reset_pagination();
         self.all_rows.clear();
         self.filtered_rows.clear();
-        self.seen_thread_ids.clear();
+        self.seen_paths.clear();
         self.selected = 0;
 
         let search_token = if self.query.is_empty() {
@@ -465,6 +490,7 @@ impl PickerState {
             cursor: None,
             request_token,
             search_token,
+            default_provider: self.default_provider.clone(),
             sort_key: self.sort_key,
         });
     }
@@ -486,6 +512,7 @@ impl PickerState {
                 self.pagination.loading = LoadingState::Idle;
                 let page = page.map_err(color_eyre::Report::from)?;
                 self.ingest_page(page);
+                self.update_thread_names().await;
                 let completed_token = pending.search_token.or(search_token);
                 self.continue_search_if_token_matches(completed_token);
             }
@@ -516,12 +543,54 @@ impl PickerState {
 
         let rows = rows_from_items(page.items);
         for row in rows {
-            if self.seen_thread_ids.insert(row.thread_id.clone()) {
+            if self.seen_paths.insert(row.path.clone()) {
                 self.all_rows.push(row);
             }
         }
 
         self.apply_filter();
+    }
+
+    async fn update_thread_names(&mut self) {
+        let mut missing_ids = HashSet::new();
+        for row in &self.all_rows {
+            let Some(thread_id) = row.thread_id else {
+                continue;
+            };
+            if self.thread_name_cache.contains_key(&thread_id) {
+                continue;
+            }
+            missing_ids.insert(thread_id);
+        }
+
+        if missing_ids.is_empty() {
+            return;
+        }
+
+        let names = find_thread_names_by_ids(&self.codex_home, &missing_ids)
+            .await
+            .unwrap_or_default();
+        for thread_id in missing_ids {
+            let thread_name = names.get(&thread_id).cloned();
+            self.thread_name_cache.insert(thread_id, thread_name);
+        }
+
+        let mut updated = false;
+        for row in self.all_rows.iter_mut() {
+            let Some(thread_id) = row.thread_id else {
+                continue;
+            };
+            let thread_name = self.thread_name_cache.get(&thread_id).cloned().flatten();
+            if row.thread_name == thread_name {
+                continue;
+            }
+            row.thread_name = thread_name;
+            updated = true;
+        }
+
+        if updated {
+            self.apply_filter();
+        }
     }
 
     fn apply_filter(&mut self) {
@@ -691,6 +760,7 @@ impl PickerState {
             cursor: Some(cursor),
             request_token,
             search_token,
+            default_provider: self.default_provider.clone(),
             sort_key: self.sort_key,
         });
     }
@@ -721,40 +791,39 @@ impl PickerState {
     }
 }
 
-fn rows_from_items(items: Vec<ApiThread>) -> Vec<Row> {
+fn rows_from_items(items: Vec<ThreadItem>) -> Vec<Row> {
     items.into_iter().map(|item| head_to_row(&item)).collect()
 }
 
-fn head_to_row(item: &ApiThread) -> Row {
-    let created_at = Utc.timestamp_opt(item.created_at, 0).single();
-    let updated_at = Utc
-        .timestamp_opt(item.updated_at, 0)
-        .single()
+fn head_to_row(item: &ThreadItem) -> Row {
+    let created_at = item.created_at.as_deref().and_then(parse_timestamp_str);
+    let updated_at = item
+        .updated_at
+        .as_deref()
+        .and_then(parse_timestamp_str)
         .or(created_at);
+
     let preview = item
-        .preview
-        .trim()
-        .to_string()
-        .chars()
-        .take(200)
-        .collect::<String>();
-    let preview = if preview.is_empty() {
-        "(no message yet)".to_string()
-    } else {
-        preview
-    };
+        .first_user_message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| String::from("(no message yet)"));
 
     Row {
-        thread_id: item.id.clone(),
+        path: item.path.clone(),
         preview,
+        thread_id: item.thread_id,
+        thread_name: None,
         created_at,
         updated_at,
-        cwd: Some(item.cwd.clone()),
-        git_branch: item.git_info.as_ref().and_then(|g| g.branch.clone()),
+        cwd: item.cwd.clone(),
+        git_branch: item.git_branch.clone(),
     }
 }
 
-fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
+fn paths_match(a: &Path, b: &Path) -> bool {
     if let (Ok(ca), Ok(cb)) = (
         path_utils::normalize_for_path_comparison(a),
         path_utils::normalize_for_path_comparison(b),
@@ -762,6 +831,12 @@ fn paths_match(a: &std::path::Path, b: &std::path::Path) -> bool {
         return ca == cb;
     }
     a == b
+}
+
+fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .map(|dt| dt.with_timezone(&Utc))
+        .ok()
 }
 
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {

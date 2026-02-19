@@ -1,3147 +1,4046 @@
-use super::*;
-
-use crate::app_event::AppEvent as WidgetAppEvent;
-use crate::app_event_sender::AppEventSender as WidgetAppEventSender;
-use crate::bottom_pane::InputResult;
+use crate::app_backtrack::BacktrackState;
+use crate::app_event::AppEvent;
+use crate::app_event::ExitMode;
+#[cfg(target_os = "windows")]
+use crate::app_event::WindowsSandboxEnableMode;
+use crate::app_event_sender::AppEventSender;
+use crate::bottom_pane::ApprovalRequest;
+use crate::bottom_pane::FeedbackAudience;
+use crate::bottom_pane::SelectionItem;
+use crate::bottom_pane::SelectionViewParams;
+use crate::bottom_pane::popup_consts::standard_popup_hint_line;
 use crate::chatwidget::ChatWidget;
-use crate::chatwidget::LiveAttachTui;
-use crate::exec_cell::CommandOutput as ExecCommandOutput;
-use crate::exec_cell::new_active_exec_command;
+use crate::chatwidget::ExternalEditorState;
+use crate::cwd_prompt::CwdPromptAction;
+use crate::diff_render::DiffSummary;
+use crate::exec_command::strip_bash_lc_and_escape;
+use crate::external_editor;
 use crate::file_search::FileSearchManager;
-use crate::get_git_diff::get_git_diff;
-use crate::history_cell::SessionHeaderHistoryCell;
+use crate::history_cell;
+use crate::history_cell::HistoryCell;
+#[cfg(not(debug_assertions))]
+use crate::history_cell::UpdateAvailableHistoryCell;
+use crate::model_migration::ModelMigrationOutcome;
+use crate::model_migration::migration_copy_for_models;
+use crate::model_migration::run_model_migration_prompt;
 use crate::pager_overlay::Overlay;
+use crate::render::highlight::highlight_bash_to_lines;
+use crate::render::renderable::Renderable;
 use crate::resume_picker::SessionSelection;
-use crate::slash_command::SlashCommand;
-use crate::slash_commands::find_builtin_command;
-use crate::version::CODEX_CLI_VERSION;
-pub(super) use codex_core::AppEvent;
-pub(super) use codex_core::AppEventSender;
-pub(super) use codex_core::AppExitInfo;
-pub(super) use codex_core::ExitMode;
-pub(super) use codex_core::ExitReason;
-pub(super) use codex_core::LiveTuiAction;
-pub(super) use codex_core::clean_background_terminals;
-pub(super) use codex_core::fork_thread;
-pub(super) use codex_core::interrupt_turn;
-pub(super) use codex_core::list_collaboration_modes;
-pub(super) use codex_core::list_connectors;
-pub(super) use codex_core::list_experimental_features_page;
-pub(super) use codex_core::list_mcp_server_statuses;
-pub(super) use codex_core::list_models;
-pub(super) use codex_core::list_skills_for_cwd;
-pub(super) use codex_core::list_threads_page;
-use codex_core::protocol::ExecCommandSource;
-pub(super) use codex_core::read_account as read_account_snapshot;
-pub(super) use codex_core::read_config_snapshot;
-pub(super) use codex_core::read_config_snapshot_for_cwd;
-pub(super) use codex_core::read_rate_limits;
-pub(super) use codex_core::respond_to_approval;
-pub(super) use codex_core::respond_to_request_json;
-pub(super) use codex_core::resume_thread_detailed;
-pub(super) use codex_core::set_thread_name;
-pub(super) use codex_core::start_compaction;
-pub(super) use codex_core::start_review;
-pub(super) use codex_core::start_thread;
-pub(super) use codex_core::start_turn_with_elements_and_collaboration;
-pub(super) use codex_core::stream_events;
-pub(super) use codex_core::write_config_value;
-pub(super) use codex_core::write_skill_enabled;
+use crate::tui;
+use crate::tui::TuiEvent;
+use crate::update_action::UpdateAction;
+use codex_ansi_escape::ansi_escape_line;
+use codex_app_server_protocol::ConfigLayerSource;
+use codex_core::AuthManager;
+use codex_core::CodexAuth;
+use codex_core::ThreadManager;
+use codex_core::config::Config;
+use codex_core::config::ConfigBuilder;
+use codex_core::config::ConfigOverrides;
+use codex_core::config::edit::ConfigEdit;
+use codex_core::config::edit::ConfigEditsBuilder;
+use codex_core::config_loader::ConfigLayerStackOrdering;
+use codex_core::features::Feature;
+use codex_core::models_manager::manager::RefreshStrategy;
+use codex_core::models_manager::model_presets::HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG;
+use codex_core::models_manager::model_presets::HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG;
+use codex_core::protocol::AskForApproval;
+use codex_core::protocol::Event;
+use codex_core::protocol::EventMsg;
+use codex_core::protocol::FinalOutput;
+use codex_core::protocol::ListSkillsResponseEvent;
+use codex_core::protocol::Op;
+use codex_core::protocol::SandboxPolicy;
+use codex_core::protocol::SessionSource;
+use codex_core::protocol::SkillErrorInfo;
+use codex_core::protocol::TokenUsage;
+#[cfg(target_os = "windows")]
+use codex_core::windows_sandbox::WindowsSandboxLevelExt;
+use codex_otel::OtelManager;
+use codex_otel::TelemetryAuthMode;
+use codex_protocol::ThreadId;
+use codex_protocol::config_types::Personality;
+#[cfg(target_os = "windows")]
+use codex_protocol::config_types::WindowsSandboxLevel;
+use codex_protocol::items::TurnItem;
+use codex_protocol::openai_models::ModelPreset;
+use codex_protocol::openai_models::ModelUpgrade;
+use codex_protocol::openai_models::ReasoningEffort as ReasoningEffortConfig;
+use codex_protocol::protocol::SessionConfiguredEvent;
+use codex_utils_absolute_path::AbsolutePathBuf;
+use color_eyre::eyre::Result;
+use color_eyre::eyre::WrapErr;
+use crossterm::event::KeyCode;
+use crossterm::event::KeyEvent;
+use crossterm::event::KeyEventKind;
+use ratatui::style::Stylize;
+use ratatui::text::Line;
+use ratatui::widgets::Paragraph;
+use ratatui::widgets::Wrap;
+use std::collections::BTreeMap;
+use std::collections::HashMap;
+use std::collections::HashSet;
+use std::collections::VecDeque;
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
-use tokio_stream::StreamExt;
+use std::thread;
+use std::time::Duration;
+use std::time::Instant;
+use tokio::select;
+use tokio::sync::Mutex;
+use tokio::sync::broadcast;
+use tokio::sync::mpsc;
+use tokio::sync::mpsc::error::TryRecvError;
+use tokio::sync::mpsc::error::TrySendError;
+use tokio::sync::mpsc::unbounded_channel;
+use toml::Value as TomlValue;
 
-const COMMIT_ANIMATION_TICK: Duration = crate::tui::TARGET_FRAME_INTERVAL;
+const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
+const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
+/// Baseline cadence for periodic stream commit animation ticks.
+///
+/// Smooth-mode streaming drains one line per tick, so this interval controls
+/// perceived typing speed for non-backlogged output.
+const COMMIT_ANIMATION_TICK: Duration = tui::TARGET_FRAME_INTERVAL;
 
-fn determine_alt_screen_mode(no_alt_screen: bool) -> bool {
-    if no_alt_screen {
-        false
-    } else {
-        std::env::var_os("ZELLIJ").is_none()
+#[derive(Debug, Clone)]
+pub struct AppExitInfo {
+    pub token_usage: TokenUsage,
+    pub thread_id: Option<ThreadId>,
+    pub thread_name: Option<String>,
+    pub update_action: Option<UpdateAction>,
+    pub exit_reason: ExitReason,
+}
+
+impl AppExitInfo {
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            token_usage: TokenUsage::default(),
+            thread_id: None,
+            thread_name: None,
+            update_action: None,
+            exit_reason: ExitReason::Fatal(message.into()),
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// App struct — mirrors upstream `app::App` but backed by app-server transport
-// ---------------------------------------------------------------------------
+#[derive(Debug)]
+pub(crate) enum AppRunControl {
+    Continue,
+    Exit(ExitReason),
+}
 
-/// Top-level application state for the TUI.
-///
-/// Mirrors upstream `App` from `app.rs` in structure: owns the `ChatWidget`,
-/// tracks the active thread, and drives the terminal event loop. All backend
-/// calls go through the `codex_core` transport shim seam.
+#[derive(Debug, Clone)]
+pub enum ExitReason {
+    UserRequested,
+    Fatal(String),
+}
+
+fn session_summary(
+    token_usage: TokenUsage,
+    thread_id: Option<ThreadId>,
+    thread_name: Option<String>,
+) -> Option<SessionSummary> {
+    if token_usage.is_zero() {
+        return None;
+    }
+
+    let usage_line = FinalOutput::from(token_usage).to_string();
+    let resume_command = codex_core::util::resume_command(thread_name.as_deref(), thread_id);
+    Some(SessionSummary {
+        usage_line,
+        resume_command,
+    })
+}
+
+fn errors_for_cwd(cwd: &Path, response: &ListSkillsResponseEvent) -> Vec<SkillErrorInfo> {
+    response
+        .skills
+        .iter()
+        .find(|entry| entry.cwd.as_path() == cwd)
+        .map(|entry| entry.errors.clone())
+        .unwrap_or_default()
+}
+
+fn emit_skill_load_warnings(app_event_tx: &AppEventSender, errors: &[SkillErrorInfo]) {
+    if errors.is_empty() {
+        return;
+    }
+
+    let error_count = errors.len();
+    app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+        crate::history_cell::new_warning_event(format!(
+            "Skipped loading {error_count} skill(s) due to invalid SKILL.md files."
+        )),
+    )));
+
+    for error in errors {
+        let path = error.path.display();
+        let message = error.message.as_str();
+        app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+            crate::history_cell::new_warning_event(format!("{path}: {message}")),
+        )));
+    }
+}
+
+fn emit_project_config_warnings(app_event_tx: &AppEventSender, config: &Config) {
+    let mut disabled_folders = Vec::new();
+
+    for layer in config
+        .config_layer_stack
+        .get_layers(ConfigLayerStackOrdering::LowestPrecedenceFirst, true)
+    {
+        let ConfigLayerSource::Project { dot_codex_folder } = &layer.name else {
+            continue;
+        };
+        if layer.disabled_reason.is_none() {
+            continue;
+        }
+        disabled_folders.push((
+            dot_codex_folder.as_path().display().to_string(),
+            layer
+                .disabled_reason
+                .as_ref()
+                .map(ToString::to_string)
+                .unwrap_or_else(|| "config.toml is disabled.".to_string()),
+        ));
+    }
+
+    if disabled_folders.is_empty() {
+        return;
+    }
+
+    let mut message = concat!(
+        "Project config.toml files are disabled in the following folders. ",
+        "Settings in those files are ignored, but skills and exec policies still load.\n",
+    )
+    .to_string();
+    for (index, (folder, reason)) in disabled_folders.iter().enumerate() {
+        let display_index = index + 1;
+        message.push_str(&format!("    {display_index}. {folder}\n"));
+        message.push_str(&format!("       {reason}\n"));
+    }
+
+    app_event_tx.send(AppEvent::InsertHistoryCell(Box::new(
+        history_cell::new_warning_event(message),
+    )));
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionSummary {
+    usage_line: String,
+    resume_command: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ThreadEventSnapshot {
+    session_configured: Option<Event>,
+    events: Vec<Event>,
+}
+
+#[derive(Debug)]
+struct ThreadEventStore {
+    session_configured: Option<Event>,
+    buffer: VecDeque<Event>,
+    user_message_ids: HashSet<String>,
+    capacity: usize,
+    active: bool,
+}
+
+impl ThreadEventStore {
+    fn new(capacity: usize) -> Self {
+        Self {
+            session_configured: None,
+            buffer: VecDeque::new(),
+            user_message_ids: HashSet::new(),
+            capacity,
+            active: false,
+        }
+    }
+
+    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
+        let mut store = Self::new(capacity);
+        store.session_configured = Some(event);
+        store
+    }
+
+    fn push_event(&mut self, event: Event) {
+        match &event.msg {
+            EventMsg::SessionConfigured(_) => {
+                self.session_configured = Some(event);
+                return;
+            }
+            EventMsg::ItemCompleted(completed) => {
+                if let TurnItem::UserMessage(item) = &completed.item {
+                    if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
+                        return;
+                    }
+                    let legacy = Event {
+                        id: event.id,
+                        msg: item.as_legacy_event(),
+                    };
+                    self.push_legacy_event(legacy);
+                    return;
+                }
+            }
+            _ => {}
+        }
+
+        self.push_legacy_event(event);
+    }
+
+    fn push_legacy_event(&mut self, event: Event) {
+        if let EventMsg::UserMessage(_) = &event.msg
+            && !event.id.is_empty()
+            && !self.user_message_ids.insert(event.id.clone())
+        {
+            return;
+        }
+        self.buffer.push_back(event);
+        if self.buffer.len() > self.capacity
+            && let Some(removed) = self.buffer.pop_front()
+            && matches!(removed.msg, EventMsg::UserMessage(_))
+            && !removed.id.is_empty()
+        {
+            self.user_message_ids.remove(&removed.id);
+        }
+    }
+
+    fn snapshot(&self) -> ThreadEventSnapshot {
+        ThreadEventSnapshot {
+            session_configured: self.session_configured.clone(),
+            events: self.buffer.iter().cloned().collect(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ThreadEventChannel {
+    sender: mpsc::Sender<Event>,
+    receiver: Option<mpsc::Receiver<Event>>,
+    store: Arc<Mutex<ThreadEventStore>>,
+}
+
+impl ThreadEventChannel {
+    fn new(capacity: usize) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
+        Self {
+            sender,
+            receiver: Some(receiver),
+            store: Arc::new(Mutex::new(ThreadEventStore::new(capacity))),
+        }
+    }
+
+    fn new_with_session_configured(capacity: usize, event: Event) -> Self {
+        let (sender, receiver) = mpsc::channel(capacity);
+        Self {
+            sender,
+            receiver: Some(receiver),
+            store: Arc::new(Mutex::new(ThreadEventStore::new_with_session_configured(
+                capacity, event,
+            ))),
+        }
+    }
+}
+
+fn should_show_model_migration_prompt(
+    current_model: &str,
+    target_model: &str,
+    seen_migrations: &BTreeMap<String, String>,
+    available_models: &[ModelPreset],
+) -> bool {
+    if target_model == current_model {
+        return false;
+    }
+
+    if let Some(seen_target) = seen_migrations.get(current_model)
+        && seen_target == target_model
+    {
+        return false;
+    }
+
+    if !available_models
+        .iter()
+        .any(|preset| preset.model == target_model && preset.show_in_picker)
+    {
+        return false;
+    }
+
+    if available_models
+        .iter()
+        .any(|preset| preset.model == current_model && preset.upgrade.is_some())
+    {
+        return true;
+    }
+
+    if available_models
+        .iter()
+        .any(|preset| preset.upgrade.as_ref().map(|u| u.id.as_str()) == Some(target_model))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn migration_prompt_hidden(config: &Config, migration_config_key: &str) -> bool {
+    match migration_config_key {
+        HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG => config
+            .notices
+            .hide_gpt_5_1_codex_max_migration_prompt
+            .unwrap_or(false),
+        HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG => {
+            config.notices.hide_gpt5_1_migration_prompt.unwrap_or(false)
+        }
+        _ => false,
+    }
+}
+
+fn target_preset_for_upgrade<'a>(
+    available_models: &'a [ModelPreset],
+    target_model: &str,
+) -> Option<&'a ModelPreset> {
+    available_models
+        .iter()
+        .find(|preset| preset.model == target_model && preset.show_in_picker)
+}
+
+async fn handle_model_migration_prompt_if_needed(
+    tui: &mut tui::Tui,
+    config: &mut Config,
+    model: &str,
+    app_event_tx: &AppEventSender,
+    available_models: Vec<ModelPreset>,
+) -> Option<AppExitInfo> {
+    let upgrade = available_models
+        .iter()
+        .find(|preset| preset.model == model)
+        .and_then(|preset| preset.upgrade.as_ref());
+
+    if let Some(ModelUpgrade {
+        id: target_model,
+        reasoning_effort_mapping,
+        migration_config_key,
+        model_link,
+        upgrade_copy,
+        migration_markdown,
+    }) = upgrade
+    {
+        if migration_prompt_hidden(config, migration_config_key.as_str()) {
+            return None;
+        }
+
+        let target_model = target_model.to_string();
+        if !should_show_model_migration_prompt(
+            model,
+            &target_model,
+            &config.notices.model_migrations,
+            &available_models,
+        ) {
+            return None;
+        }
+
+        let current_preset = available_models.iter().find(|preset| preset.model == model);
+        let target_preset = target_preset_for_upgrade(&available_models, &target_model);
+        let target_preset = target_preset?;
+        let target_display_name = target_preset.display_name.clone();
+        let heading_label = if target_display_name == model {
+            target_model.clone()
+        } else {
+            target_display_name.clone()
+        };
+        let target_description =
+            (!target_preset.description.is_empty()).then(|| target_preset.description.clone());
+        let can_opt_out = current_preset.is_some();
+        let prompt_copy = migration_copy_for_models(
+            model,
+            &target_model,
+            model_link.clone(),
+            upgrade_copy.clone(),
+            migration_markdown.clone(),
+            heading_label,
+            target_description,
+            can_opt_out,
+        );
+        match run_model_migration_prompt(tui, prompt_copy).await {
+            ModelMigrationOutcome::Accepted => {
+                app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
+                    from_model: model.to_string(),
+                    to_model: target_model.clone(),
+                });
+
+                let mapped_effort = if let Some(reasoning_effort_mapping) = reasoning_effort_mapping
+                    && let Some(reasoning_effort) = config.model_reasoning_effort
+                {
+                    reasoning_effort_mapping
+                        .get(&reasoning_effort)
+                        .cloned()
+                        .or(config.model_reasoning_effort)
+                } else {
+                    config.model_reasoning_effort
+                };
+
+                config.model = Some(target_model.clone());
+                config.model_reasoning_effort = mapped_effort;
+                app_event_tx.send(AppEvent::UpdateModel(target_model.clone()));
+                app_event_tx.send(AppEvent::UpdateReasoningEffort(mapped_effort));
+                app_event_tx.send(AppEvent::PersistModelSelection {
+                    model: target_model.clone(),
+                    effort: mapped_effort,
+                });
+            }
+            ModelMigrationOutcome::Rejected => {
+                app_event_tx.send(AppEvent::PersistModelMigrationPromptAcknowledged {
+                    from_model: model.to_string(),
+                    to_model: target_model.clone(),
+                });
+            }
+            ModelMigrationOutcome::Exit => {
+                return Some(AppExitInfo {
+                    token_usage: TokenUsage::default(),
+                    thread_id: None,
+                    thread_name: None,
+                    update_action: None,
+                    exit_reason: ExitReason::UserRequested,
+                });
+            }
+        }
+    }
+
+    None
+}
+
 pub(crate) struct App {
-    /// The active chat widget.
-    widget: ChatWidget,
-    /// Shared CLI state (app-server endpoint, sessions, auth).
-    state: CliState,
-    /// ID of the active app-server thread.
-    thread_id: String,
-    /// Internal app event sender (upstream-style dispatch seam).
-    app_event_tx: AppEventSender,
-    /// Internal app event receiver.
-    app_event_rx: std::sync::mpsc::Receiver<AppEvent>,
-    /// Widget event receiver (bottom pane + file search).
-    widget_event_rx: tokio::sync::mpsc::UnboundedReceiver<WidgetAppEvent>,
-    /// Widget event sender (used for app-driven widget events like commit ticks).
-    widget_event_tx: WidgetAppEventSender,
-    /// Upstream-style @file search manager.
-    file_search: FileSearchManager,
-    /// Runtime status data used by `/status` card rendering.
-    status_runtime: StatusRuntime,
+    pub(crate) server: Arc<ThreadManager>,
+    pub(crate) otel_manager: OtelManager,
+    pub(crate) app_event_tx: AppEventSender,
+    pub(crate) chat_widget: ChatWidget,
+    pub(crate) auth_manager: Arc<AuthManager>,
+    /// Config is stored here so we can recreate ChatWidgets as needed.
+    pub(crate) config: Config,
+    pub(crate) active_profile: Option<String>,
+    cli_kv_overrides: Vec<(String, TomlValue)>,
+    harness_overrides: ConfigOverrides,
+    runtime_approval_policy_override: Option<AskForApproval>,
+    runtime_sandbox_policy_override: Option<SandboxPolicy>,
+
+    pub(crate) file_search: FileSearchManager,
+
+    pub(crate) transcript_cells: Vec<Arc<dyn HistoryCell>>,
+
+    // Pager overlay state (Transcript or Static like Diff)
+    pub(crate) overlay: Option<Overlay>,
+    pub(crate) deferred_history_lines: Vec<Line<'static>>,
+    has_emitted_history_lines: bool,
+
+    pub(crate) enhanced_keys_supported: bool,
+
+    /// Controls the animation thread that sends CommitTick events.
+    pub(crate) commit_anim_running: Arc<AtomicBool>,
+    // Shared across ChatWidget instances so invalid status-line config warnings only emit once.
+    status_line_invalid_items_warned: Arc<AtomicBool>,
+
+    // Esc-backtracking state grouped
+    pub(crate) backtrack: crate::app_backtrack::BacktrackState,
+    /// When set, the next draw re-renders the transcript into terminal scrollback once.
+    ///
+    /// This is used after a confirmed thread rollback to ensure scrollback reflects the trimmed
+    /// transcript cells.
+    pub(crate) backtrack_render_pending: bool,
+    pub(crate) feedback: codex_feedback::CodexFeedback,
+    feedback_audience: FeedbackAudience,
+    /// Set when the user confirms an update; propagated on exit.
+    pub(crate) pending_update_action: Option<UpdateAction>,
+
     /// One-shot guard used while switching threads.
-    pending_thread_switch_clear: bool,
-    /// Controls the animation thread that sends commit tick events.
-    commit_anim_running: Arc<AtomicBool>,
-    /// Optional pager overlay (transcript/static) shown above main chat UI.
-    overlay: Option<Overlay>,
-    /// Run without alternate screen mode when requested by CLI.
-    no_alt_screen: bool,
-    /// Optional startup picker mode requested by CLI.
-    startup_picker: Option<StartupPicker>,
-    /// Whether startup picker should include all threads across cwd.
-    startup_picker_show_all: bool,
+    ///
+    /// We set this when intentionally stopping the current thread before moving
+    /// to another one, then ignore exactly one `ShutdownComplete` so it is not
+    /// misclassified as an unexpected sub-agent death.
+    suppress_shutdown_complete: bool,
+    /// Tracks the thread we intentionally shut down while exiting the app.
+    ///
+    /// When this matches the active thread, its `ShutdownComplete` should lead to
+    /// process exit instead of being treated as an unexpected sub-agent death that
+    /// triggers failover to the primary thread.
+    ///
+    /// This is thread-scoped state (`Option<ThreadId>`) instead of a global bool
+    /// so shutdown events from other threads still take the normal failover path.
+    pending_shutdown_exit_thread_id: Option<ThreadId>,
+
+    windows_sandbox: WindowsSandboxState,
+
+    thread_event_channels: HashMap<ThreadId, ThreadEventChannel>,
+    active_thread_id: Option<ThreadId>,
+    active_thread_rx: Option<mpsc::Receiver<Event>>,
+    primary_thread_id: Option<ThreadId>,
+    primary_session_configured: Option<SessionConfiguredEvent>,
+    pending_primary_events: VecDeque<Event>,
 }
 
 #[derive(Default)]
-struct StatusRuntime {
-    token_info: Option<codex_core::protocol::TokenUsageInfo>,
-    total_token_usage: codex_core::protocol::TokenUsage,
-    rate_limit_snapshots_by_limit_id:
-        std::collections::BTreeMap<String, crate::status::RateLimitSnapshotDisplay>,
-    thread_name: Option<String>,
-    session_model: Option<String>,
-    session_reasoning_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
+struct WindowsSandboxState {
+    setup_started_at: Option<Instant>,
+    // One-shot suppression of the next world-writable scan after user confirmation.
+    skip_world_writable_scan_once: bool,
 }
 
-struct DrainResult {
-    redraw: bool,
-    detach: bool,
+fn normalize_harness_overrides_for_cwd(
+    mut overrides: ConfigOverrides,
+    base_cwd: &Path,
+) -> Result<ConfigOverrides> {
+    if overrides.additional_writable_roots.is_empty() {
+        return Ok(overrides);
+    }
+
+    let mut normalized = Vec::with_capacity(overrides.additional_writable_roots.len());
+    for root in overrides.additional_writable_roots.drain(..) {
+        let absolute = AbsolutePathBuf::resolve_path_against_base(root, base_cwd)?;
+        normalized.push(absolute.into_path_buf());
+    }
+    overrides.additional_writable_roots = normalized;
+    Ok(overrides)
 }
 
 impl App {
-    /// Create a new `App` for an interactive TUI session.
-    ///
-    /// Mirrors upstream `App::run()` initialization: ensures the app-server is
-    /// ready, starts or reuses a thread, and creates the initial `ChatWidget`.
-    pub(crate) fn new(args: TuiArgs, mut state: CliState) -> Result<Self> {
-        ensure_app_server_ready(&state)?;
-        let (thread_id, status_message, resume_replay_events) =
-            resolve_initial_thread_id(&state, args.thread_id, state.last_thread_id.clone())?;
-        state.last_thread_id = Some(thread_id.clone());
+    pub fn chatwidget_init_for_forked_or_resumed_thread(
+        &self,
+        tui: &mut tui::Tui,
+        cfg: codex_core::config::Config,
+    ) -> crate::chatwidget::ChatWidgetInit {
+        crate::chatwidget::ChatWidgetInit {
+            config: cfg,
+            frame_requester: tui.frame_requester(),
+            app_event_tx: self.app_event_tx.clone(),
+            // Fork/resume bootstraps here don't carry any prefilled message content.
+            initial_user_message: None,
+            enhanced_keys_supported: self.enhanced_keys_supported,
+            auth_manager: self.auth_manager.clone(),
+            models_manager: self.server.get_models_manager(),
+            feedback: self.feedback.clone(),
+            is_first_run: false,
+            feedback_audience: self.feedback_audience,
+            model: Some(self.chat_widget.current_model().to_string()),
+            status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+            otel_manager: self.otel_manager.clone(),
+        }
+    }
 
-        let mut widget = ChatWidget::new(thread_id.clone());
-        let mut status_runtime = StatusRuntime::default();
-        widget.ui_mut().set_status_message(Some(status_message));
-        if !resume_replay_events.is_empty() {
-            widget.ui_mut().apply_replay_ui_events(resume_replay_events);
+    async fn rebuild_config_for_cwd(&self, cwd: PathBuf) -> Result<Config> {
+        let mut overrides = self.harness_overrides.clone();
+        overrides.cwd = Some(cwd.clone());
+        let cwd_display = cwd.display().to_string();
+        ConfigBuilder::default()
+            .codex_home(self.config.codex_home.clone())
+            .cli_overrides(self.cli_kv_overrides.clone())
+            .harness_overrides(overrides)
+            .build()
+            .await
+            .wrap_err_with(|| format!("Failed to rebuild config for cwd {cwd_display}"))
+    }
+
+    async fn refresh_in_memory_config_from_disk(&mut self) -> Result<()> {
+        let mut config = self.rebuild_config_for_cwd(self.config.cwd.clone()).await?;
+        self.apply_runtime_policy_overrides(&mut config);
+        self.config = config;
+        Ok(())
+    }
+
+    fn apply_runtime_policy_overrides(&mut self, config: &mut Config) {
+        if let Some(policy) = self.runtime_approval_policy_override.as_ref()
+            && let Err(err) = config.permissions.approval_policy.set(*policy)
+        {
+            tracing::warn!(%err, "failed to carry forward approval policy override");
+            self.chat_widget.add_error_message(format!(
+                "Failed to carry forward approval policy override: {err}"
+            ));
+        }
+        if let Some(policy) = self.runtime_sandbox_policy_override.as_ref()
+            && let Err(err) = config.permissions.sandbox_policy.set(policy.clone())
+        {
+            tracing::warn!(%err, "failed to carry forward sandbox policy override");
+            self.chat_widget.add_error_message(format!(
+                "Failed to carry forward sandbox policy override: {err}"
+            ));
+        }
+    }
+
+    fn open_url_in_browser(&mut self, url: String) {
+        if let Err(err) = webbrowser::open(&url) {
+            self.chat_widget
+                .add_error_message(format!("Failed to open browser for {url}: {err}"));
+            return;
+        }
+
+        self.chat_widget
+            .add_info_message(format!("Opened {url} in your browser."), None);
+    }
+
+    async fn shutdown_current_thread(&mut self) {
+        if let Some(thread_id) = self.chat_widget.thread_id() {
+            // Clear any in-flight rollback guard when switching threads.
+            self.backtrack.pending_rollback = None;
+            self.suppress_shutdown_complete = true;
+            self.chat_widget.submit_op(Op::Shutdown);
+            self.server.remove_thread(&thread_id).await;
+        }
+    }
+
+    fn ensure_thread_channel(&mut self, thread_id: ThreadId) -> &mut ThreadEventChannel {
+        self.thread_event_channels
+            .entry(thread_id)
+            .or_insert_with(|| ThreadEventChannel::new(THREAD_EVENT_CHANNEL_CAPACITY))
+    }
+
+    async fn set_thread_active(&mut self, thread_id: ThreadId, active: bool) {
+        if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+            let mut store = channel.store.lock().await;
+            store.active = active;
+        }
+    }
+
+    async fn activate_thread_channel(&mut self, thread_id: ThreadId) {
+        if self.active_thread_id.is_some() {
+            return;
+        }
+        self.set_thread_active(thread_id, true).await;
+        let receiver = if let Some(channel) = self.thread_event_channels.get_mut(&thread_id) {
+            channel.receiver.take()
         } else {
-            match stream_events(&state, widget.ui_mut().last_sequence) {
-                Ok(events) => {
-                    if !events.is_empty() {
-                        status_runtime.apply_stream_events(&events);
-                        widget
-                            .ui_mut()
-                            .apply_rpc_stream_events_with_replay(&events, true);
-                    }
-                }
-                Err(err) => {
-                    widget.ui_mut().set_status_message(Some(format!(
-                        "connected; initial stream sync failed: {}",
-                        err
-                    )));
-                }
-            }
-        }
-        if !widget.ui_mut().has_history_cells() {
-            let model = status_runtime
-                .session_model
-                .clone()
-                .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-            widget
-                .ui_mut()
-                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
-                    model,
-                    status_runtime.session_reasoning_effort,
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    CODEX_CLI_VERSION,
-                )));
-        }
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
-        let widget_sender = WidgetAppEventSender::new(widget_tx);
-        let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        let file_search = FileSearchManager::new(search_dir, widget_sender.clone());
-        if let Ok(skills) = fetch_skills_for_cwd(&state)
-            && !skills.is_empty()
-        {
-            widget.ui_mut().set_skills(Some(skills));
-        }
-        if let Ok(connectors) = fetch_connectors(&state)
-            && !connectors.connectors.is_empty()
-        {
-            widget.ui_mut().set_connectors_snapshot(Some(connectors));
-        }
+            None
+        };
+        self.active_thread_id = Some(thread_id);
+        self.active_thread_rx = receiver;
+    }
 
-        let app = Self {
-            widget,
-            state,
-            thread_id,
-            app_event_tx: AppEventSender::new(tx),
-            app_event_rx: rx,
-            widget_event_rx: widget_rx,
-            widget_event_tx: widget_sender.clone(),
-            file_search,
-            status_runtime,
-            pending_thread_switch_clear: false,
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
-            overlay: None,
-            no_alt_screen: args.no_alt_screen,
-            startup_picker: args.startup_picker,
-            startup_picker_show_all: args.startup_picker_show_all,
+    async fn store_active_thread_receiver(&mut self) {
+        let Some(active_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(receiver) = self.active_thread_rx.take() else {
+            return;
+        };
+        if let Some(channel) = self.thread_event_channels.get_mut(&active_id) {
+            let mut store = channel.store.lock().await;
+            store.active = false;
+            channel.receiver = Some(receiver);
+        }
+    }
+
+    async fn activate_thread_for_replay(
+        &mut self,
+        thread_id: ThreadId,
+    ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
+        let channel = self.thread_event_channels.get_mut(&thread_id)?;
+        let receiver = channel.receiver.take()?;
+        let mut store = channel.store.lock().await;
+        store.active = true;
+        let snapshot = store.snapshot();
+        Some((receiver, snapshot))
+    }
+
+    async fn clear_active_thread(&mut self) {
+        if let Some(active_id) = self.active_thread_id.take() {
+            self.set_thread_active(active_id, false).await;
+        }
+        self.active_thread_rx = None;
+    }
+
+    async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
+        let (sender, store) = {
+            let channel = self.ensure_thread_channel(thread_id);
+            (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        Ok(app)
-    }
+        let should_send = {
+            let mut guard = store.lock().await;
+            guard.push_event(event.clone());
+            guard.active
+        };
 
-    /// Create an `App` that attaches to an existing app-server session.
-    pub(crate) fn attach(
-        session_id: String,
-        initial_events: Vec<DaemonStreamEnvelope>,
-        mut state: CliState,
-    ) -> Result<Self> {
-        let mut widget = ChatWidget::new(session_id.clone());
-        let status_runtime = StatusRuntime::default();
-        {
-            let ui = widget.ui_mut();
-            ui.latest_state = cached_session_state_label(&state, &session_id)
-                .unwrap_or("unknown")
-                .to_string();
-            ui.apply_stream_events_with_replay(&initial_events, true);
-            ui.set_status_message(Some("attached to app-server websocket".to_string()));
-        }
-        if !widget.ui_mut().has_history_cells() {
-            widget
-                .ui_mut()
-                .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
-                    "gpt-5.3-codex".to_string(),
-                    None,
-                    std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                    CODEX_CLI_VERSION,
-                )));
-        }
-        state.last_thread_id = Some(session_id.clone());
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
-        let widget_sender = WidgetAppEventSender::new(widget_tx);
-        let search_dir = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        let file_search = FileSearchManager::new(search_dir, widget_sender.clone());
-        if let Ok(skills) = fetch_skills_for_cwd(&state)
-            && !skills.is_empty()
-        {
-            widget.ui_mut().set_skills(Some(skills));
-        }
-        if let Ok(connectors) = fetch_connectors(&state)
-            && !connectors.connectors.is_empty()
-        {
-            widget.ui_mut().set_connectors_snapshot(Some(connectors));
-        }
-
-        Ok(Self {
-            widget,
-            state,
-            thread_id: session_id,
-            app_event_tx: AppEventSender::new(tx),
-            app_event_rx: rx,
-            widget_event_rx: widget_rx,
-            widget_event_tx: widget_sender.clone(),
-            file_search,
-            status_runtime,
-            pending_thread_switch_clear: false,
-            commit_anim_running: Arc::new(AtomicBool::new(false)),
-            overlay: None,
-            no_alt_screen: false,
-            startup_picker: None,
-            startup_picker_show_all: false,
-        })
-    }
-
-    /// Run the interactive TUI event loop.
-    ///
-    /// This mirrors upstream `App::run()` — sets up the terminal, enters the
-    /// main loop, then restores the terminal on exit.
-    pub(crate) async fn run(&mut self) -> Result<AppExitInfo> {
-        if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-            return Ok(AppExitInfo {
-                thread_id: Some(self.thread_id.clone()),
-                exit_reason: ExitReason::UserRequested,
-            });
-        }
-
-        let terminal = crate::tui::init().context("initialize tui terminal")?;
-        let mut tui = crate::tui::Tui::new(terminal);
-        tui.set_alt_screen_enabled(determine_alt_screen_mode(self.no_alt_screen));
-        if let Some(mode) = self.startup_picker.take() {
-            match mode {
-                StartupPicker::Resume => {
-                    self.open_thread_picker(&mut tui, false, self.startup_picker_show_all)
-                        .await?
-                }
-                StartupPicker::Fork => {
-                    self.open_thread_picker(&mut tui, true, self.startup_picker_show_all)
-                        .await?
-                }
-            }
-        }
-
-        let loop_result = self.event_loop(&mut tui).await;
-        let _ = crate::tui::restore();
-
-        loop_result?;
-        self.state.last_thread_id = Some(self.widget.session_id().to_string());
-
-        Ok(AppExitInfo {
-            thread_id: Some(self.widget.session_id().to_string()),
-            exit_reason: ExitReason::UserRequested,
-        })
-    }
-
-    /// Consume the `App`, returning the final `CliState` so the caller can
-    /// persist it.
-    pub(crate) fn into_state(self) -> CliState {
-        self.state
-    }
-
-    // -----------------------------------------------------------------------
-    // Event loop — mirrors upstream `App::run()` main loop body
-    // -----------------------------------------------------------------------
-
-    async fn event_loop(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
-        let tui_events = tui.event_stream();
-        tokio::pin!(tui_events);
-        tui.frame_requester().schedule_frame();
-        let mut stream_poll_tick = tokio::time::interval(TUI_STREAM_POLL_INTERVAL);
-        stream_poll_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-        loop {
-            let control = tokio::select! {
-                Some(event) = tui_events.next() => self.handle_tui_event(tui, event).await?,
-                _ = stream_poll_tick.tick() => {
-                    let control = self.handle_event(tui, AppEvent::Tick).await?;
-                    if matches!(control, LiveTuiAction::Continue) {
-                        tui.frame_requester().schedule_frame();
-                    }
-                    control
-                }
-            };
-
-            if matches!(control, LiveTuiAction::Detach) {
-                return Ok(());
-            }
-
-            let drained_widget = self.drain_pending_widget_events(tui).await?;
-            if drained_widget.detach {
-                return Ok(());
-            }
-            if drained_widget.redraw {
-                tui.frame_requester().schedule_frame();
-            }
-
-            let drained = self.drain_pending_app_events(tui).await?;
-            if drained.detach {
-                return Ok(());
-            }
-            if drained.redraw {
-                tui.frame_requester().schedule_frame();
-            }
-        }
-    }
-
-    async fn handle_tui_event(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        event: crate::tui::TuiEvent,
-    ) -> Result<LiveTuiAction> {
-        if self.overlay.is_some() {
-            if let Some(overlay) = self.overlay.as_mut() {
-                overlay.handle_event(tui, event)?;
-                if overlay.is_done() {
-                    self.overlay = None;
-                    tui.frame_requester().schedule_frame();
-                }
-            }
-            return Ok(LiveTuiAction::Continue);
-        }
-
-        match event {
-            crate::tui::TuiEvent::Key(key_event) => {
-                if key_event.kind == KeyEventKind::Release {
-                    return Ok(LiveTuiAction::Continue);
-                }
-                let control = self.handle_event(tui, AppEvent::Key(key_event)).await?;
-                if matches!(control, LiveTuiAction::Continue) {
-                    tui.frame_requester().schedule_frame();
-                }
-                Ok(control)
-            }
-            crate::tui::TuiEvent::Paste(pasted) => {
-                let control = self.handle_event(tui, AppEvent::Paste(pasted)).await?;
-                if matches!(control, LiveTuiAction::Continue) {
-                    tui.frame_requester().schedule_frame();
-                }
-                Ok(control)
-            }
-            crate::tui::TuiEvent::Draw => {
-                if self.pending_thread_switch_clear {
-                    tui.terminal.clear_scrollback()?;
-                    tui.terminal.clear()?;
-                    self.pending_thread_switch_clear = false;
-                }
-                let _ = self.widget.ui_mut().flush_bottom_pane_paste_burst_if_due();
-                let _ = self.widget.ui_mut().commit_assistant_stream_tick();
-                let history_width = tui.terminal.size()?.width;
-                let new_history_lines = self
-                    .widget
-                    .ui_mut()
-                    .take_new_history_lines_for_scrollback(history_width);
-                if !new_history_lines.is_empty() {
-                    tui.insert_history_lines(new_history_lines);
-                }
-                let width = tui.terminal.size()?.width;
-                let desired_height = self.widget.desired_height(width);
-                tui.draw(desired_height, |frame| {
-                    self.widget.render(frame.area(), frame.buffer_mut());
-                    if let Some((x, y)) = self.widget.cursor_pos(frame.area()) {
-                        frame.set_cursor_position((x, y));
-                    }
-                })?;
-                Ok(LiveTuiAction::Continue)
-            }
-        }
-    }
-
-    async fn drain_pending_widget_events(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-    ) -> Result<DrainResult> {
-        let mut handled_any = false;
-        while let Ok(event) = self.widget_event_rx.try_recv() {
-            self.handle_widget_app_event(tui, event).await?;
-            handled_any = true;
-        }
-        Ok(DrainResult {
-            redraw: handled_any,
-            detach: false,
-        })
-    }
-
-    async fn drain_pending_app_events(&mut self, tui: &mut crate::tui::Tui) -> Result<DrainResult> {
-        let mut handled_any = false;
-        while let Ok(app_event) = self.app_event_rx.try_recv() {
-            match self.handle_event(tui, app_event).await? {
-                LiveTuiAction::Continue => {}
-                LiveTuiAction::Detach => {
-                    return Ok(DrainResult {
-                        redraw: handled_any,
-                        detach: true,
+        if should_send {
+            // Never await a bounded channel send on the main TUI loop: if the receiver falls behind,
+            // `send().await` can block and the UI stops drawing. If the channel is full, wait in a
+            // spawned task instead.
+            match sender.try_send(event) {
+                Ok(()) => {}
+                Err(TrySendError::Full(event)) => {
+                    tokio::spawn(async move {
+                        if let Err(err) = sender.send(event).await {
+                            tracing::warn!("thread {thread_id} event channel closed: {err}");
+                        }
                     });
                 }
+                Err(TrySendError::Closed(_)) => {
+                    tracing::warn!("thread {thread_id} event channel closed");
+                }
             }
-            handled_any = true;
         }
-        Ok(DrainResult {
-            redraw: handled_any,
-            detach: false,
+        Ok(())
+    }
+
+    async fn enqueue_primary_event(&mut self, event: Event) -> Result<()> {
+        if let Some(thread_id) = self.primary_thread_id {
+            return self.enqueue_thread_event(thread_id, event).await;
+        }
+
+        if let EventMsg::SessionConfigured(session) = &event.msg {
+            let thread_id = session.session_id;
+            self.primary_thread_id = Some(thread_id);
+            self.primary_session_configured = Some(session.clone());
+            self.ensure_thread_channel(thread_id);
+            self.activate_thread_channel(thread_id).await;
+
+            let pending = std::mem::take(&mut self.pending_primary_events);
+            for pending_event in pending {
+                self.enqueue_thread_event(thread_id, pending_event).await?;
+            }
+            self.enqueue_thread_event(thread_id, event).await?;
+        } else {
+            self.pending_primary_events.push_back(event);
+        }
+        Ok(())
+    }
+
+    async fn open_agent_picker(&mut self) {
+        let thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
+        for thread_id in thread_ids {
+            if self.server.get_thread(thread_id).await.is_err() {
+                self.thread_event_channels.remove(&thread_id);
+            }
+        }
+
+        if self.thread_event_channels.is_empty() {
+            self.chat_widget
+                .add_info_message("No agents available yet.".to_string(), None);
+            return;
+        }
+
+        let mut thread_ids: Vec<ThreadId> = self.thread_event_channels.keys().cloned().collect();
+        thread_ids.sort_by_key(ToString::to_string);
+
+        let mut initial_selected_idx = None;
+        let items: Vec<SelectionItem> = thread_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, thread_id)| {
+                if self.active_thread_id == Some(*thread_id) {
+                    initial_selected_idx = Some(idx);
+                }
+                let id = *thread_id;
+                SelectionItem {
+                    name: thread_id.to_string(),
+                    is_current: self.active_thread_id == Some(*thread_id),
+                    actions: vec![Box::new(move |tx| {
+                        tx.send(AppEvent::SelectAgentThread(id));
+                    })],
+                    dismiss_on_select: true,
+                    search_value: Some(thread_id.to_string()),
+                    ..Default::default()
+                }
+            })
+            .collect();
+
+        self.chat_widget.show_selection_view(SelectionViewParams {
+            title: Some("Agents".to_string()),
+            subtitle: Some("Select a thread to focus".to_string()),
+            footer_hint: Some(standard_popup_hint_line()),
+            items,
+            initial_selected_idx,
+            ..Default::default()
+        });
+    }
+
+    async fn select_agent_thread(&mut self, tui: &mut tui::Tui, thread_id: ThreadId) -> Result<()> {
+        if self.active_thread_id == Some(thread_id) {
+            return Ok(());
+        }
+
+        let thread = match self.server.get_thread(thread_id).await {
+            Ok(thread) => thread,
+            Err(err) => {
+                self.chat_widget.add_error_message(format!(
+                    "Failed to attach to agent thread {thread_id}: {err}"
+                ));
+                return Ok(());
+            }
+        };
+
+        let previous_thread_id = self.active_thread_id;
+        self.store_active_thread_receiver().await;
+        self.active_thread_id = None;
+        let Some((receiver, snapshot)) = self.activate_thread_for_replay(thread_id).await else {
+            self.chat_widget
+                .add_error_message(format!("Agent thread {thread_id} is already active."));
+            if let Some(previous_thread_id) = previous_thread_id {
+                self.activate_thread_channel(previous_thread_id).await;
+            }
+            return Ok(());
+        };
+
+        self.active_thread_id = Some(thread_id);
+        self.active_thread_rx = Some(receiver);
+
+        let init = self.chatwidget_init_for_forked_or_resumed_thread(tui, self.config.clone());
+        let codex_op_tx = crate::chatwidget::spawn_op_forwarder(thread);
+        self.chat_widget = ChatWidget::new_with_op_sender(init, codex_op_tx);
+
+        self.reset_for_thread_switch(tui)?;
+        self.replay_thread_snapshot(snapshot);
+        self.drain_active_thread_events(tui).await?;
+
+        Ok(())
+    }
+
+    fn reset_for_thread_switch(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        self.overlay = None;
+        self.transcript_cells.clear();
+        self.deferred_history_lines.clear();
+        self.has_emitted_history_lines = false;
+        self.backtrack = BacktrackState::default();
+        self.backtrack_render_pending = false;
+        tui.terminal.clear_scrollback()?;
+        tui.terminal.clear()?;
+        Ok(())
+    }
+
+    fn reset_thread_event_state(&mut self) {
+        self.thread_event_channels.clear();
+        self.active_thread_id = None;
+        self.active_thread_rx = None;
+        self.primary_thread_id = None;
+        self.pending_primary_events.clear();
+    }
+
+    async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
+        let Some(mut rx) = self.active_thread_rx.take() else {
+            return Ok(());
+        };
+
+        let mut disconnected = false;
+        loop {
+            match rx.try_recv() {
+                Ok(event) => self.handle_codex_event_now(event),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+
+        if !disconnected {
+            self.active_thread_rx = Some(rx);
+        } else {
+            self.clear_active_thread().await;
+        }
+
+        if self.backtrack_render_pending {
+            tui.frame_requester().schedule_frame();
+        }
+        Ok(())
+    }
+
+    /// Returns `(closed_thread_id, primary_thread_id)` when a non-primary active
+    /// thread has died and we should fail over to the primary thread.
+    ///
+    /// A user-requested shutdown (`ExitMode::ShutdownFirst`) sets
+    /// `pending_shutdown_exit_thread_id`; matching shutdown completions are ignored
+    /// here so Ctrl+C-like exits don't accidentally resurrect the main thread.
+    ///
+    /// Failover is only eligible when all of these are true:
+    /// 1. the event is `ShutdownComplete`;
+    /// 2. the active thread differs from the primary thread;
+    /// 3. the active thread is not the pending shutdown-exit thread.
+    fn active_non_primary_shutdown_target(&self, msg: &EventMsg) -> Option<(ThreadId, ThreadId)> {
+        if !matches!(msg, EventMsg::ShutdownComplete) {
+            return None;
+        }
+        let active_thread_id = self.active_thread_id?;
+        let primary_thread_id = self.primary_thread_id?;
+        if self.pending_shutdown_exit_thread_id == Some(active_thread_id) {
+            return None;
+        }
+        (active_thread_id != primary_thread_id).then_some((active_thread_id, primary_thread_id))
+    }
+
+    fn replay_thread_snapshot(&mut self, snapshot: ThreadEventSnapshot) {
+        if let Some(event) = snapshot.session_configured {
+            self.handle_codex_event_replay(event);
+        }
+        for event in snapshot.events {
+            self.handle_codex_event_replay(event);
+        }
+        self.refresh_status_line();
+    }
+
+    fn should_wait_for_initial_session(session_selection: &SessionSelection) -> bool {
+        matches!(
+            session_selection,
+            SessionSelection::StartFresh | SessionSelection::Exit
+        )
+    }
+
+    fn should_handle_active_thread_events(
+        waiting_for_initial_session_configured: bool,
+        has_active_thread_receiver: bool,
+    ) -> bool {
+        has_active_thread_receiver && !waiting_for_initial_session_configured
+    }
+
+    fn should_stop_waiting_for_initial_session(
+        waiting_for_initial_session_configured: bool,
+        primary_thread_id: Option<ThreadId>,
+    ) -> bool {
+        waiting_for_initial_session_configured && primary_thread_id.is_some()
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run(
+        tui: &mut tui::Tui,
+        auth_manager: Arc<AuthManager>,
+        mut config: Config,
+        cli_kv_overrides: Vec<(String, TomlValue)>,
+        harness_overrides: ConfigOverrides,
+        active_profile: Option<String>,
+        initial_prompt: Option<String>,
+        initial_images: Vec<PathBuf>,
+        session_selection: SessionSelection,
+        feedback: codex_feedback::CodexFeedback,
+        is_first_run: bool,
+        should_prompt_windows_sandbox_nux_at_startup: bool,
+    ) -> Result<AppExitInfo> {
+        use tokio_stream::StreamExt;
+        let (app_event_tx, mut app_event_rx) = unbounded_channel();
+        let app_event_tx = AppEventSender::new(app_event_tx);
+        emit_project_config_warnings(&app_event_tx, &config);
+        tui.set_notification_method(config.tui_notification_method);
+
+        let harness_overrides =
+            normalize_harness_overrides_for_cwd(harness_overrides, &config.cwd)?;
+        let thread_manager = Arc::new(ThreadManager::new(
+            config.codex_home.clone(),
+            auth_manager.clone(),
+            SessionSource::Cli,
+        ));
+        let mut model = thread_manager
+            .get_models_manager()
+            .get_default_model(&config.model, RefreshStrategy::Offline)
+            .await;
+        let available_models = thread_manager
+            .get_models_manager()
+            .list_models(RefreshStrategy::Offline)
+            .await;
+        let exit_info = handle_model_migration_prompt_if_needed(
+            tui,
+            &mut config,
+            model.as_str(),
+            &app_event_tx,
+            available_models,
+        )
+        .await;
+        if let Some(exit_info) = exit_info {
+            return Ok(exit_info);
+        }
+        if let Some(updated_model) = config.model.clone() {
+            model = updated_model;
+        }
+
+        let auth = auth_manager.auth().await;
+        let auth_ref = auth.as_ref();
+        // Determine who should see internal Slack routing. We treat
+        // `@openai.com` emails as employees and default to `External` when the
+        // email is unavailable (for example, API key auth).
+        let feedback_audience = if auth_ref
+            .and_then(CodexAuth::get_account_email)
+            .is_some_and(|email| email.ends_with("@openai.com"))
+        {
+            FeedbackAudience::OpenAiEmployee
+        } else {
+            FeedbackAudience::External
+        };
+        let auth_mode = auth_ref
+            .map(CodexAuth::auth_mode)
+            .map(TelemetryAuthMode::from);
+        let otel_manager = OtelManager::new(
+            ThreadId::new(),
+            model.as_str(),
+            model.as_str(),
+            auth_ref.and_then(CodexAuth::get_account_id),
+            auth_ref.and_then(CodexAuth::get_account_email),
+            auth_mode,
+            codex_core::default_client::originator().value,
+            config.otel.log_user_prompt,
+            codex_core::terminal::user_agent(),
+            SessionSource::Cli,
+        );
+        if config
+            .tui_status_line
+            .as_ref()
+            .is_some_and(|cmd| !cmd.is_empty())
+        {
+            otel_manager.counter("codex.status_line", 1, &[]);
+        }
+
+        let status_line_invalid_items_warned = Arc::new(AtomicBool::new(false));
+
+        let enhanced_keys_supported = tui.enhanced_keys_supported();
+        let wait_for_initial_session_configured =
+            Self::should_wait_for_initial_session(&session_selection);
+        let mut chat_widget = match session_selection {
+            SessionSelection::StartFresh | SessionSelection::Exit => {
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: app_event_tx.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
+                    enhanced_keys_supported,
+                    auth_manager: auth_manager.clone(),
+                    models_manager: thread_manager.get_models_manager(),
+                    feedback: feedback.clone(),
+                    is_first_run,
+                    feedback_audience,
+                    model: Some(model.clone()),
+                    status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                    otel_manager: otel_manager.clone(),
+                };
+                ChatWidget::new(init, thread_manager.clone())
+            }
+            SessionSelection::Resume(path) => {
+                let resumed = thread_manager
+                    .resume_thread_from_rollout(config.clone(), path.clone(), auth_manager.clone())
+                    .await
+                    .wrap_err_with(|| {
+                        let path_display = path.display();
+                        format!("Failed to resume session from {path_display}")
+                    })?;
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: app_event_tx.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
+                    enhanced_keys_supported,
+                    auth_manager: auth_manager.clone(),
+                    models_manager: thread_manager.get_models_manager(),
+                    feedback: feedback.clone(),
+                    is_first_run,
+                    feedback_audience,
+                    model: config.model.clone(),
+                    status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                    otel_manager: otel_manager.clone(),
+                };
+                ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
+            }
+            SessionSelection::Fork(path) => {
+                otel_manager.counter("codex.thread.fork", 1, &[("source", "cli_subcommand")]);
+                let forked = thread_manager
+                    .fork_thread(usize::MAX, config.clone(), path.clone(), false)
+                    .await
+                    .wrap_err_with(|| {
+                        let path_display = path.display();
+                        format!("Failed to fork session from {path_display}")
+                    })?;
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: app_event_tx.clone(),
+                    initial_user_message: crate::chatwidget::create_initial_user_message(
+                        initial_prompt.clone(),
+                        initial_images.clone(),
+                        // CLI prompt args are plain strings, so they don't provide element ranges.
+                        Vec::new(),
+                    ),
+                    enhanced_keys_supported,
+                    auth_manager: auth_manager.clone(),
+                    models_manager: thread_manager.get_models_manager(),
+                    feedback: feedback.clone(),
+                    is_first_run,
+                    feedback_audience,
+                    model: config.model.clone(),
+                    status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+                    otel_manager: otel_manager.clone(),
+                };
+                ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
+            }
+        };
+
+        chat_widget
+            .maybe_prompt_windows_sandbox_enable(should_prompt_windows_sandbox_nux_at_startup);
+
+        let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        #[cfg(not(debug_assertions))]
+        let upgrade_version = crate::updates::get_upgrade_version(&config);
+
+        let mut app = Self {
+            server: thread_manager.clone(),
+            otel_manager: otel_manager.clone(),
+            app_event_tx,
+            chat_widget,
+            auth_manager: auth_manager.clone(),
+            config,
+            active_profile,
+            cli_kv_overrides,
+            harness_overrides,
+            runtime_approval_policy_override: None,
+            runtime_sandbox_policy_override: None,
+            file_search,
+            enhanced_keys_supported,
+            transcript_cells: Vec::new(),
+            overlay: None,
+            deferred_history_lines: Vec::new(),
+            has_emitted_history_lines: false,
+            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
+            backtrack: BacktrackState::default(),
+            backtrack_render_pending: false,
+            feedback: feedback.clone(),
+            feedback_audience,
+            pending_update_action: None,
+            suppress_shutdown_complete: false,
+            pending_shutdown_exit_thread_id: None,
+            windows_sandbox: WindowsSandboxState::default(),
+            thread_event_channels: HashMap::new(),
+            active_thread_id: None,
+            active_thread_rx: None,
+            primary_thread_id: None,
+            primary_session_configured: None,
+            pending_primary_events: VecDeque::new(),
+        };
+
+        // On startup, if Agent mode (workspace-write) or ReadOnly is active, warn about world-writable dirs on Windows.
+        #[cfg(target_os = "windows")]
+        {
+            let should_check = WindowsSandboxLevel::from_config(&app.config)
+                != WindowsSandboxLevel::Disabled
+                && matches!(
+                    app.config.permissions.sandbox_policy.get(),
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_core::protocol::SandboxPolicy::ReadOnly { .. }
+                )
+                && !app
+                    .config
+                    .notices
+                    .hide_world_writable_warning
+                    .unwrap_or(false);
+            if should_check {
+                let cwd = app.config.cwd.clone();
+                let env_map: std::collections::HashMap<String, String> = std::env::vars().collect();
+                let tx = app.app_event_tx.clone();
+                let logs_base_dir = app.config.codex_home.clone();
+                let sandbox_policy = app.config.permissions.sandbox_policy.get().clone();
+                Self::spawn_world_writable_scan(cwd, env_map, logs_base_dir, sandbox_policy, tx);
+            }
+        }
+
+        #[cfg(not(debug_assertions))]
+        if let Some(latest_version) = upgrade_version {
+            let control = app
+                .handle_event(
+                    tui,
+                    AppEvent::InsertHistoryCell(Box::new(UpdateAvailableHistoryCell::new(
+                        latest_version,
+                        crate::update_action::get_update_action(),
+                    ))),
+                )
+                .await?;
+            if let AppRunControl::Exit(exit_reason) = control {
+                return Ok(AppExitInfo {
+                    token_usage: app.token_usage(),
+                    thread_id: app.chat_widget.thread_id(),
+                    thread_name: app.chat_widget.thread_name(),
+                    update_action: app.pending_update_action,
+                    exit_reason,
+                });
+            }
+        }
+
+        let tui_events = tui.event_stream();
+        tokio::pin!(tui_events);
+
+        tui.frame_requester().schedule_frame();
+
+        let mut thread_created_rx = thread_manager.subscribe_thread_created();
+        let mut listen_for_threads = true;
+        let mut waiting_for_initial_session_configured = wait_for_initial_session_configured;
+
+        let exit_reason = loop {
+            let control = select! {
+                Some(event) = app_event_rx.recv() => {
+                    app.handle_event(tui, event).await?
+                }
+                active = async {
+                    if let Some(rx) = app.active_thread_rx.as_mut() {
+                        rx.recv().await
+                    } else {
+                        None
+                    }
+                }, if App::should_handle_active_thread_events(
+                    waiting_for_initial_session_configured,
+                    app.active_thread_rx.is_some()
+                ) => {
+                    if let Some(event) = active {
+                        app.handle_active_thread_event(tui, event).await?;
+                    } else {
+                        app.clear_active_thread().await;
+                    }
+                    AppRunControl::Continue
+                }
+                Some(event) = tui_events.next() => {
+                    app.handle_tui_event(tui, event).await?
+                }
+                // Listen on new thread creation due to collab tools.
+                created = thread_created_rx.recv(), if listen_for_threads => {
+                    match created {
+                        Ok(thread_id) => {
+                            app.handle_thread_created(thread_id).await?;
+                        }
+                        Err(broadcast::error::RecvError::Lagged(_)) => {
+                            tracing::warn!("thread_created receiver lagged; skipping resync");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => {
+                            listen_for_threads = false;
+                        }
+                    }
+                    AppRunControl::Continue
+                }
+            };
+            if App::should_stop_waiting_for_initial_session(
+                waiting_for_initial_session_configured,
+                app.primary_thread_id,
+            ) {
+                waiting_for_initial_session_configured = false;
+            }
+            match control {
+                AppRunControl::Continue => {}
+                AppRunControl::Exit(reason) => break reason,
+            }
+        };
+        tui.terminal.clear()?;
+        Ok(AppExitInfo {
+            token_usage: app.token_usage(),
+            thread_id: app.chat_widget.thread_id(),
+            thread_name: app.chat_widget.thread_name(),
+            update_action: app.pending_update_action,
+            exit_reason,
         })
     }
 
-    fn switch_to_thread(
+    pub(crate) async fn handle_tui_event(
         &mut self,
-        thread_id: String,
-        status_message: &str,
-        announce_switch: bool,
-        replay_events: Vec<codex_core::UiEvent>,
-    ) {
-        let previous_thread = self.widget.ui_mut().session_id.clone();
-        let changed = previous_thread != thread_id;
-
-        if changed {
-            self.widget
-                .ui_mut()
-                .reset_for_thread_switch(thread_id.clone());
-            self.status_runtime = StatusRuntime::default();
-            self.pending_thread_switch_clear = true;
-            if !replay_events.is_empty() {
-                self.widget.ui_mut().apply_replay_ui_events(replay_events);
-            } else if let Ok(events) = stream_events(&self.state, 0)
-                && !events.is_empty()
-            {
-                self.status_runtime.apply_stream_events(&events);
-                self.widget
-                    .ui_mut()
-                    .apply_rpc_stream_events_with_replay(&events, true);
-            }
-            if !self.widget.ui_mut().has_history_cells() {
-                let model = self
-                    .status_runtime
-                    .session_model
-                    .clone()
-                    .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-                self.widget
-                    .ui_mut()
-                    .add_history_cell(Box::new(SessionHeaderHistoryCell::new(
-                        model,
-                        self.status_runtime.session_reasoning_effort,
-                        std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
-                        CODEX_CLI_VERSION,
-                    )));
+        tui: &mut tui::Tui,
+        event: TuiEvent,
+    ) -> Result<AppRunControl> {
+        if matches!(event, TuiEvent::Draw) {
+            let size = tui.terminal.size()?;
+            if size != tui.terminal.last_known_screen_size {
+                self.refresh_status_line();
             }
         }
 
-        if announce_switch && changed {
-            self.widget
-                .ui_mut()
-                .push_line(&format!("[thread switched] {thread_id}"));
+        if self.overlay.is_some() {
+            let _ = self.handle_backtrack_overlay_event(tui, event).await?;
+        } else {
+            match event {
+                TuiEvent::Key(key_event) => {
+                    self.handle_key_event(tui, key_event).await;
+                }
+                TuiEvent::Paste(pasted) => {
+                    // Many terminals convert newlines to \r when pasting (e.g., iTerm2),
+                    // but tui-textarea expects \n. Normalize CR to LF.
+                    // [tui-textarea]: https://github.com/rhysd/tui-textarea/blob/4d18622eeac13b309e0ff6a55a46ac6706da68cf/src/textarea.rs#L782-L783
+                    // [iTerm2]: https://github.com/gnachman/iTerm2/blob/5d0c0d9f68523cbd0494dad5422998964a2ecd8d/sources/iTermPasteHelper.m#L206-L216
+                    let pasted = pasted.replace("\r", "\n");
+                    self.chat_widget.handle_paste(pasted);
+                }
+                TuiEvent::Draw => {
+                    if self.backtrack_render_pending {
+                        self.backtrack_render_pending = false;
+                        self.render_transcript_once(tui);
+                    }
+                    self.chat_widget.maybe_post_pending_notification(tui);
+                    if self
+                        .chat_widget
+                        .handle_paste_burst_tick(tui.frame_requester())
+                    {
+                        return Ok(AppRunControl::Continue);
+                    }
+                    tui.draw(
+                        self.chat_widget.desired_height(tui.terminal.size()?.width),
+                        |frame| {
+                            self.chat_widget.render(frame.area(), frame.buffer);
+                            if let Some((x, y)) = self.chat_widget.cursor_pos(frame.area()) {
+                                frame.set_cursor_position((x, y));
+                            }
+                        },
+                    )?;
+                    if self.chat_widget.external_editor_state() == ExternalEditorState::Requested {
+                        self.chat_widget
+                            .set_external_editor_state(ExternalEditorState::Active);
+                        self.app_event_tx.send(AppEvent::LaunchExternalEditor);
+                    }
+                }
+            }
         }
-        self.widget
-            .ui_mut()
-            .set_status_message(Some(status_message.to_string()));
-        self.state.last_thread_id = Some(thread_id.clone());
-        self.thread_id = thread_id;
+        Ok(AppRunControl::Continue)
     }
 
-    // -----------------------------------------------------------------------
-    // Event handling — mirrors upstream `App::handle_event()`
-    // -----------------------------------------------------------------------
-
-    /// Process a single `AppEvent` and return the action the loop should take.
-    ///
-    /// This is the central dispatch point, mirroring upstream's enormous
-    /// `handle_event`. Currently handles the essential events; additional
-    /// upstream event types will be added incrementally.
-    async fn handle_event(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        event: AppEvent,
-    ) -> Result<LiveTuiAction> {
+    async fn handle_event(&mut self, tui: &mut tui::Tui, event: AppEvent) -> Result<AppRunControl> {
         match event {
-            AppEvent::Key(key_event) => self.handle_key_event(tui, key_event).await,
-            AppEvent::Mouse(_mouse_event) => Ok(LiveTuiAction::Continue),
-            AppEvent::Paste(pasted) => {
-                // Mirror upstream textarea behavior: normalize CR to LF for pasted text.
-                let pasted = pasted.replace('\r', "\n");
-                self.widget.ui_mut().handle_bottom_pane_paste(pasted);
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::Resize => Ok(LiveTuiAction::Continue),
-            AppEvent::Tick => {
-                let since_sequence = self.widget.ui_mut().last_sequence;
-                match stream_events(&self.state, since_sequence) {
-                    Ok(envelopes) => {
-                        if !envelopes.is_empty() {
-                            self.app_event_tx.send(AppEvent::StreamUpdate(envelopes));
-                        }
-                    }
-                    Err(err) => {
-                        self.widget
-                            .ui_mut()
-                            .set_status_message(Some(format!("stream poll failed: {err}")));
-                    }
-                }
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::SubmitInput {
-                text,
-                text_elements,
-                mention_bindings,
-            } => {
-                self.handle_submit(tui, &text, text_elements, mention_bindings)
-                    .await
-            }
-            AppEvent::StartTurn {
-                text,
-                text_elements,
-                mention_bindings,
-            } => {
-                let selected_mask = self.widget.ui_mut().active_collaboration_mask();
-                let session_model = self
-                    .status_runtime
-                    .session_model
-                    .clone()
-                    .or_else(|| fetch_current_model_from_config(&self.state));
-                let session_effort = self.status_runtime.session_reasoning_effort;
-                let collaboration_mode =
-                    collaboration_mode_from_mask(selected_mask, session_model, session_effort);
-                let ui = self.widget.ui_mut();
-                ui.register_local_user_message_echo(&text, &text_elements);
-                ui.push_user_prompt(&text, text_elements.clone());
-                if let Some(turn_id) = start_turn_with_elements_and_collaboration(
-                    &self.state,
-                    &ui.session_id,
-                    &text,
-                    text_elements,
-                    mention_bindings,
-                    collaboration_mode,
-                )? {
-                    ui.active_turn_id = Some(turn_id);
-                }
-                ui.set_status_message(Some("waiting for response...".to_string()));
-                Ok(LiveTuiAction::Continue)
-            }
             AppEvent::NewSession => {
-                let thread_id = start_thread(&self.state)?;
-                self.switch_to_thread(thread_id, "started new thread", true, Vec::new());
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::Interrupt => {
-                let ui = self.widget.ui_mut();
-                if let Some(turn_id) = ui.active_turn_id.clone() {
-                    interrupt_turn(&self.state, &ui.session_id, &turn_id)?;
-                    ui.set_status_message(Some("interrupt requested".to_string()));
-                } else {
-                    ui.set_status_message(Some("no running turn".to_string()));
+                let model = self.chat_widget.current_model().to_string();
+                let summary = session_summary(
+                    self.chat_widget.token_usage(),
+                    self.chat_widget.thread_id(),
+                    self.chat_widget.thread_name(),
+                );
+                self.shutdown_current_thread().await;
+                if let Err(err) = self.server.remove_and_close_all_threads().await {
+                    tracing::warn!(error = %err, "failed to close all threads");
                 }
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::ShowStatus => {
-                self.emit_status_summary();
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::RefreshStream => {
-                self.widget
-                    .ui_mut()
-                    .set_status_message(Some("refreshing stream...".to_string()));
-                self.app_event_tx.send(AppEvent::Tick);
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::ResumeSession => {
-                self.open_resume_picker(tui).await?;
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::ApprovalDecision { arg, approve } => {
-                handle_app_server_approval_decision(
-                    &mut self.state,
-                    self.widget.ui_mut(),
-                    &arg,
-                    approve,
-                )?;
-                Ok(LiveTuiAction::Continue)
-            }
-            AppEvent::Exit(_mode) => Ok(LiveTuiAction::Detach),
-            AppEvent::StreamUpdate(envelopes) => {
-                self.status_runtime.apply_stream_events(&envelopes);
-                self.widget.ui_mut().apply_rpc_stream_events(&envelopes);
-                Ok(LiveTuiAction::Continue)
-            }
-        }
-    }
-
-    /// Handle a key press event — mirrors upstream `App::handle_key_event`.
-    async fn handle_key_event(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        key: crossterm::event::KeyEvent,
-    ) -> Result<LiveTuiAction> {
-        if key.kind == KeyEventKind::Press
-            && key.code == KeyCode::Esc
-            && self.widget.ui_mut().bottom_pane_no_modal_or_popup_active()
-            && self
-                .widget
-                .ui_mut()
-                .bottom_pane_composer_text()
-                .trim()
-                .is_empty()
-        {
-            let width = tui.terminal.size()?.width;
-            let lines = self.widget.ui_mut().history_view_lines(width);
-            self.overlay = Some(Overlay::new_static_with_lines(
-                lines,
-                "Transcript".to_string(),
-            ));
-            tui.frame_requester().schedule_frame();
-            return Ok(LiveTuiAction::Continue);
-        }
-
-        if key.kind == KeyEventKind::Press
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
-        {
-            let width = tui.terminal.size()?.width;
-            let lines = self.widget.ui_mut().history_view_lines(width);
-            self.overlay = Some(Overlay::new_static_with_lines(
-                lines,
-                "Transcript".to_string(),
-            ));
-            tui.frame_requester().schedule_frame();
-            return Ok(LiveTuiAction::Continue);
-        }
-
-        let mut queued_submit: Option<(String, Vec<codex_protocol::user_input::TextElement>)> =
-            None;
-        let mut queued_command: Option<(
-            SlashCommand,
-            Option<String>,
-            Vec<codex_protocol::user_input::TextElement>,
-        )> = None;
-        let mut queued_external_editor_launch = false;
-        let pending_widget_events = {
-            let ui = self.widget.ui_mut();
-            if key.code == KeyCode::Esc && ui.shortcuts_overlay_visible() {
-                ui.hide_shortcuts_overlay();
-                return Ok(LiveTuiAction::Continue);
-            }
-            match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
-                    return Ok(LiveTuiAction::Continue);
-                }
-                KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if !ui.shortcuts_overlay_visible() && ui.bottom_pane_no_modal_or_popup_active()
-                    {
-                        queued_external_editor_launch = true;
+                let init = crate::chatwidget::ChatWidgetInit {
+                    config: self.config.clone(),
+                    frame_requester: tui.frame_requester(),
+                    app_event_tx: self.app_event_tx.clone(),
+                    // New sessions start without prefilled message content.
+                    initial_user_message: None,
+                    enhanced_keys_supported: self.enhanced_keys_supported,
+                    auth_manager: self.auth_manager.clone(),
+                    models_manager: self.server.get_models_manager(),
+                    feedback: self.feedback.clone(),
+                    is_first_run: false,
+                    feedback_audience: self.feedback_audience,
+                    model: Some(model),
+                    status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
+                    otel_manager: self.otel_manager.clone(),
+                };
+                self.chat_widget = ChatWidget::new(init, self.server.clone());
+                self.reset_thread_event_state();
+                if let Some(summary) = summary {
+                    let mut lines: Vec<Line<'static>> = vec![summary.usage_line.clone().into()];
+                    if let Some(command) = summary.resume_command {
+                        let spans = vec!["To continue this session, run ".into(), command.cyan()];
+                        lines.push(spans.into());
                     }
+                    self.chat_widget.add_plain_history_lines(lines);
                 }
-                KeyCode::Char('?') => {
-                    if !key.modifiers.contains(KeyModifiers::CONTROL)
-                        && !key.modifiers.contains(KeyModifiers::ALT)
-                        && ui.bottom_pane_composer_text().trim().is_empty()
-                    {
-                        ui.toggle_shortcuts_overlay();
-                    } else {
-                        match ui.handle_bottom_pane_key_event(key) {
-                            InputResult::Submitted {
-                                text,
-                                text_elements,
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenResumePicker => {
+                match crate::resume_picker::run_resume_picker(tui, &self.config, false).await? {
+                    SessionSelection::Resume(path) => {
+                        let current_cwd = self.config.cwd.clone();
+                        let resume_cwd = match crate::resolve_cwd_for_resume_or_fork(
+                            tui,
+                            &current_cwd,
+                            &path,
+                            CwdPromptAction::Resume,
+                            true,
+                        )
+                        .await?
+                        {
+                            crate::ResolveCwdOutcome::Continue(Some(cwd)) => cwd,
+                            crate::ResolveCwdOutcome::Continue(None) => current_cwd.clone(),
+                            crate::ResolveCwdOutcome::Exit => {
+                                return Ok(AppRunControl::Exit(ExitReason::UserRequested));
                             }
-                            | InputResult::Queued {
-                                text,
-                                text_elements,
-                            } => {
-                                queued_submit = Some((text, text_elements));
+                        };
+                        let mut resume_config = if crate::cwds_differ(&current_cwd, &resume_cwd) {
+                            match self.rebuild_config_for_cwd(resume_cwd).await {
+                                Ok(cfg) => cfg,
+                                Err(err) => {
+                                    self.chat_widget.add_error_message(format!(
+                                        "Failed to rebuild configuration for resume: {err}"
+                                    ));
+                                    return Ok(AppRunControl::Continue);
+                                }
                             }
-                            InputResult::Command(cmd) => {
-                                queued_command = Some((cmd, None, Vec::new()));
+                        } else {
+                            // No rebuild needed: current_cwd comes from self.config.cwd.
+                            self.config.clone()
+                        };
+                        self.apply_runtime_policy_overrides(&mut resume_config);
+                        let summary = session_summary(
+                            self.chat_widget.token_usage(),
+                            self.chat_widget.thread_id(),
+                            self.chat_widget.thread_name(),
+                        );
+                        match self
+                            .server
+                            .resume_thread_from_rollout(
+                                resume_config.clone(),
+                                path.clone(),
+                                self.auth_manager.clone(),
+                            )
+                            .await
+                        {
+                            Ok(resumed) => {
+                                self.shutdown_current_thread().await;
+                                self.config = resume_config;
+                                tui.set_notification_method(self.config.tui_notification_method);
+                                self.file_search.update_search_dir(self.config.cwd.clone());
+                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                    tui,
+                                    self.config.clone(),
+                                );
+                                self.chat_widget = ChatWidget::new_from_existing(
+                                    init,
+                                    resumed.thread,
+                                    resumed.session_configured,
+                                );
+                                self.reset_thread_event_state();
+                                if let Some(summary) = summary {
+                                    let mut lines: Vec<Line<'static>> =
+                                        vec![summary.usage_line.clone().into()];
+                                    if let Some(command) = summary.resume_command {
+                                        let spans = vec![
+                                            "To continue this session, run ".into(),
+                                            command.cyan(),
+                                        ];
+                                        lines.push(spans.into());
+                                    }
+                                    self.chat_widget.add_plain_history_lines(lines);
+                                }
                             }
-                            InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                                queued_command = Some((cmd, Some(args), text_elements));
+                            Err(err) => {
+                                let path_display = path.display();
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to resume session from {path_display}: {err}"
+                                ));
                             }
-                            InputResult::None => {}
                         }
                     }
+                    SessionSelection::Exit
+                    | SessionSelection::StartFresh
+                    | SessionSelection::Fork(_) => {}
                 }
-                _ => match ui.handle_bottom_pane_key_event(key) {
-                    InputResult::Submitted {
-                        text,
-                        text_elements,
-                    }
-                    | InputResult::Queued {
-                        text,
-                        text_elements,
-                    } => {
-                        queued_submit = Some((text, text_elements));
-                    }
-                    InputResult::Command(cmd) => {
-                        queued_command = Some((cmd, None, Vec::new()));
-                    }
-                    InputResult::CommandWithArgs(cmd, args, text_elements) => {
-                        queued_command = Some((cmd, Some(args), text_elements));
-                    }
-                    InputResult::None => {}
-                },
-            }
-            ui.drain_bottom_pane_events()
-        };
-        for event in pending_widget_events {
-            self.handle_widget_app_event(tui, event).await?;
-        }
 
-        if queued_external_editor_launch {
-            self.handle_widget_app_event(tui, WidgetAppEvent::LaunchExternalEditor)
-                .await?;
-        }
+                // Leaving alt-screen may blank the inline viewport; force a redraw either way.
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ForkCurrentSession => {
+                self.otel_manager
+                    .counter("codex.thread.fork", 1, &[("source", "slash_command")]);
+                let summary = session_summary(
+                    self.chat_widget.token_usage(),
+                    self.chat_widget.thread_id(),
+                    self.chat_widget.thread_name(),
+                );
+                self.chat_widget
+                    .add_plain_history_lines(vec!["/fork".magenta().into()]);
+                if let Some(path) = self.chat_widget.rollout_path() {
+                    // Fresh threads expose a precomputed path, but the file is
+                    // materialized lazily on first user message.
+                    if path.exists() {
+                        match self
+                            .server
+                            .fork_thread(usize::MAX, self.config.clone(), path.clone(), false)
+                            .await
+                        {
+                            Ok(forked) => {
+                                self.shutdown_current_thread().await;
+                                let init = self.chatwidget_init_for_forked_or_resumed_thread(
+                                    tui,
+                                    self.config.clone(),
+                                );
+                                self.chat_widget = ChatWidget::new_from_existing(
+                                    init,
+                                    forked.thread,
+                                    forked.session_configured,
+                                );
+                                self.reset_thread_event_state();
+                                if let Some(summary) = summary {
+                                    let mut lines: Vec<Line<'static>> =
+                                        vec![summary.usage_line.clone().into()];
+                                    if let Some(command) = summary.resume_command {
+                                        let spans = vec![
+                                            "To continue this session, run ".into(),
+                                            command.cyan(),
+                                        ];
+                                        lines.push(spans.into());
+                                    }
+                                    self.chat_widget.add_plain_history_lines(lines);
+                                }
+                            }
+                            Err(err) => {
+                                let path_display = path.display();
+                                self.chat_widget.add_error_message(format!(
+                                    "Failed to fork current session from {path_display}: {err}"
+                                ));
+                            }
+                        }
+                    } else {
+                        self.chat_widget.add_error_message(
+                            "A thread must contain at least one turn before it can be forked."
+                                .to_string(),
+                        );
+                    }
+                } else {
+                    self.chat_widget.add_error_message(
+                        "A thread must contain at least one turn before it can be forked."
+                            .to_string(),
+                    );
+                }
 
-        if let Some((cmd, args, text_elements)) = queued_command {
-            self.dispatch_slash_command(tui, cmd, args, text_elements)
-                .await?;
-        } else if let Some((input, text_elements)) = queued_submit {
-            let mention_bindings = self
-                .widget
-                .ui_mut()
-                .take_recent_submission_mention_bindings();
-            self.app_event_tx.send(AppEvent::SubmitInput {
-                text: input,
-                text_elements,
-                mention_bindings,
-            });
-        }
-        Ok(LiveTuiAction::Continue)
-    }
-
-    async fn handle_widget_app_event(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        event: WidgetAppEvent,
-    ) -> Result<()> {
-        match event {
-            WidgetAppEvent::CodexEvent(event) => {
-                self.widget.ui_mut().apply_codex_event(event);
+                tui.frame_requester().schedule_frame();
             }
-            WidgetAppEvent::FatalExitRequest(message) => {
-                self.widget
-                    .ui_mut()
-                    .add_history_cell(Box::new(crate::history_cell::new_error_event(message)));
-                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
+            AppEvent::InsertHistoryCell(cell) => {
+                let cell: Arc<dyn HistoryCell> = cell.into();
+                if let Some(Overlay::Transcript(t)) = &mut self.overlay {
+                    t.insert_cell(cell.clone());
+                    tui.frame_requester().schedule_frame();
+                }
+                self.transcript_cells.push(cell.clone());
+                let mut display = cell.display_lines(tui.terminal.last_known_screen_size.width);
+                if !display.is_empty() {
+                    // Only insert a separating blank line for new cells that are not
+                    // part of an ongoing stream. Streaming continuations should not
+                    // accrue extra blank lines between chunks.
+                    if !cell.is_stream_continuation() {
+                        if self.has_emitted_history_lines {
+                            display.insert(0, Line::from(""));
+                        } else {
+                            self.has_emitted_history_lines = true;
+                        }
+                    }
+                    if self.overlay.is_some() {
+                        self.deferred_history_lines.extend(display);
+                    } else {
+                        tui.insert_history_lines(display);
+                    }
+                }
             }
-            WidgetAppEvent::CodexOp(op) => self.handle_widget_op(op)?,
-            WidgetAppEvent::OpenAgentPicker => {
-                self.open_agent_picker()?;
+            AppEvent::ApplyThreadRollback { num_turns } => {
+                if self.apply_non_pending_thread_rollback(num_turns) {
+                    tui.frame_requester().schedule_frame();
+                }
             }
-            WidgetAppEvent::InsertHistoryCell(cell) => {
-                self.widget.ui_mut().add_history_cell(cell);
-            }
-            WidgetAppEvent::ApplyThreadRollback { num_turns } => {
-                self.widget
-                    .ui_mut()
-                    .apply_non_pending_thread_rollback(num_turns);
-            }
-            WidgetAppEvent::StartCommitAnimation => {
+            AppEvent::StartCommitAnimation => {
                 if self
                     .commit_anim_running
                     .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
                     .is_ok()
                 {
-                    let tx = self.widget_event_tx.clone();
+                    let tx = self.app_event_tx.clone();
                     let running = self.commit_anim_running.clone();
                     thread::spawn(move || {
                         while running.load(Ordering::Relaxed) {
                             thread::sleep(COMMIT_ANIMATION_TICK);
-                            tx.send(WidgetAppEvent::CommitTick);
+                            tx.send(AppEvent::CommitTick);
                         }
                     });
                 }
             }
-            WidgetAppEvent::StopCommitAnimation => {
+            AppEvent::StopCommitAnimation => {
                 self.commit_anim_running.store(false, Ordering::Release);
             }
-            WidgetAppEvent::CommitTick => {
-                self.widget.ui_mut().on_commit_tick();
+            AppEvent::CommitTick => {
+                self.chat_widget.on_commit_tick();
             }
-            WidgetAppEvent::StartFileSearch(query) => {
+            AppEvent::CodexEvent(event) => {
+                self.enqueue_primary_event(event).await?;
+            }
+            AppEvent::Exit(mode) => match mode {
+                ExitMode::ShutdownFirst => {
+                    // Mark the thread we are explicitly shutting down for exit so
+                    // its shutdown completion does not trigger agent failover.
+                    self.pending_shutdown_exit_thread_id =
+                        self.active_thread_id.or(self.chat_widget.thread_id());
+                    self.chat_widget.submit_op(Op::Shutdown);
+                }
+                ExitMode::Immediate => {
+                    self.pending_shutdown_exit_thread_id = None;
+                    return Ok(AppRunControl::Exit(ExitReason::UserRequested));
+                }
+            },
+            AppEvent::FatalExitRequest(message) => {
+                return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
+            }
+            AppEvent::CodexOp(op) => {
+                self.chat_widget.submit_op(op);
+            }
+            AppEvent::DiffResult(text) => {
+                // Clear the in-progress state in the bottom pane
+                self.chat_widget.on_diff_complete();
+                // Enter alternate screen using TUI helper and build pager lines
+                let _ = tui.enter_alt_screen();
+                let pager_lines: Vec<ratatui::text::Line<'static>> = if text.trim().is_empty() {
+                    vec!["No changes detected.".italic().into()]
+                } else {
+                    text.lines().map(ansi_escape_line).collect()
+                };
+                self.overlay = Some(Overlay::new_static_with_lines(
+                    pager_lines,
+                    "D I F F".to_string(),
+                ));
+                tui.frame_requester().schedule_frame();
+            }
+            AppEvent::OpenAppLink {
+                app_id,
+                title,
+                description,
+                instructions,
+                url,
+                is_installed,
+                is_enabled,
+            } => {
+                self.chat_widget
+                    .open_app_link_view(crate::bottom_pane::AppLinkViewParams {
+                        app_id,
+                        title,
+                        description,
+                        instructions,
+                        url,
+                        is_installed,
+                        is_enabled,
+                    });
+            }
+            AppEvent::OpenUrlInBrowser { url } => {
+                self.open_url_in_browser(url);
+            }
+            AppEvent::RefreshConnectors { force_refetch } => {
+                self.chat_widget.refresh_connectors(force_refetch);
+            }
+            AppEvent::StartFileSearch(query) => {
                 self.file_search.on_user_query(query);
             }
-            WidgetAppEvent::FileSearchResult { query, matches } => {
-                self.widget
-                    .ui_mut()
-                    .apply_file_search_result(query, matches);
+            AppEvent::FileSearchResult { query, matches } => {
+                self.chat_widget.apply_file_search_result(query, matches);
             }
-            WidgetAppEvent::OpenResumePicker => {
-                self.open_resume_picker(tui).await?;
+            AppEvent::RateLimitSnapshotFetched(snapshot) => {
+                self.chat_widget.on_rate_limit_snapshot(Some(snapshot));
             }
-            WidgetAppEvent::OpenApprovalsPopup | WidgetAppEvent::OpenPermissionsPopup => {
-                self.open_permissions_picker()?;
+            AppEvent::ConnectorsLoaded { result, is_final } => {
+                self.chat_widget.on_connectors_loaded(result, is_final);
             }
-            WidgetAppEvent::OpenSkillsList => {
-                self.widget.ui_mut().bottom_pane_insert_str("$");
+            AppEvent::UpdateReasoningEffort(effort) => {
+                self.on_update_reasoning_effort(effort);
+                self.refresh_status_line();
             }
-            WidgetAppEvent::OpenManageSkillsPopup => {
-                self.open_manage_skills_popup()?;
+            AppEvent::UpdateModel(model) => {
+                self.chat_widget.set_model(&model);
+                self.refresh_status_line();
             }
-            WidgetAppEvent::OpenReviewBranchPicker(cwd) => {
-                self.open_review_branch_picker(&cwd);
+            AppEvent::UpdateCollaborationMode(mask) => {
+                self.chat_widget.set_collaboration_mask(mask);
+                self.refresh_status_line();
             }
-            WidgetAppEvent::OpenReviewCommitPicker(cwd) => {
-                self.open_review_commit_picker(&cwd);
+            AppEvent::UpdatePersonality(personality) => {
+                self.on_update_personality(personality);
             }
-            WidgetAppEvent::OpenReviewCustomPrompt => {
-                self.widget.ui_mut().show_review_custom_prompt();
+            AppEvent::OpenReasoningPopup { model } => {
+                self.chat_widget.open_reasoning_popup(model);
             }
-            WidgetAppEvent::ForkCurrentSession => {
-                let active_thread_id = self.widget.ui_mut().session_id.clone();
-                if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("fork returned no thread id".to_string()));
-                }
+            AppEvent::OpenAllModelsPopup { models } => {
+                self.chat_widget.open_all_models_popup(models);
             }
-            WidgetAppEvent::SelectAgentThread(thread_id) => {
-                let selected_thread_id = thread_id.to_string();
-                let resumed = resume_thread_detailed(&self.state, &selected_thread_id)?;
-                if let Some(resumed_thread_id) = resumed.thread_id {
-                    self.switch_to_thread(
-                        resumed_thread_id,
-                        "thread resumed",
-                        false,
-                        resumed.replay_events,
-                    );
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("resume returned no thread id".to_string()));
-                }
-            }
-            WidgetAppEvent::UpdateModel(model) => {
-                self.apply_model_selection(model)?;
-            }
-            WidgetAppEvent::UpdateReasoningEffort(effort) => {
-                self.apply_reasoning_effort_selection(effort)?;
-            }
-            WidgetAppEvent::UpdateAskForApprovalPolicy(policy) => {
-                self.apply_approval_policy_selection(policy)?;
-            }
-            WidgetAppEvent::UpdateSandboxPolicy(policy) => {
-                self.apply_sandbox_policy_selection(policy)?;
-            }
-            WidgetAppEvent::UpdatePersonality(personality) => {
-                self.apply_personality_selection(personality)?;
-            }
-            WidgetAppEvent::UpdateCollaborationMode(mask) => {
-                self.widget.ui_mut().set_collaboration_mask(mask);
-                self.widget
-                    .ui_mut()
-                    .set_status_message(Some("collaboration mode updated".to_string()));
-            }
-            WidgetAppEvent::UpdateFeatureFlags { updates } => {
-                self.apply_feature_flags(updates)?;
-            }
-            WidgetAppEvent::SetSkillEnabled { path, enabled } => {
-                self.apply_skill_enabled(path, enabled)?;
-            }
-            WidgetAppEvent::SetAppEnabled { id, enabled } => {
-                self.apply_app_enabled(id, enabled)?;
-            }
-            WidgetAppEvent::ManageSkillsClosed => {
-                self.widget
-                    .ui_mut()
-                    .set_status_message(Some("skill settings updated".to_string()));
-            }
-            WidgetAppEvent::OpenFeedbackConsent { category } => {
-                let rollout_path = self.widget.ui_mut().rollout_path();
-                self.widget
-                    .ui_mut()
-                    .open_feedback_consent(category, rollout_path);
-            }
-            WidgetAppEvent::OpenFeedbackNote {
-                category,
-                include_logs,
-            } => {
-                let rollout_path = self.widget.ui_mut().rollout_path();
-                self.widget
-                    .ui_mut()
-                    .open_feedback_note(category, include_logs, rollout_path);
-            }
-            WidgetAppEvent::OpenReasoningPopup { model } => {
-                self.widget.ui_mut().open_reasoning_popup(model);
-            }
-            WidgetAppEvent::OpenAllModelsPopup { models } => {
-                self.widget.ui_mut().open_all_models_popup(models);
-            }
-            WidgetAppEvent::OpenFullAccessConfirmation {
+            AppEvent::OpenFullAccessConfirmation {
                 preset,
                 return_to_permissions,
             } => {
-                self.widget
-                    .ui_mut()
+                self.chat_widget
                     .open_full_access_confirmation(preset, return_to_permissions);
             }
-            WidgetAppEvent::SubmitUserMessageWithMode {
-                text,
-                collaboration_mode,
+            AppEvent::OpenWorldWritableWarningConfirmation {
+                preset,
+                sample_paths,
+                extra_count,
+                failed_scan,
             } => {
-                let session_model = self
-                    .status_runtime
-                    .session_model
-                    .clone()
-                    .or_else(|| fetch_current_model_from_config(&self.state));
-                let session_effort = self.status_runtime.session_reasoning_effort;
-                let collaboration_mode = collaboration_mode_from_mask(
-                    Some(collaboration_mode),
-                    session_model,
-                    session_effort,
+                self.chat_widget.open_world_writable_warning_confirmation(
+                    preset,
+                    sample_paths,
+                    extra_count,
+                    failed_scan,
                 );
-                let ui = self.widget.ui_mut();
-                ui.register_local_user_message_echo(&text, &[]);
-                ui.push_user_prompt(&text, Vec::new());
-                if let Some(turn_id) = start_turn_with_elements_and_collaboration(
-                    &self.state,
-                    &ui.session_id,
-                    &text,
-                    Vec::new(),
-                    Vec::new(),
-                    collaboration_mode,
-                )? {
-                    ui.active_turn_id = Some(turn_id);
-                }
-                ui.set_status_message(Some("waiting for response...".to_string()));
             }
-            WidgetAppEvent::LaunchExternalEditor => {
-                self.launch_external_editor()?;
+            AppEvent::OpenFeedbackNote {
+                category,
+                include_logs,
+            } => {
+                self.chat_widget.open_feedback_note(category, include_logs);
             }
-            WidgetAppEvent::StatusLineBranchUpdated { cwd, branch } => {
-                let ui = self.widget.ui_mut();
-                ui.set_status_line_branch(cwd, branch);
-                ui.refresh_status_line();
+            AppEvent::OpenFeedbackConsent { category } => {
+                self.chat_widget.open_feedback_consent(category);
             }
-            WidgetAppEvent::StatusLineSetup { items } => {
-                self.widget.ui_mut().setup_status_line(items);
-            }
-            WidgetAppEvent::StatusLineSetupCancelled => {
-                self.widget.ui_mut().cancel_status_line_setup();
-            }
-            WidgetAppEvent::FullScreenApprovalRequest(request) => {
-                self.widget
-                    .ui_mut()
-                    .push_fullscreen_approval_request(request);
-            }
-            _ => {}
-        }
-        Ok(())
-    }
-
-    async fn dispatch_slash_command(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        cmd: SlashCommand,
-        args: Option<String>,
-        _text_elements: Vec<codex_protocol::user_input::TextElement>,
-    ) -> Result<()> {
-        if !cmd.available_during_task() && self.widget.ui_mut().bottom_pane_is_task_running() {
-            self.widget
-                .ui_mut()
-                .add_history_cell(Box::new(crate::history_cell::new_error_event(format!(
-                    "'/{}' is disabled while a task is in progress.",
-                    cmd.command()
-                ))));
-            self.widget.ui_mut().drain_pending_submission_state();
-            return Ok(());
-        }
-
-        let arg = args.unwrap_or_default();
-        match cmd {
-            SlashCommand::Model => self.open_model_picker()?,
-            SlashCommand::New => self.app_event_tx.send(AppEvent::NewSession),
-            SlashCommand::Resume => self.open_resume_picker(tui).await?,
-            SlashCommand::Status => self.emit_status_summary(),
-            SlashCommand::Statusline => self.widget.ui_mut().open_status_line_setup(),
-            SlashCommand::DebugConfig => self
-                .widget
-                .ui_mut()
-                .push_line("[info] /debug-config is not yet ported in app-server tui"),
-            SlashCommand::Fork => {
-                let active_thread_id = self.widget.ui_mut().session_id.clone();
-                if let Some(forked_thread_id) = fork_thread(&self.state, &active_thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("fork returned no thread id".to_string()));
+            AppEvent::LaunchExternalEditor => {
+                if self.chat_widget.external_editor_state() == ExternalEditorState::Active {
+                    self.launch_external_editor(tui).await;
                 }
             }
-            SlashCommand::Init => {
-                let init_target = std::env::current_dir()
-                    .unwrap_or_else(|_| std::env::temp_dir())
-                    .join("AGENTS.md");
-                if init_target.exists() {
-                    self.widget.ui_mut().push_line(
-                        "AGENTS.md already exists here. Skipping /init to avoid overwriting it.",
+            AppEvent::OpenWindowsSandboxEnablePrompt { preset } => {
+                self.chat_widget.open_windows_sandbox_enable_prompt(preset);
+            }
+            AppEvent::OpenWindowsSandboxFallbackPrompt { preset } => {
+                self.otel_manager
+                    .counter("codex.windows_sandbox.fallback_prompt_shown", 1, &[]);
+                self.chat_widget.clear_windows_sandbox_setup_status();
+                if let Some(started_at) = self.windows_sandbox.setup_started_at.take() {
+                    self.otel_manager.record_duration(
+                        "codex.windows_sandbox.elevated_setup_duration_ms",
+                        started_at.elapsed(),
+                        &[("result", "failure")],
                     );
-                } else {
-                    const INIT_PROMPT: &str = include_str!("../prompt_for_init_command.md");
-                    self.app_event_tx.send(AppEvent::StartTurn {
-                        text: INIT_PROMPT.to_string(),
-                        text_elements: Vec::new(),
-                        mention_bindings: Vec::new(),
+                }
+                self.chat_widget
+                    .open_windows_sandbox_fallback_prompt(preset);
+            }
+            AppEvent::BeginWindowsSandboxElevatedSetup { preset } => {
+                #[cfg(target_os = "windows")]
+                {
+                    let policy = preset.sandbox.clone();
+                    let policy_cwd = self.config.cwd.clone();
+                    let command_cwd = policy_cwd.clone();
+                    let env_map: std::collections::HashMap<String, String> =
+                        std::env::vars().collect();
+                    let codex_home = self.config.codex_home.clone();
+                    let tx = self.app_event_tx.clone();
+
+                    // If the elevated setup already ran on this machine, don't prompt for
+                    // elevation again - just flip the config to use the elevated path.
+                    if codex_core::windows_sandbox::sandbox_setup_is_complete(codex_home.as_path())
+                    {
+                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
+                            preset,
+                            mode: WindowsSandboxEnableMode::Elevated,
+                        });
+                        return Ok(AppRunControl::Continue);
+                    }
+
+                    self.chat_widget.show_windows_sandbox_setup_status();
+                    self.windows_sandbox.setup_started_at = Some(Instant::now());
+                    let otel_manager = self.otel_manager.clone();
+                    tokio::task::spawn_blocking(move || {
+                        let result = codex_core::windows_sandbox::run_elevated_setup(
+                            &policy,
+                            policy_cwd.as_path(),
+                            command_cwd.as_path(),
+                            &env_map,
+                            codex_home.as_path(),
+                        );
+                        let event = match result {
+                            Ok(()) => {
+                                otel_manager.counter(
+                                    "codex.windows_sandbox.elevated_setup_success",
+                                    1,
+                                    &[],
+                                );
+                                AppEvent::EnableWindowsSandboxForAgentMode {
+                                    preset: preset.clone(),
+                                    mode: WindowsSandboxEnableMode::Elevated,
+                                }
+                            }
+                            Err(err) => {
+                                let mut code_tag: Option<String> = None;
+                                let mut message_tag: Option<String> = None;
+                                if let Some((code, message)) =
+                                    codex_core::windows_sandbox::elevated_setup_failure_details(
+                                        &err,
+                                    )
+                                {
+                                    code_tag = Some(code);
+                                    message_tag = Some(message);
+                                }
+                                let mut tags: Vec<(&str, &str)> = Vec::new();
+                                if let Some(code) = code_tag.as_deref() {
+                                    tags.push(("code", code));
+                                }
+                                if let Some(message) = message_tag.as_deref() {
+                                    tags.push(("message", message));
+                                }
+                                otel_manager.counter(
+                                    codex_core::windows_sandbox::elevated_setup_failure_metric_name(
+                                        &err,
+                                    ),
+                                    1,
+                                    &tags,
+                                );
+                                tracing::error!(
+                                    error = %err,
+                                    "failed to run elevated Windows sandbox setup"
+                                );
+                                AppEvent::OpenWindowsSandboxFallbackPrompt { preset }
+                            }
+                        };
+                        tx.send(event);
                     });
                 }
-            }
-            SlashCommand::Approvals | SlashCommand::Permissions => {
-                self.open_permissions_picker()?
-            }
-            SlashCommand::Review => {
-                if arg.trim().is_empty() {
-                    self.widget.ui_mut().open_review_popup();
-                } else {
-                    self.start_review_custom(arg.trim())?;
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = preset;
                 }
             }
-            SlashCommand::Rename => {
-                if arg.trim().is_empty() {
-                    self.widget
-                        .ui_mut()
-                        .push_line("[info] usage: /rename <thread-name>");
-                } else {
-                    let thread_id = self.widget.ui_mut().session_id.clone();
-                    set_thread_name(&self.state, &thread_id, arg.trim())?;
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some(format!("thread renamed to {}", arg.trim())));
+            AppEvent::BeginWindowsSandboxLegacySetup { preset } => {
+                #[cfg(target_os = "windows")]
+                {
+                    let policy = preset.sandbox.clone();
+                    let policy_cwd = self.config.cwd.clone();
+                    let command_cwd = policy_cwd.clone();
+                    let env_map: std::collections::HashMap<String, String> =
+                        std::env::vars().collect();
+                    let codex_home = self.config.codex_home.clone();
+                    let tx = self.app_event_tx.clone();
+                    let otel_manager = self.otel_manager.clone();
+
+                    self.chat_widget.show_windows_sandbox_setup_status();
+                    tokio::task::spawn_blocking(move || {
+                        if let Err(err) = codex_core::windows_sandbox::run_legacy_setup_preflight(
+                            &policy,
+                            policy_cwd.as_path(),
+                            command_cwd.as_path(),
+                            &env_map,
+                            codex_home.as_path(),
+                        ) {
+                            otel_manager.counter(
+                                "codex.windows_sandbox.legacy_setup_preflight_failed",
+                                1,
+                                &[],
+                            );
+                            tracing::warn!(
+                                error = %err,
+                                "failed to preflight non-admin Windows sandbox setup"
+                            );
+                        }
+                        tx.send(AppEvent::EnableWindowsSandboxForAgentMode {
+                            preset,
+                            mode: WindowsSandboxEnableMode::Legacy,
+                        });
+                    });
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = preset;
                 }
             }
-            SlashCommand::SandboxReadRoot => {
-                self.widget.ui_mut().add_history_cell(Box::new(
-                    crate::history_cell::new_error_event(
-                        "Usage: /sandbox-add-read-dir <absolute-directory-path>".to_string(),
-                    ),
-                ));
-            }
-            SlashCommand::Quit | SlashCommand::Exit => {
-                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate))
-            }
-            SlashCommand::Logout => {
-                self.state.config.auth_token = None;
-                self.widget
-                    .ui_mut()
-                    .push_line("Logged out from app-server auth token.");
-                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
-            }
-            SlashCommand::Mention => {
-                self.widget.ui_mut().bottom_pane_insert_str("@");
-            }
-            SlashCommand::Diff => {
-                let diff_text = run_diff_now();
-                self.widget.ui_mut().push_line(&diff_text);
-            }
-            SlashCommand::Skills => self.widget.ui_mut().open_skills_menu(),
-            SlashCommand::Apps => match fetch_connectors(&self.state) {
-                Ok(snapshot) if snapshot.connectors.is_empty() => {
-                    self.widget.ui_mut().push_line("No apps available.");
+            AppEvent::BeginWindowsSandboxGrantReadRoot { path } => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.chat_widget
+                        .add_to_history(history_cell::new_info_event(
+                            format!("Granting sandbox read access to {path} ..."),
+                            None,
+                        ));
+
+                    let policy = self.config.permissions.sandbox_policy.get().clone();
+                    let policy_cwd = self.config.cwd.clone();
+                    let command_cwd = self.config.cwd.clone();
+                    let env_map: std::collections::HashMap<String, String> =
+                        std::env::vars().collect();
+                    let codex_home = self.config.codex_home.clone();
+                    let tx = self.app_event_tx.clone();
+
+                    tokio::task::spawn_blocking(move || {
+                        let requested_path = PathBuf::from(path);
+                        let event = match codex_core::windows_sandbox_read_grants::grant_read_root_non_elevated(
+                            &policy,
+                            policy_cwd.as_path(),
+                            command_cwd.as_path(),
+                            &env_map,
+                            codex_home.as_path(),
+                            requested_path.as_path(),
+                        ) {
+                            Ok(canonical_path) => AppEvent::WindowsSandboxGrantReadRootCompleted {
+                                path: canonical_path,
+                                error: None,
+                            },
+                            Err(err) => AppEvent::WindowsSandboxGrantReadRootCompleted {
+                                path: requested_path,
+                                error: Some(err.to_string()),
+                            },
+                        };
+                        tx.send(event);
+                    });
                 }
-                Ok(snapshot) => {
-                    self.widget.ui_mut().push_line("Apps:");
-                    for app in snapshot.connectors {
-                        self.widget.ui_mut().push_line(&format!(
-                            "- {} ({}){}",
-                            app.name,
-                            app.id,
-                            if app.is_enabled { "" } else { " [disabled]" }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = path;
+                }
+            }
+            AppEvent::WindowsSandboxGrantReadRootCompleted { path, error } => match error {
+                Some(err) => {
+                    self.chat_widget
+                        .add_to_history(history_cell::new_error_event(format!("Error: {err}")));
+                }
+                None => {
+                    self.chat_widget
+                        .add_to_history(history_cell::new_info_event(
+                            format!("Sandbox read access granted for {}", path.display()),
+                            None,
+                        ));
+                }
+            },
+            AppEvent::EnableWindowsSandboxForAgentMode { preset, mode } => {
+                #[cfg(target_os = "windows")]
+                {
+                    self.chat_widget.clear_windows_sandbox_setup_status();
+                    if let Some(started_at) = self.windows_sandbox.setup_started_at.take() {
+                        self.otel_manager.record_duration(
+                            "codex.windows_sandbox.elevated_setup_duration_ms",
+                            started_at.elapsed(),
+                            &[("result", "success")],
+                        );
+                    }
+                    let profile = self.active_profile.as_deref();
+                    let elevated_enabled = matches!(mode, WindowsSandboxEnableMode::Elevated);
+                    let builder = ConfigEditsBuilder::new(&self.config.codex_home)
+                        .with_profile(profile)
+                        .set_windows_sandbox_mode(if elevated_enabled {
+                            "elevated"
+                        } else {
+                            "unelevated"
+                        })
+                        .clear_legacy_windows_sandbox_keys();
+                    match builder.apply().await {
+                        Ok(()) => {
+                            if elevated_enabled {
+                                self.config.set_windows_sandbox_enabled(false);
+                                self.config.set_windows_elevated_sandbox_enabled(true);
+                            } else {
+                                self.config.set_windows_sandbox_enabled(true);
+                                self.config.set_windows_elevated_sandbox_enabled(false);
+                            }
+                            self.chat_widget.set_windows_sandbox_mode(
+                                self.config.permissions.windows_sandbox_mode,
+                            );
+                            let windows_sandbox_level =
+                                WindowsSandboxLevel::from_config(&self.config);
+                            if let Some((sample_paths, extra_count, failed_scan)) =
+                                self.chat_widget.world_writable_warning_details()
+                            {
+                                self.app_event_tx.send(AppEvent::CodexOp(
+                                    Op::OverrideTurnContext {
+                                        cwd: None,
+                                        approval_policy: None,
+                                        sandbox_policy: None,
+                                        windows_sandbox_level: Some(windows_sandbox_level),
+                                        model: None,
+                                        effort: None,
+                                        summary: None,
+                                        collaboration_mode: None,
+                                        personality: None,
+                                    },
+                                ));
+                                self.app_event_tx.send(
+                                    AppEvent::OpenWorldWritableWarningConfirmation {
+                                        preset: Some(preset.clone()),
+                                        sample_paths,
+                                        extra_count,
+                                        failed_scan,
+                                    },
+                                );
+                            } else {
+                                self.app_event_tx.send(AppEvent::CodexOp(
+                                    Op::OverrideTurnContext {
+                                        cwd: None,
+                                        approval_policy: Some(preset.approval),
+                                        sandbox_policy: Some(preset.sandbox.clone()),
+                                        windows_sandbox_level: Some(windows_sandbox_level),
+                                        model: None,
+                                        effort: None,
+                                        summary: None,
+                                        collaboration_mode: None,
+                                        personality: None,
+                                    },
+                                ));
+                                self.app_event_tx
+                                    .send(AppEvent::UpdateAskForApprovalPolicy(preset.approval));
+                                self.app_event_tx
+                                    .send(AppEvent::UpdateSandboxPolicy(preset.sandbox.clone()));
+                                let _ = mode;
+                                self.chat_widget.add_plain_history_lines(vec![
+                                    Line::from(vec!["• ".dim(), "Sandbox ready".into()]),
+                                    Line::from(vec![
+                                        "  ".into(),
+                                        "Codex can now safely edit files and execute commands in your computer"
+                                            .dark_gray(),
+                                    ]),
+                                ]);
+                            }
+                        }
+                        Err(err) => {
+                            tracing::error!(
+                                error = %err,
+                                "failed to enable Windows sandbox feature"
+                            );
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to enable the Windows sandbox feature: {err}"
+                            ));
+                        }
+                    }
+                }
+                #[cfg(not(target_os = "windows"))]
+                {
+                    let _ = (preset, mode);
+                }
+            }
+            AppEvent::PersistModelSelection { model, effort } => {
+                let profile = self.active_profile.as_deref();
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_model(Some(model.as_str()), effort)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let mut message = format!("Model changed to {model}");
+                        if let Some(label) = Self::reasoning_label_for(&model, effort) {
+                            message.push(' ');
+                            message.push_str(label);
+                        }
+                        if let Some(profile) = profile {
+                            message.push_str(" for ");
+                            message.push_str(profile);
+                            message.push_str(" profile");
+                        }
+                        self.chat_widget.add_info_message(message, None);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "failed to persist model selection"
+                        );
+                        if let Some(profile) = profile {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save model for profile `{profile}`: {err}"
+                            ));
+                        } else {
+                            self.chat_widget
+                                .add_error_message(format!("Failed to save default model: {err}"));
+                        }
+                    }
+                }
+            }
+            AppEvent::PersistPersonalitySelection { personality } => {
+                let profile = self.active_profile.as_deref();
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(profile)
+                    .set_personality(Some(personality))
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        let label = Self::personality_label(personality);
+                        let mut message = format!("Personality set to {label}");
+                        if let Some(profile) = profile {
+                            message.push_str(" for ");
+                            message.push_str(profile);
+                            message.push_str(" profile");
+                        }
+                        self.chat_widget.add_info_message(message, None);
+                    }
+                    Err(err) => {
+                        tracing::error!(
+                            error = %err,
+                            "failed to persist personality selection"
+                        );
+                        if let Some(profile) = profile {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save personality for profile `{profile}`: {err}"
+                            ));
+                        } else {
+                            self.chat_widget.add_error_message(format!(
+                                "Failed to save default personality: {err}"
+                            ));
+                        }
+                    }
+                }
+            }
+            AppEvent::UpdateAskForApprovalPolicy(policy) => {
+                self.runtime_approval_policy_override = Some(policy);
+                if let Err(err) = self.config.permissions.approval_policy.set(policy) {
+                    tracing::warn!(%err, "failed to set approval policy on app config");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to set approval policy: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+                self.chat_widget.set_approval_policy(policy);
+            }
+            AppEvent::UpdateSandboxPolicy(policy) => {
+                #[cfg(target_os = "windows")]
+                let policy_is_workspace_write_or_ro = matches!(
+                    &policy,
+                    codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. }
+                        | codex_core::protocol::SandboxPolicy::ReadOnly { .. }
+                );
+                let policy_for_chat = policy.clone();
+
+                if let Err(err) = self.config.permissions.sandbox_policy.set(policy) {
+                    tracing::warn!(%err, "failed to set sandbox policy on app config");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to set sandbox policy: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+                if let Err(err) = self.chat_widget.set_sandbox_policy(policy_for_chat) {
+                    tracing::warn!(%err, "failed to set sandbox policy on chat config");
+                    self.chat_widget
+                        .add_error_message(format!("Failed to set sandbox policy: {err}"));
+                    return Ok(AppRunControl::Continue);
+                }
+                self.runtime_sandbox_policy_override =
+                    Some(self.config.permissions.sandbox_policy.get().clone());
+
+                // If sandbox policy becomes workspace-write or read-only, run the Windows world-writable scan.
+                #[cfg(target_os = "windows")]
+                {
+                    // One-shot suppression if the user just confirmed continue.
+                    if self.windows_sandbox.skip_world_writable_scan_once {
+                        self.windows_sandbox.skip_world_writable_scan_once = false;
+                        return Ok(AppRunControl::Continue);
+                    }
+
+                    let should_check = WindowsSandboxLevel::from_config(&self.config)
+                        != WindowsSandboxLevel::Disabled
+                        && policy_is_workspace_write_or_ro
+                        && !self.chat_widget.world_writable_warning_hidden();
+                    if should_check {
+                        let cwd = self.config.cwd.clone();
+                        let env_map: std::collections::HashMap<String, String> =
+                            std::env::vars().collect();
+                        let tx = self.app_event_tx.clone();
+                        let logs_base_dir = self.config.codex_home.clone();
+                        let sandbox_policy = self.config.permissions.sandbox_policy.get().clone();
+                        Self::spawn_world_writable_scan(
+                            cwd,
+                            env_map,
+                            logs_base_dir,
+                            sandbox_policy,
+                            tx,
+                        );
+                    }
+                }
+            }
+            AppEvent::UpdateFeatureFlags { updates } => {
+                if updates.is_empty() {
+                    return Ok(AppRunControl::Continue);
+                }
+                let windows_sandbox_changed = updates.iter().any(|(feature, _)| {
+                    matches!(
+                        feature,
+                        Feature::WindowsSandbox | Feature::WindowsSandboxElevated
+                    )
+                });
+                let mut builder = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_profile(self.active_profile.as_deref());
+                for (feature, enabled) in &updates {
+                    let feature_key = feature.key();
+                    if *enabled {
+                        // Update the in-memory configs.
+                        self.config.features.enable(*feature);
+                        self.chat_widget.set_feature_enabled(*feature, true);
+                        builder = builder.set_feature_enabled(feature_key, true);
+                    } else {
+                        // Update the in-memory configs.
+                        self.config.features.disable(*feature);
+                        self.chat_widget.set_feature_enabled(*feature, false);
+                        if feature.default_enabled() {
+                            builder = builder.set_feature_enabled(feature_key, false);
+                        } else {
+                            // If the feature already default to `false`, we drop the key
+                            // in the config file so that the user does not miss the feature
+                            // once it gets globally released.
+                            builder = builder.with_edits(vec![ConfigEdit::ClearPath {
+                                segments: vec!["features".to_string(), feature_key.to_string()],
+                            }]);
+                        }
+                    }
+                }
+                if windows_sandbox_changed {
+                    #[cfg(target_os = "windows")]
+                    {
+                        let windows_sandbox_level = WindowsSandboxLevel::from_config(&self.config);
+                        self.app_event_tx
+                            .send(AppEvent::CodexOp(Op::OverrideTurnContext {
+                                cwd: None,
+                                approval_policy: None,
+                                sandbox_policy: None,
+                                windows_sandbox_level: Some(windows_sandbox_level),
+                                model: None,
+                                effort: None,
+                                summary: None,
+                                collaboration_mode: None,
+                                personality: None,
+                            }));
+                    }
+                }
+                if let Err(err) = builder.apply().await {
+                    tracing::error!(error = %err, "failed to persist feature flags");
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to update experimental features: {err}"
+                    ));
+                }
+            }
+            AppEvent::SkipNextWorldWritableScan => {
+                self.windows_sandbox.skip_world_writable_scan_once = true;
+            }
+            AppEvent::UpdateFullAccessWarningAcknowledged(ack) => {
+                self.chat_widget.set_full_access_warning_acknowledged(ack);
+            }
+            AppEvent::UpdateWorldWritableWarningAcknowledged(ack) => {
+                self.chat_widget
+                    .set_world_writable_warning_acknowledged(ack);
+            }
+            AppEvent::UpdateRateLimitSwitchPromptHidden(hidden) => {
+                self.chat_widget.set_rate_limit_switch_prompt_hidden(hidden);
+            }
+            AppEvent::PersistFullAccessWarningAcknowledged => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_full_access_warning(true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist full access warning acknowledgement"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save full access confirmation preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistWorldWritableWarningAcknowledged => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_world_writable_warning(true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist world-writable warning acknowledgement"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save Agent mode warning preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistRateLimitSwitchPromptHidden => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .set_hide_rate_limit_model_nudge(true)
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist rate limit switch prompt preference"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save rate limit reminder preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::PersistModelMigrationPromptAcknowledged {
+                from_model,
+                to_model,
+            } => {
+                if let Err(err) = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .record_model_migration_seen(from_model.as_str(), to_model.as_str())
+                    .apply()
+                    .await
+                {
+                    tracing::error!(
+                        error = %err,
+                        "failed to persist model migration prompt acknowledgement"
+                    );
+                    self.chat_widget.add_error_message(format!(
+                        "Failed to save model migration prompt preference: {err}"
+                    ));
+                }
+            }
+            AppEvent::OpenApprovalsPopup => {
+                self.chat_widget.open_approvals_popup();
+            }
+            AppEvent::OpenAgentPicker => {
+                self.open_agent_picker().await;
+            }
+            AppEvent::SelectAgentThread(thread_id) => {
+                self.select_agent_thread(tui, thread_id).await?;
+            }
+            AppEvent::OpenSkillsList => {
+                self.chat_widget.open_skills_list();
+            }
+            AppEvent::OpenManageSkillsPopup => {
+                self.chat_widget.open_manage_skills_popup();
+            }
+            AppEvent::SetSkillEnabled { path, enabled } => {
+                let edits = [ConfigEdit::SetSkillConfig {
+                    path: path.clone(),
+                    enabled,
+                }];
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits(edits)
+                    .apply()
+                    .await
+                {
+                    Ok(()) => {
+                        self.chat_widget.update_skill_enabled(path.clone(), enabled);
+                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                            tracing::warn!(
+                                error = %err,
+                                "failed to refresh config after skill toggle"
+                            );
+                        }
+                    }
+                    Err(err) => {
+                        let path_display = path.display();
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to update skill config for {path_display}: {err}"
                         ));
                     }
                 }
-                Err(err) => self
-                    .widget
-                    .ui_mut()
-                    .push_line(&format!("Failed to load apps: {err}")),
-            },
-            SlashCommand::Ps => {
-                self.widget.ui_mut().add_history_cell(Box::new(
-                    crate::history_cell::new_unified_exec_processes_output(Vec::new()),
-                ));
             }
-            SlashCommand::Clean => {
-                let thread_id = self.widget.ui_mut().session_id.clone();
-                self.widget
-                    .ui_mut()
-                    .push_line("Stopping all background terminals.");
-                match clean_background_terminals(&self.state, &thread_id) {
-                    Ok(()) => self
-                        .widget
-                        .ui_mut()
-                        .push_line("Stopped all background terminals."),
-                    Err(err) => self
-                        .widget
-                        .ui_mut()
-                        .push_line(&format!("Failed to stop background terminals: {err}")),
-                }
-            }
-            SlashCommand::Mcp => match fetch_mcp_tools_output(&self.state) {
-                Ok(cell) => self.widget.ui_mut().add_history_cell(Box::new(cell)),
-                Err(err) => self
-                    .widget
-                    .ui_mut()
-                    .push_line(&format!("Failed to load MCP tools: {err}")),
-            },
-            SlashCommand::Rollout => {
-                if let Some(path) = self.widget.ui_mut().rollout_path() {
-                    self.widget
-                        .ui_mut()
-                        .push_line(&format!("Current rollout path: {}", path.display()));
+            AppEvent::SetAppEnabled { id, enabled } => {
+                let edits = if enabled {
+                    vec![
+                        ConfigEdit::ClearPath {
+                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
+                        },
+                        ConfigEdit::ClearPath {
+                            segments: vec![
+                                "apps".to_string(),
+                                id.clone(),
+                                "disabled_reason".to_string(),
+                            ],
+                        },
+                    ]
                 } else {
-                    self.widget
-                        .ui_mut()
-                        .push_line("Rollout path is not available yet.");
-                }
-            }
-            SlashCommand::Feedback => self.widget.ui_mut().open_feedback_selection(),
-            SlashCommand::Compact => self.start_compaction()?,
-            SlashCommand::Plan => {
-                if !self.widget.ui_mut().collaboration_modes_enabled() {
-                    self.widget
-                        .ui_mut()
-                        .push_line("Collaboration modes are disabled.");
-                    return Ok(());
-                }
-                let modes = fetch_collaboration_modes(&self.state)?;
-                if let Some(plan_mask) = modes
-                    .iter()
-                    .find(|mask| {
-                        matches!(
-                            mask.mode,
-                            Some(codex_protocol::config_types::ModeKind::Plan)
-                        )
-                    })
-                    .cloned()
+                    vec![
+                        ConfigEdit::SetPath {
+                            segments: vec!["apps".to_string(), id.clone(), "enabled".to_string()],
+                            value: false.into(),
+                        },
+                        ConfigEdit::SetPath {
+                            segments: vec![
+                                "apps".to_string(),
+                                id.clone(),
+                                "disabled_reason".to_string(),
+                            ],
+                            value: "user".into(),
+                        },
+                    ]
+                };
+                match ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits(edits)
+                    .apply()
+                    .await
                 {
-                    self.widget.ui_mut().set_collaboration_mask(plan_mask);
-                    if !arg.trim().is_empty() {
-                        self.app_event_tx.send(AppEvent::StartTurn {
-                            text: arg.trim().to_string(),
-                            text_elements: Vec::new(),
-                            mention_bindings: Vec::new(),
-                        });
+                    Ok(()) => {
+                        self.chat_widget.update_connector_enabled(&id, enabled);
+                        if let Err(err) = self.refresh_in_memory_config_from_disk().await {
+                            tracing::warn!(error = %err, "failed to refresh config after app toggle");
+                        }
+                        self.chat_widget.submit_op(Op::ReloadUserConfig);
                     }
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .push_line("Plan mode unavailable right now.");
+                    Err(err) => {
+                        self.chat_widget.add_error_message(format!(
+                            "Failed to update app config for {id}: {err}"
+                        ));
+                    }
                 }
             }
-            SlashCommand::Collab => {
-                if !self.widget.ui_mut().collaboration_modes_enabled() {
-                    self.widget
-                        .ui_mut()
-                        .push_line("Collaboration modes are disabled.");
-                    return Ok(());
-                }
-                let modes = fetch_collaboration_modes(&self.state)?;
-                self.widget.ui_mut().open_collaboration_modes_popup(modes);
+            AppEvent::OpenPermissionsPopup => {
+                self.chat_widget.open_permissions_popup();
             }
-            SlashCommand::Agent => self.open_agent_picker()?,
-            SlashCommand::Experimental => {
-                let features = fetch_experimental_features(&self.state)?;
-                self.widget.ui_mut().open_experimental_popup(features);
+            AppEvent::OpenReviewBranchPicker(cwd) => {
+                self.chat_widget.show_review_branch_picker(&cwd).await;
             }
-            SlashCommand::Personality => self.open_personality_picker(),
-            SlashCommand::TestApproval => self
-                .widget
-                .ui_mut()
-                .push_line("/test-approval is not available in app-server TUI."),
-            SlashCommand::MemoryDrop => {
-                self.handle_widget_op(codex_core::protocol::Op::DropMemories)?
+            AppEvent::OpenReviewCommitPicker(cwd) => {
+                self.chat_widget.show_review_commit_picker(&cwd).await;
             }
-            SlashCommand::MemoryUpdate => {
-                self.handle_widget_op(codex_core::protocol::Op::UpdateMemories)?
+            AppEvent::OpenReviewCustomPrompt => {
+                self.chat_widget.show_review_custom_prompt();
             }
-            SlashCommand::ElevateSandbox => self
-                .widget
-                .ui_mut()
-                .push_line("/setup-default-sandbox is not available on this runtime."),
-        }
-        Ok(())
-    }
-
-    fn handle_widget_op(&mut self, op: codex_core::protocol::Op) -> Result<()> {
-        match op {
-            codex_core::protocol::Op::Interrupt => {
-                self.app_event_tx.send(AppEvent::Interrupt);
-            }
-            codex_core::protocol::Op::Compact => {
-                self.start_compaction()?;
-            }
-            codex_core::protocol::Op::Review { review_request } => {
-                let target = match review_request.target {
-                    codex_core::protocol::ReviewTarget::UncommittedChanges => {
-                        json!({ "type": "uncommittedChanges" })
-                    }
-                    codex_core::protocol::ReviewTarget::BaseBranch { branch } => {
-                        json!({ "type": "baseBranch", "branch": branch })
-                    }
-                    codex_core::protocol::ReviewTarget::Commit { sha, title } => {
-                        json!({ "type": "commit", "sha": sha, "title": title })
-                    }
-                    codex_core::protocol::ReviewTarget::Custom { instructions } => {
-                        json!({ "type": "custom", "instructions": instructions })
-                    }
-                };
-                self.start_review_with_target(target)?;
-            }
-            codex_core::protocol::Op::ExecApproval { id, decision, .. } => {
-                let Some(request) = self.widget.ui_mut().take_pending_approval_for_operation(
-                    &id,
-                    &[
-                        "item/commandExecution/requestApproval",
-                        "execCommandApproval",
-                    ],
-                ) else {
-                    self.widget
-                        .ui_mut()
-                        .push_line(&format!("No pending exec approval found for {id}."));
-                    return Ok(());
-                };
-                let approve = matches!(
-                    decision,
-                    codex_core::protocol::ReviewDecision::Approved
-                        | codex_core::protocol::ReviewDecision::ApprovedForSession
-                        | codex_core::protocol::ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                );
-                respond_to_approval(&self.state, request.request_id, &request.method, approve)?;
-            }
-            codex_core::protocol::Op::PatchApproval { id, decision } => {
-                let Some(request) = self.widget.ui_mut().take_pending_approval_for_operation(
-                    &id,
-                    &["item/fileChange/requestApproval", "applyPatchApproval"],
-                ) else {
-                    self.widget
-                        .ui_mut()
-                        .push_line(&format!("No pending patch approval found for {id}."));
-                    return Ok(());
-                };
-                let approve = matches!(
-                    decision,
-                    codex_core::protocol::ReviewDecision::Approved
-                        | codex_core::protocol::ReviewDecision::ApprovedForSession
-                        | codex_core::protocol::ReviewDecision::ApprovedExecpolicyAmendment { .. }
-                );
-                respond_to_approval(&self.state, request.request_id, &request.method, approve)?;
-            }
-            codex_core::protocol::Op::ResolveElicitation {
-                server_name: _,
-                request_id: _,
-                decision,
+            AppEvent::SubmitUserMessageWithMode {
+                text,
+                collaboration_mode,
             } => {
-                let Some((key, request)) = self
-                    .widget
-                    .ui_mut()
-                    .pending_approvals
-                    .iter()
-                    .find(|(_, request)| {
-                        request.method == "item/tool/elicit"
-                            || request.method == "item/mcpToolCall/requestApproval"
-                    })
-                    .map(|(key, request)| (key.clone(), request.clone()))
-                else {
-                    self.widget
-                        .ui_mut()
-                        .push_line("No pending MCP elicitation request found.");
-                    return Ok(());
-                };
-                self.widget.ui_mut().pending_approvals.remove(&key);
-                let decision_text = match decision {
-                    codex_core::protocol::ElicitationAction::Accept => "accept",
-                    codex_core::protocol::ElicitationAction::Decline => "decline",
-                    codex_core::protocol::ElicitationAction::Cancel => "cancel",
-                };
-                respond_to_request_json(
-                    &self.state,
-                    request.request_id,
-                    json!({ "decision": decision_text }),
-                )?;
+                self.chat_widget
+                    .submit_user_message_with_mode(text, collaboration_mode);
             }
-            codex_core::protocol::Op::UserInputAnswer { id, response } => {
-                let Some(request) = self
-                    .widget
-                    .ui_mut()
-                    .take_pending_request_user_input_for_turn(&id)
-                else {
-                    self.widget
-                        .ui_mut()
-                        .push_line("No pending request_user_input request found.");
-                    return Ok(());
-                };
-                respond_to_request_json(
-                    &self.state,
-                    request.request_id,
-                    serde_json::to_value(response)?,
-                )?;
+            AppEvent::ManageSkillsClosed => {
+                self.chat_widget.handle_manage_skills_closed();
             }
-            codex_core::protocol::Op::DropMemories | codex_core::protocol::Op::UpdateMemories => {
-                self.widget
-                    .ui_mut()
-                    .push_line("Memory debug commands are not available in app-server TUI.");
-            }
-            _ => {
-                self.widget
-                    .ui_mut()
-                    .push_line("This operation is not available in app-server TUI.");
-            }
-        }
-        Ok(())
-    }
-
-    fn open_personality_picker(&mut self) {
-        use codex_protocol::config_types::Personality;
-
-        let items = [Personality::Friendly, Personality::Pragmatic]
-            .into_iter()
-            .map(|personality| {
-                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::UpdatePersonality(personality));
-                });
-                crate::bottom_pane::SelectionItem {
-                    name: personality_label(personality).to_string(),
-                    description: Some(personality_description(personality).to_string()),
-                    actions: vec![action],
-                    dismiss_on_select: true,
-                    ..Default::default()
+            AppEvent::FullScreenApprovalRequest(request) => match request {
+                ApprovalRequest::ApplyPatch { cwd, changes, .. } => {
+                    let _ = tui.enter_alt_screen();
+                    let diff_summary = DiffSummary::new(changes, cwd);
+                    self.overlay = Some(Overlay::new_static_with_renderables(
+                        vec![diff_summary.into()],
+                        "P A T C H".to_string(),
+                    ));
                 }
-            })
-            .collect::<Vec<_>>();
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                title: Some("Select Personality".to_string()),
-                subtitle: Some("Choose a communication style for Codex.".to_string()),
-                items,
-                ..Default::default()
-            });
+                ApprovalRequest::Exec { command, .. } => {
+                    let _ = tui.enter_alt_screen();
+                    let full_cmd = strip_bash_lc_and_escape(&command);
+                    let full_cmd_lines = highlight_bash_to_lines(&full_cmd);
+                    self.overlay = Some(Overlay::new_static_with_lines(
+                        full_cmd_lines,
+                        "E X E C".to_string(),
+                    ));
+                }
+                ApprovalRequest::McpElicitation {
+                    server_name,
+                    message,
+                    ..
+                } => {
+                    let _ = tui.enter_alt_screen();
+                    let paragraph = Paragraph::new(vec![
+                        Line::from(vec!["Server: ".into(), server_name.bold()]),
+                        Line::from(""),
+                        Line::from(message),
+                    ])
+                    .wrap(Wrap { trim: false });
+                    self.overlay = Some(Overlay::new_static_with_renderables(
+                        vec![Box::new(paragraph)],
+                        "E L I C I T A T I O N".to_string(),
+                    ));
+                }
+            },
+            AppEvent::StatusLineSetup { items } => {
+                let ids = items.iter().map(ToString::to_string).collect::<Vec<_>>();
+                let edit = codex_core::config::edit::status_line_items_edit(&ids);
+                let apply_result = ConfigEditsBuilder::new(&self.config.codex_home)
+                    .with_edits([edit])
+                    .apply()
+                    .await;
+                match apply_result {
+                    Ok(()) => {
+                        self.config.tui_status_line = Some(ids.clone());
+                        self.chat_widget.setup_status_line(items);
+                    }
+                    Err(err) => {
+                        tracing::error!(error = %err, "failed to persist status line items; keeping previous selection");
+                        self.chat_widget
+                            .add_error_message(format!("Failed to save status line items: {err}"));
+                    }
+                }
+            }
+            AppEvent::StatusLineBranchUpdated { cwd, branch } => {
+                self.chat_widget.set_status_line_branch(cwd, branch);
+                self.refresh_status_line();
+            }
+            AppEvent::StatusLineSetupCancelled => {
+                self.chat_widget.cancel_status_line_setup();
+            }
+        }
+        Ok(AppRunControl::Continue)
     }
 
-    /// Handle submitted user input (from Enter key or programmatic submit).
-    async fn handle_submit(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        input: &str,
-        text_elements: Vec<codex_protocol::user_input::TextElement>,
-        mention_bindings: Vec<crate::bottom_pane::MentionBinding>,
-    ) -> Result<LiveTuiAction> {
-        let trimmed = input.trim();
-        if trimmed.is_empty() {
-            return Ok(LiveTuiAction::Continue);
-        }
-        if let Some(command) = input.strip_prefix('!') {
-            self.run_user_shell_command(command.trim());
-            return Ok(LiveTuiAction::Continue);
-        }
-        let ui = self.widget.ui_mut();
-        ui.hide_shortcuts_overlay();
-        ui.remember_history_entry(trimmed);
-
-        match trimmed {
-            "/exit" | "/quit" => {
-                self.app_event_tx.send(AppEvent::Exit(ExitMode::Immediate));
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/status" => {
-                self.emit_status_summary();
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/refresh" => {
-                self.app_event_tx.send(AppEvent::RefreshStream);
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/new" => {
-                self.app_event_tx.send(AppEvent::NewSession);
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/interrupt" => {
-                self.app_event_tx.send(AppEvent::Interrupt);
-                return Ok(LiveTuiAction::Continue);
-            }
-            "/resume" => {
-                self.open_resume_picker(tui).await?;
-                return Ok(LiveTuiAction::Continue);
-            }
-            _ => {}
-        }
-
-        if let Some(rest) = trimmed.strip_prefix("/approve") {
-            self.app_event_tx.send(AppEvent::ApprovalDecision {
-                arg: rest.trim().to_string(),
-                approve: true,
-            });
-            return Ok(LiveTuiAction::Continue);
-        }
-        if let Some(rest) = trimmed.strip_prefix("/deny") {
-            self.app_event_tx.send(AppEvent::ApprovalDecision {
-                arg: rest.trim().to_string(),
-                approve: false,
-            });
-            return Ok(LiveTuiAction::Continue);
-        }
-
-        if let Some(stripped) = trimmed.strip_prefix('/') {
-            let mut parts = stripped.splitn(2, char::is_whitespace);
-            let command = parts.next().unwrap_or_default();
-            let args = parts.next().unwrap_or_default().trim().to_string();
-            if let Some(cmd) = find_builtin_command(command, true, true, true, true) {
-                let args = if args.is_empty() { None } else { Some(args) };
-                self.dispatch_slash_command(tui, cmd, args, text_elements)
-                    .await?;
-                return Ok(LiveTuiAction::Continue);
-            }
-        }
-
-        self.app_event_tx.send(AppEvent::StartTurn {
-            text: input.to_string(),
-            text_elements,
-            mention_bindings,
-        });
-        Ok(LiveTuiAction::Continue)
-    }
-
-    fn run_user_shell_command(&mut self, command: &str) {
-        if command.is_empty() {
-            self.widget.ui_mut().set_status_message(Some(
-                "prefix with ! to run a local shell command".to_string(),
-            ));
+    fn handle_codex_event_now(&mut self, event: Event) {
+        let needs_refresh = matches!(
+            event.msg,
+            EventMsg::SessionConfigured(_) | EventMsg::TokenCount(_)
+        );
+        // This guard is only for intentional thread-switch shutdowns.
+        // App-exit shutdowns are tracked by `pending_shutdown_exit_thread_id`
+        // and resolved in `handle_active_thread_event`.
+        if self.suppress_shutdown_complete && matches!(event.msg, EventMsg::ShutdownComplete) {
+            self.suppress_shutdown_complete = false;
             return;
         }
-        let started = Instant::now();
-        let call_id = format!("user-shell-{}", started.elapsed().as_nanos());
-        let mut cell = new_active_exec_command(
-            call_id.clone(),
-            vec!["bash".to_string(), "-lc".to_string(), command.to_string()],
-            Vec::new(),
-            ExecCommandSource::UserShell,
-            None,
-            true,
-        );
-        let output = std::process::Command::new("bash")
-            .arg("-lc")
-            .arg(command)
-            .current_dir(std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()))
-            .output();
-        match output {
-            Ok(output) => {
-                let exit_code = output.status.code().unwrap_or(1);
-                let aggregated_output = format!(
-                    "{}{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
+        if let EventMsg::ListSkillsResponse(response) = &event.msg {
+            let cwd = self.chat_widget.config_ref().cwd.clone();
+            let errors = errors_for_cwd(&cwd, response);
+            emit_skill_load_warnings(&self.app_event_tx, &errors);
+        }
+        self.handle_backtrack_event(&event.msg);
+        self.chat_widget.handle_codex_event(event);
+
+        if needs_refresh {
+            self.refresh_status_line();
+        }
+    }
+
+    fn handle_codex_event_replay(&mut self, event: Event) {
+        self.chat_widget.handle_codex_event_replay(event);
+    }
+
+    /// Handles an event emitted by the currently active thread.
+    ///
+    /// This function enforces shutdown intent routing: unexpected non-primary
+    /// thread shutdowns fail over to the primary thread, while user-requested
+    /// app exits consume only the tracked shutdown completion and then proceed.
+    async fn handle_active_thread_event(&mut self, tui: &mut tui::Tui, event: Event) -> Result<()> {
+        // Capture this before any potential thread switch: we only want to clear
+        // the exit marker when the currently active thread acknowledges shutdown.
+        let pending_shutdown_exit_completed = matches!(&event.msg, EventMsg::ShutdownComplete)
+            && self.pending_shutdown_exit_thread_id == self.active_thread_id;
+
+        // Processing order matters:
+        //
+        // 1. handle unexpected non-primary shutdown failover first;
+        // 2. clear pending exit marker for matching shutdown;
+        // 3. forward the event through normal handling.
+        //
+        // This preserves the mental model that user-requested exits do not trigger
+        // failover, while true sub-agent deaths still do.
+        if let Some((closed_thread_id, primary_thread_id)) =
+            self.active_non_primary_shutdown_target(&event.msg)
+        {
+            self.thread_event_channels.remove(&closed_thread_id);
+            self.select_agent_thread(tui, primary_thread_id).await?;
+            if self.active_thread_id == Some(primary_thread_id) {
+                self.chat_widget.add_info_message(
+                    format!(
+                        "Agent thread {closed_thread_id} closed. Switched back to main thread."
+                    ),
+                    None,
                 );
-                cell.complete_call(
-                    &call_id,
-                    ExecCommandOutput {
-                        exit_code,
-                        aggregated_output: aggregated_output.clone(),
-                        formatted_output: aggregated_output,
-                    },
-                    started.elapsed(),
-                );
-                self.widget.ui_mut().add_history_cell(Box::new(cell));
+            } else {
+                self.clear_active_thread().await;
+                self.chat_widget.add_error_message(format!(
+                    "Agent thread {closed_thread_id} closed. Failed to switch back to main thread {primary_thread_id}.",
+                ));
             }
+            return Ok(());
+        }
+
+        if pending_shutdown_exit_completed {
+            // Clear only after seeing the shutdown completion for the tracked
+            // thread, so unrelated shutdowns cannot consume this marker.
+            self.pending_shutdown_exit_thread_id = None;
+        }
+        self.handle_codex_event_now(event);
+        if self.backtrack_render_pending {
+            tui.frame_requester().schedule_frame();
+        }
+        Ok(())
+    }
+
+    async fn handle_thread_created(&mut self, thread_id: ThreadId) -> Result<()> {
+        if self.thread_event_channels.contains_key(&thread_id) {
+            return Ok(());
+        }
+        let thread = match self.server.get_thread(thread_id).await {
+            Ok(thread) => thread,
             Err(err) => {
-                cell.complete_call(
-                    &call_id,
-                    ExecCommandOutput {
-                        exit_code: 1,
-                        aggregated_output: format!("shell command failed: {err}"),
-                        formatted_output: String::new(),
-                    },
-                    started.elapsed(),
-                );
-                self.widget.ui_mut().add_history_cell(Box::new(cell));
+                tracing::warn!("failed to attach listener for thread {thread_id}: {err}");
+                return Ok(());
             }
-        }
-    }
-
-    fn emit_status_summary(&mut self) {
-        let mut config = crate::config::Config::default();
-        config.cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-        self.status_runtime
-            .refresh_from_server(&self.state, &mut config);
-        let (auth_manager, plan_type) = self.status_runtime.read_account(&self.state);
-        let token_info = self.status_runtime.token_info.as_ref();
-        let token_usage = &self.status_runtime.total_token_usage;
-        let rate_limits: Vec<crate::status::RateLimitSnapshotDisplay> = self
-            .status_runtime
-            .rate_limit_snapshots_by_limit_id
-            .values()
-            .cloned()
-            .collect();
-        let thread_id =
-            codex_protocol::ThreadId::from_string(self.widget.ui_mut().session_id.clone())
-                .ok()
-                .map(Some)
-                .unwrap_or(None);
-        let model_name = config
-            .model
-            .clone()
-            .or_else(|| self.status_runtime.session_model.clone())
-            .unwrap_or_else(|| "gpt-5.3-codex".to_string());
-        let reasoning_effort_override = Some(self.status_runtime.session_reasoning_effort);
-
-        let cell = crate::status::new_status_output_with_rate_limits(
-            &config,
-            &auth_manager,
-            token_info,
-            token_usage,
-            &thread_id,
-            self.status_runtime.thread_name.clone(),
-            None,
-            rate_limits.as_slice(),
-            plan_type,
-            chrono::Local::now(),
-            &model_name,
-            Some("Default"),
-            reasoning_effort_override,
-        );
-        self.widget.ui_mut().add_history_cell(Box::new(cell));
-    }
-
-    async fn open_resume_picker(&mut self, tui: &mut crate::tui::Tui) -> Result<()> {
-        self.open_thread_picker(tui, false, true).await
-    }
-
-    async fn open_thread_picker(
-        &mut self,
-        tui: &mut crate::tui::Tui,
-        fork: bool,
-        show_all: bool,
-    ) -> Result<()> {
-        let selection = if fork {
-            crate::resume_picker::run_fork_picker(tui, &self.state, show_all).await
-        } else {
-            crate::resume_picker::run_resume_picker(tui, &self.state, show_all).await
-        }
-        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
-        match selection {
-            SessionSelection::Resume(thread_id) => {
-                let resumed = resume_thread_detailed(&self.state, &thread_id)?;
-                if let Some(resumed_thread_id) = resumed.thread_id {
-                    self.switch_to_thread(
-                        resumed_thread_id,
-                        "thread resumed",
-                        false,
-                        resumed.replay_events,
-                    );
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("resume returned no thread id".to_string()));
+        };
+        let config_snapshot = thread.config_snapshot().await;
+        let event = Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: thread_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: config_snapshot.model,
+                model_provider_id: config_snapshot.model_provider_id,
+                approval_policy: config_snapshot.approval_policy,
+                sandbox_policy: config_snapshot.sandbox_policy,
+                cwd: config_snapshot.cwd,
+                reasoning_effort: config_snapshot.reasoning_effort,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: thread.rollout_path(),
+            }),
+        };
+        let channel =
+            ThreadEventChannel::new_with_session_configured(THREAD_EVENT_CHANNEL_CAPACITY, event);
+        let sender = channel.sender.clone();
+        let store = Arc::clone(&channel.store);
+        self.thread_event_channels.insert(thread_id, channel);
+        tokio::spawn(async move {
+            loop {
+                let event = match thread.next_event().await {
+                    Ok(event) => event,
+                    Err(err) => {
+                        tracing::debug!("external thread {thread_id} listener stopped: {err}");
+                        break;
+                    }
+                };
+                let should_send = {
+                    let mut guard = store.lock().await;
+                    guard.push_event(event.clone());
+                    guard.active
+                };
+                if should_send && let Err(err) = sender.send(event).await {
+                    tracing::debug!("external thread {thread_id} channel closed: {err}");
+                    break;
                 }
             }
-            SessionSelection::Fork(thread_id) => {
-                if let Some(forked_thread_id) = fork_thread(&self.state, &thread_id)? {
-                    self.switch_to_thread(forked_thread_id, "thread forked", true, Vec::new());
-                } else {
-                    self.widget
-                        .ui_mut()
-                        .set_status_message(Some("fork returned no thread id".to_string()));
-                }
-            }
-            SessionSelection::StartFresh | SessionSelection::Exit => {}
+        });
+        Ok(())
+    }
+
+    fn reasoning_label(reasoning_effort: Option<ReasoningEffortConfig>) -> &'static str {
+        match reasoning_effort {
+            Some(ReasoningEffortConfig::Minimal) => "minimal",
+            Some(ReasoningEffortConfig::Low) => "low",
+            Some(ReasoningEffortConfig::Medium) => "medium",
+            Some(ReasoningEffortConfig::High) => "high",
+            Some(ReasoningEffortConfig::XHigh) => "xhigh",
+            None | Some(ReasoningEffortConfig::None) => "default",
         }
-        Ok(())
     }
 
-    fn open_agent_picker(&mut self) -> Result<()> {
-        let threads = fetch_resume_threads(&self.state, true)?;
-        if threads.is_empty() {
-            self.widget
-                .ui_mut()
-                .add_history_cell(Box::new(crate::history_cell::new_info_event(
-                    "No agents available yet.".to_string(),
-                    None,
-                )));
-            return Ok(());
+    fn reasoning_label_for(
+        model: &str,
+        reasoning_effort: Option<ReasoningEffortConfig>,
+    ) -> Option<&'static str> {
+        (!model.starts_with("codex-auto-")).then(|| Self::reasoning_label(reasoning_effort))
+    }
+
+    pub(crate) fn token_usage(&self) -> codex_core::protocol::TokenUsage {
+        self.chat_widget.token_usage()
+    }
+
+    fn on_update_reasoning_effort(&mut self, effort: Option<ReasoningEffortConfig>) {
+        // TODO(aibrahim): Remove this and don't use config as a state object.
+        // Instead, explicitly pass the stored collaboration mode's effort into new sessions.
+        self.config.model_reasoning_effort = effort;
+        self.chat_widget.set_reasoning_effort(effort);
+    }
+
+    fn on_update_personality(&mut self, personality: Personality) {
+        self.config.personality = Some(personality);
+        self.chat_widget.set_personality(personality);
+    }
+
+    fn personality_label(personality: Personality) -> &'static str {
+        match personality {
+            Personality::None => "None",
+            Personality::Friendly => "Friendly",
+            Personality::Pragmatic => "Pragmatic",
         }
-
-        let current_session_id = self.widget.ui_mut().session_id.clone();
-        let mut initial_selected_idx: Option<usize> = None;
-        let items = threads
-            .into_iter()
-            .enumerate()
-            .filter_map(|(idx, thread)| {
-                let thread_id_text = thread.thread_id.clone();
-                let thread_id =
-                    codex_protocol::ThreadId::from_string(thread_id_text.clone()).ok()?;
-                if current_session_id == thread_id_text {
-                    initial_selected_idx = Some(idx);
-                }
-                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::SelectAgentThread(thread_id.clone()));
-                });
-                Some(crate::bottom_pane::SelectionItem {
-                    name: thread_id_text.clone(),
-                    is_current: current_session_id == thread_id_text,
-                    actions: vec![action],
-                    dismiss_on_select: true,
-                    search_value: Some(thread_id_text),
-                    ..Default::default()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if items.is_empty() {
-            self.widget
-                .ui_mut()
-                .add_history_cell(Box::new(crate::history_cell::new_info_event(
-                    "No agents available yet.".to_string(),
-                    None,
-                )));
-            return Ok(());
-        }
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                title: Some("Agents".to_string()),
-                subtitle: Some("Select a thread to focus".to_string()),
-                items,
-                initial_selected_idx,
-                is_searchable: true,
-                ..Default::default()
-            });
-        Ok(())
     }
 
-    fn open_model_picker(&mut self) -> Result<()> {
-        let models = fetch_model_picker_entries(&self.state)?;
-        if models.is_empty() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("no models available".to_string()));
-            return Ok(());
-        }
-
-        let current_model = fetch_current_model_from_config(&self.state)
-            .or_else(|| self.status_runtime.session_model.clone());
-
-        let items = models
-            .into_iter()
-            .map(|entry| {
-                let slug = entry.slug.clone();
-                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::UpdateModel(slug.clone()));
-                });
-                crate::bottom_pane::SelectionItem {
-                    name: entry.display_name,
-                    description: Some(entry.description),
-                    is_current: current_model.as_deref() == Some(entry.slug.as_str()),
-                    actions: vec![action],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                }
-            })
-            .collect::<Vec<_>>();
-
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                view_id: Some("model-picker"),
-                title: Some("Select Model".to_string()),
-                subtitle: Some("Choose the model Codex should use.".to_string()),
-                items,
-                ..Default::default()
-            });
-        Ok(())
-    }
-
-    fn open_manage_skills_popup(&mut self) -> Result<()> {
-        let entries = fetch_skills_toggle_entries(&self.state)?;
-        let mapped = entries
-            .into_iter()
-            .map(|entry| crate::chatwidget::SkillsToggleEntry {
-                path: entry.path,
-                name: entry.name,
-                description: entry.description,
-                enabled: entry.enabled,
-            })
-            .collect::<Vec<_>>();
-        self.widget.ui_mut().open_manage_skills_popup(mapped);
-        Ok(())
-    }
-
-    fn apply_model_selection(&mut self, model: String) -> Result<()> {
-        write_config_value(&self.state, "model", Value::String(model.clone()))?;
-        self.status_runtime.session_model = Some(model.clone());
-        self.widget
-            .ui_mut()
-            .set_status_message(Some(format!("model updated to {model}")));
-        Ok(())
-    }
-
-    fn apply_reasoning_effort_selection(
-        &mut self,
-        effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-    ) -> Result<()> {
-        let effort_value = effort
-            .map(|v| v.to_string())
-            .map(Value::String)
-            .unwrap_or(Value::Null);
-        write_config_value(&self.state, "modelReasoningEffort", effort_value)?;
-        self.status_runtime.session_reasoning_effort = effort;
-        self.widget.ui_mut().set_status_message(Some(match effort {
-            Some(level) => format!("reasoning effort updated to {level}"),
-            None => "reasoning effort reset to default".to_string(),
-        }));
-        Ok(())
-    }
-
-    fn launch_external_editor(&mut self) -> Result<()> {
-        if !self.widget.ui_mut().bottom_pane_no_modal_or_popup_active() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("close active popup before editing".to_string()));
-            return Ok(());
-        }
-        let seed = self
-            .widget
-            .ui_mut()
-            .bottom_pane_composer_text_with_pending();
-        let editor_cmd = match crate::external_editor::resolve_editor_command() {
+    async fn launch_external_editor(&mut self, tui: &mut tui::Tui) {
+        let editor_cmd = match external_editor::resolve_editor_command() {
             Ok(cmd) => cmd,
-            Err(crate::external_editor::EditorError::MissingEditor) => {
-                self.widget
-                    .ui_mut()
-                    .add_history_cell(Box::new(crate::history_cell::new_error_event(
+            Err(external_editor::EditorError::MissingEditor) => {
+                self.chat_widget
+                    .add_to_history(history_cell::new_error_event(
                     "Cannot open external editor: set $VISUAL or $EDITOR before starting Codex."
                         .to_string(),
-                )));
-                return Ok(());
+                ));
+                self.reset_external_editor_state(tui);
+                return;
             }
             Err(err) => {
-                self.widget.ui_mut().add_history_cell(Box::new(
-                    crate::history_cell::new_error_event(format!("Failed to open editor: {err}",)),
-                ));
-                return Ok(());
+                self.chat_widget
+                    .add_to_history(history_cell::new_error_event(format!(
+                        "Failed to open editor: {err}",
+                    )));
+                self.reset_external_editor_state(tui);
+                return;
             }
         };
 
-        let edit_result = thread::spawn(move || -> Result<String> {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()?;
-            runtime
-                .block_on(crate::external_editor::run_editor(&seed, &editor_cmd))
-                .map_err(|err| anyhow::anyhow!("{err}"))
-        })
-        .join();
-
-        match edit_result {
-            Ok(Ok(edited)) => {
-                let cleaned = edited.trim_end().to_string();
-                self.widget.ui_mut().apply_external_edit(cleaned);
-            }
-            Ok(Err(err)) => {
-                self.widget.ui_mut().add_history_cell(Box::new(
-                    crate::history_cell::new_error_event(format!("Failed to open editor: {err}")),
-                ));
-            }
-            Err(_) => {
-                self.widget.ui_mut().add_history_cell(Box::new(
-                    crate::history_cell::new_error_event(
-                        "Failed to open editor: editor panicked".to_string(),
-                    ),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    fn apply_personality_selection(
-        &mut self,
-        personality: codex_protocol::config_types::Personality,
-    ) -> Result<()> {
-        write_config_value(
-            &self.state,
-            "personality",
-            Value::String(personality_config_value(personality).to_string()),
-        )?;
-        self.widget.ui_mut().set_status_message(Some(format!(
-            "personality set to {}",
-            personality_label(personality)
-        )));
-        Ok(())
-    }
-
-    fn apply_feature_flags(
-        &mut self,
-        updates: Vec<(codex_core::features::Feature, bool)>,
-    ) -> Result<()> {
-        if updates.is_empty() {
-            return Ok(());
-        }
-
-        for (feature, enabled) in updates {
-            write_config_value(
-                &self.state,
-                &format!("features.{}", feature.key()),
-                Value::Bool(enabled),
-            )?;
-        }
-
-        self.widget
-            .ui_mut()
-            .set_status_message(Some("experimental features updated".to_string()));
-        Ok(())
-    }
-
-    fn apply_skill_enabled(&mut self, path: std::path::PathBuf, enabled: bool) -> Result<()> {
-        write_skill_enabled(&self.state, path, enabled)?;
-        self.refresh_skills_snapshot()?;
-        Ok(())
-    }
-
-    fn apply_app_enabled(&mut self, id: String, enabled: bool) -> Result<()> {
-        write_config_value(
-            &self.state,
-            &format!("apps.{id}.enabled"),
-            Value::Bool(enabled),
-        )?;
-        write_config_value(
-            &self.state,
-            &format!("apps.{id}.disabled_reason"),
-            if enabled {
-                Value::Null
-            } else {
-                Value::String("user".to_string())
-            },
-        )?;
-        if let Ok(snapshot) = fetch_connectors(&self.state) {
-            self.widget.ui_mut().set_connectors_snapshot(Some(snapshot));
-        }
-        self.widget.ui_mut().set_status_message(Some(format!(
-            "app {} {}",
-            id,
-            if enabled { "enabled" } else { "disabled" }
-        )));
-        Ok(())
-    }
-
-    fn refresh_skills_snapshot(&mut self) -> Result<()> {
-        let skills = fetch_skills_for_cwd(&self.state)?;
-        self.widget.ui_mut().set_skills(Some(skills));
-        Ok(())
-    }
-
-    fn open_permissions_picker(&mut self) -> Result<()> {
-        let current = fetch_current_permissions_from_config(&self.state);
-        let current_approval = current
-            .as_ref()
-            .map(|(approval, _)| *approval)
-            .unwrap_or(codex_core::protocol::AskForApproval::OnRequest);
-        let current_sandbox = current
-            .as_ref()
-            .map(|(_, sandbox)| sandbox.clone())
-            .unwrap_or_else(codex_core::protocol::SandboxPolicy::new_workspace_write_policy);
-
-        let presets = permissions_presets();
-        let items = presets
-            .into_iter()
-            .map(|preset| {
-                let approval = preset.approval;
-                let sandbox = preset.sandbox.clone();
-                let sandbox_for_action = sandbox.clone();
-                let action: crate::bottom_pane::SelectionAction = Box::new(move |sender| {
-                    sender.send(WidgetAppEvent::UpdateAskForApprovalPolicy(approval));
-                    sender.send(WidgetAppEvent::UpdateSandboxPolicy(
-                        sandbox_for_action.clone(),
-                    ));
-                });
-                crate::bottom_pane::SelectionItem {
-                    name: preset.label.to_string(),
-                    description: Some(preset.description.to_string()),
-                    is_current: approval == current_approval && sandbox == current_sandbox,
-                    actions: vec![action],
-                    dismiss_on_select: true,
-                    ..Default::default()
-                }
+        let seed = self.chat_widget.composer_text_with_pending();
+        let editor_result = tui
+            .with_restored(tui::RestoreMode::KeepRaw, || async {
+                external_editor::run_editor(&seed, &editor_cmd).await
             })
-            .collect::<Vec<_>>();
+            .await;
+        self.reset_external_editor_state(tui);
 
-        self.widget
-            .ui_mut()
-            .show_selection_view(crate::bottom_pane::SelectionViewParams {
-                view_id: Some("permissions-picker"),
-                title: Some("Select Approval Mode".to_string()),
-                subtitle: Some("Switch between Codex approval presets".to_string()),
-                items,
-                ..Default::default()
-            });
-        Ok(())
-    }
-
-    fn open_review_branch_picker(&mut self, cwd: &std::path::Path) {
-        let current_branch =
-            git_current_branch_name(cwd).unwrap_or_else(|| "(detached HEAD)".into());
-        let branches = git_local_branches(cwd);
-        if branches.is_empty() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("No local branches found for review.".to_string()));
-            return;
+        match editor_result {
+            Ok(new_text) => {
+                // Trim trailing whitespace
+                let cleaned = new_text.trim_end().to_string();
+                self.chat_widget.apply_external_edit(cleaned);
+            }
+            Err(err) => {
+                self.chat_widget
+                    .add_to_history(history_cell::new_error_event(format!(
+                        "Failed to open editor: {err}",
+                    )));
+            }
         }
-
-        self.widget
-            .ui_mut()
-            .show_review_branch_picker(current_branch, branches);
+        tui.frame_requester().schedule_frame();
     }
 
-    fn open_review_commit_picker(&mut self, cwd: &std::path::Path) {
-        let commits = git_recent_commits(cwd, 100);
-        if commits.is_empty() {
-            self.widget
-                .ui_mut()
-                .set_status_message(Some("No commits found for review.".to_string()));
-            return;
-        }
-
-        self.widget.ui_mut().show_review_commit_picker(
-            commits
-                .into_iter()
-                .map(|entry| crate::chatwidget::ReviewCommitPickerEntry {
-                    sha: entry.sha,
-                    subject: entry.subject,
-                })
-                .collect(),
-        );
+    fn request_external_editor_launch(&mut self, tui: &mut tui::Tui) {
+        self.chat_widget
+            .set_external_editor_state(ExternalEditorState::Requested);
+        self.chat_widget.set_footer_hint_override(Some(vec![(
+            EXTERNAL_EDITOR_HINT.to_string(),
+            String::new(),
+        )]));
+        tui.frame_requester().schedule_frame();
     }
 
-    fn start_review_uncommitted(&mut self) -> Result<()> {
-        self.start_review_with_target(json!({ "type": "uncommittedChanges" }))
+    fn reset_external_editor_state(&mut self, tui: &mut tui::Tui) {
+        self.chat_widget
+            .set_external_editor_state(ExternalEditorState::Closed);
+        self.chat_widget.set_footer_hint_override(None);
+        tui.frame_requester().schedule_frame();
     }
 
-    fn start_compaction(&mut self) -> Result<()> {
-        let thread_id = self.widget.ui_mut().session_id.clone();
-        start_compaction(&self.state, &thread_id)?;
-        self.widget
-            .ui_mut()
-            .set_status_message(Some("compacting context...".to_string()));
-        Ok(())
-    }
-
-    fn start_review_base_branch(&mut self, branch: &str) -> Result<()> {
-        self.start_review_with_target(json!({
-            "type": "baseBranch",
-            "branch": branch,
-        }))
-    }
-
-    fn start_review_commit(&mut self, sha: &str, title: Option<&str>) -> Result<()> {
-        self.start_review_with_target(json!({
-            "type": "commit",
-            "sha": sha,
-            "title": title,
-        }))
-    }
-
-    fn start_review_custom(&mut self, instructions: &str) -> Result<()> {
-        self.start_review_with_target(json!({
-            "type": "custom",
-            "instructions": instructions,
-        }))
-    }
-
-    fn start_review_with_target(&mut self, target: Value) -> Result<()> {
-        let thread_id = self.widget.ui_mut().session_id.clone();
-        if let Some(turn_id) = start_review(&self.state, &thread_id, target)? {
-            self.widget.ui_mut().active_turn_id = Some(turn_id);
-        }
-        self.widget
-            .ui_mut()
-            .set_status_message(Some("running review...".to_string()));
-        Ok(())
-    }
-
-    fn apply_approval_policy_selection(
-        &mut self,
-        approval_policy: codex_core::protocol::AskForApproval,
-    ) -> Result<()> {
-        write_config_value(
-            &self.state,
-            "approval_policy",
-            Value::String(approval_policy.to_string()),
-        )?;
-        self.widget.ui_mut().set_status_message(Some(format!(
-            "approval policy updated to {}",
-            approval_policy
-        )));
-        Ok(())
-    }
-
-    fn apply_sandbox_policy_selection(
-        &mut self,
-        sandbox_policy: codex_core::protocol::SandboxPolicy,
-    ) -> Result<()> {
-        let sandbox_mode = match sandbox_policy {
-            codex_core::protocol::SandboxPolicy::DangerFullAccess => "danger-full-access",
-            codex_core::protocol::SandboxPolicy::ReadOnly { .. } => "read-only",
-            codex_core::protocol::SandboxPolicy::WorkspaceWrite { .. } => "workspace-write",
-            codex_core::protocol::SandboxPolicy::ExternalSandbox { .. } => "workspace-write",
+    async fn handle_key_event(&mut self, tui: &mut tui::Tui, key_event: KeyEvent) {
+        match key_event {
+            KeyEvent {
+                code: KeyCode::Char('t'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                // Enter alternate screen and set viewport to full size.
+                let _ = tui.enter_alt_screen();
+                self.overlay = Some(Overlay::new_transcript(self.transcript_cells.clone()));
+                tui.frame_requester().schedule_frame();
+            }
+            KeyEvent {
+                code: KeyCode::Char('g'),
+                modifiers: crossterm::event::KeyModifiers::CONTROL,
+                kind: KeyEventKind::Press,
+                ..
+            } => {
+                // Only launch the external editor if there is no overlay and the bottom pane is not in use.
+                // Note that it can be launched while a task is running to enable editing while the previous turn is ongoing.
+                if self.overlay.is_none()
+                    && self.chat_widget.can_launch_external_editor()
+                    && self.chat_widget.external_editor_state() == ExternalEditorState::Closed
+                {
+                    self.request_external_editor_launch(tui);
+                }
+            }
+            // Esc primes/advances backtracking only in normal (not working) mode
+            // with the composer focused and empty. In any other state, forward
+            // Esc so the active UI (e.g. status indicator, modals, popups)
+            // handles it.
+            KeyEvent {
+                code: KeyCode::Esc,
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                if self.chat_widget.is_normal_backtrack_mode()
+                    && self.chat_widget.composer_is_empty()
+                {
+                    self.handle_backtrack_esc_key(tui);
+                } else {
+                    self.chat_widget.handle_key_event(key_event);
+                }
+            }
+            // Enter confirms backtrack when primed + count > 0. Otherwise pass to widget.
+            KeyEvent {
+                code: KeyCode::Enter,
+                kind: KeyEventKind::Press,
+                ..
+            } if self.backtrack.primed
+                && self.backtrack.nth_user_message != usize::MAX
+                && self.chat_widget.composer_is_empty() =>
+            {
+                if let Some(selection) = self.confirm_backtrack_from_main() {
+                    self.apply_backtrack_selection(tui, selection);
+                }
+            }
+            KeyEvent {
+                kind: KeyEventKind::Press | KeyEventKind::Repeat,
+                ..
+            } => {
+                // Any non-Esc key press should cancel a primed backtrack.
+                // This avoids stale "Esc-primed" state after the user starts typing
+                // (even if they later backspace to empty).
+                if key_event.code != KeyCode::Esc && self.backtrack.primed {
+                    self.reset_backtrack_state();
+                }
+                self.chat_widget.handle_key_event(key_event);
+            }
+            _ => {
+                // Ignore Release key events.
+            }
         };
+    }
 
-        write_config_value(
-            &self.state,
-            "sandbox_mode",
-            Value::String(sandbox_mode.to_string()),
-        )?;
-        self.widget
-            .ui_mut()
-            .set_status_message(Some(format!("sandbox mode updated to {sandbox_mode}")));
-        Ok(())
+    fn refresh_status_line(&mut self) {
+        self.chat_widget.refresh_status_line();
+    }
+
+    #[cfg(target_os = "windows")]
+    fn spawn_world_writable_scan(
+        cwd: PathBuf,
+        env_map: std::collections::HashMap<String, String>,
+        logs_base_dir: PathBuf,
+        sandbox_policy: codex_core::protocol::SandboxPolicy,
+        tx: AppEventSender,
+    ) {
+        tokio::task::spawn_blocking(move || {
+            let result = codex_windows_sandbox::apply_world_writable_scan_and_denies(
+                &logs_base_dir,
+                &cwd,
+                &env_map,
+                &sandbox_policy,
+                Some(logs_base_dir.as_path()),
+            );
+            if result.is_err() {
+                // Scan failed: warn without examples.
+                tx.send(AppEvent::OpenWorldWritableWarningConfirmation {
+                    preset: None,
+                    sample_paths: Vec::new(),
+                    extra_count: 0usize,
+                    failed_scan: true,
+                });
+            }
+        });
     }
 }
 
-impl StatusRuntime {
-    fn apply_stream_events(&mut self, stream_events: &[DaemonRpcStreamEnvelope]) {
-        for envelope in stream_events {
-            let DaemonRpcStreamEvent::Notification(notification) = &envelope.event else {
-                continue;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app_backtrack::BacktrackSelection;
+    use crate::app_backtrack::BacktrackState;
+    use crate::app_backtrack::user_count;
+    use crate::chatwidget::tests::make_chatwidget_manual_with_sender;
+    use crate::file_search::FileSearchManager;
+    use crate::history_cell::AgentMessageCell;
+    use crate::history_cell::HistoryCell;
+    use crate::history_cell::UserHistoryCell;
+    use crate::history_cell::new_session_info;
+    use codex_core::CodexAuth;
+    use codex_core::config::ConfigBuilder;
+    use codex_core::config::ConfigOverrides;
+    use codex_core::protocol::AskForApproval;
+    use codex_core::protocol::Event;
+    use codex_core::protocol::EventMsg;
+    use codex_core::protocol::SandboxPolicy;
+    use codex_core::protocol::SessionConfiguredEvent;
+    use codex_core::protocol::SessionSource;
+    use codex_core::protocol::ThreadRolledBackEvent;
+    use codex_core::protocol::UserMessageEvent;
+    use codex_otel::OtelManager;
+    use codex_protocol::ThreadId;
+    use codex_protocol::user_input::TextElement;
+    use codex_protocol::user_input::UserInput;
+    use crossterm::event::KeyModifiers;
+    use insta::assert_snapshot;
+    use pretty_assertions::assert_eq;
+    use ratatui::prelude::Line;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use tempfile::tempdir;
+    use tokio::time;
+
+    #[test]
+    fn normalize_harness_overrides_resolves_relative_add_dirs() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let base_cwd = temp_dir.path().join("base");
+        std::fs::create_dir_all(&base_cwd)?;
+
+        let overrides = ConfigOverrides {
+            additional_writable_roots: vec![PathBuf::from("rel")],
+            ..Default::default()
+        };
+        let normalized = normalize_harness_overrides_for_cwd(overrides, &base_cwd)?;
+
+        assert_eq!(
+            normalized.additional_writable_roots,
+            vec![base_cwd.join("rel")]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn startup_waiting_gate_is_only_for_fresh_or_exit_session_selection() {
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh),
+            true
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Exit),
+            true
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Resume(PathBuf::from(
+                "/tmp/restore"
+            ))),
+            false
+        );
+        assert_eq!(
+            App::should_wait_for_initial_session(&SessionSelection::Fork(PathBuf::from(
+                "/tmp/fork"
+            ))),
+            false
+        );
+    }
+
+    #[test]
+    fn startup_waiting_gate_holds_active_thread_events_until_primary_thread_configured() {
+        let mut wait_for_initial_session =
+            App::should_wait_for_initial_session(&SessionSelection::StartFresh);
+        assert_eq!(wait_for_initial_session, true);
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_initial_session, true),
+            false
+        );
+
+        assert_eq!(
+            App::should_stop_waiting_for_initial_session(wait_for_initial_session, None),
+            false
+        );
+        if App::should_stop_waiting_for_initial_session(
+            wait_for_initial_session,
+            Some(ThreadId::new()),
+        ) {
+            wait_for_initial_session = false;
+        }
+        assert_eq!(wait_for_initial_session, false);
+
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_initial_session, true),
+            true
+        );
+    }
+
+    #[test]
+    fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
+        let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
+            PathBuf::from("/tmp/restore"),
+        ));
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_resume, true),
+            true
+        );
+        let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
+            PathBuf::from("/tmp/fork"),
+        ));
+        assert_eq!(
+            App::should_handle_active_thread_events(wait_for_fork, true),
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_does_not_block_when_channel_full() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(1));
+        app.set_thread_active(thread_id, true).await;
+
+        let event = Event {
+            id: String::new(),
+            msg: EventMsg::ShutdownComplete,
+        };
+
+        app.enqueue_thread_event(thread_id, event.clone()).await?;
+        time::timeout(
+            Duration::from_millis(50),
+            app.enqueue_thread_event(thread_id, event),
+        )
+        .await
+        .expect("enqueue_thread_event blocked on a full channel")?;
+
+        let mut rx = app
+            .thread_event_channels
+            .get_mut(&thread_id)
+            .expect("missing thread channel")
+            .receiver
+            .take()
+            .expect("missing receiver");
+
+        time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("timed out waiting for first event")
+            .expect("channel closed unexpectedly");
+        time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("timed out waiting for second event")
+            .expect("channel closed unexpectedly");
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn open_agent_picker_prunes_missing_threads() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(1));
+
+        app.open_agent_picker().await;
+
+        assert_eq!(app.thread_event_channels.contains_key(&thread_id), false);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_for_non_shutdown_event() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        app.active_thread_id = Some(ThreadId::new());
+        app.primary_thread_id = Some(ThreadId::new());
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&EventMsg::SkillsUpdateAvailable),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_for_primary_thread_shutdown()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.active_thread_id = Some(thread_id);
+        app.primary_thread_id = Some(thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&EventMsg::ShutdownComplete),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_ids_for_non_primary_shutdown() -> Result<()>
+    {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&EventMsg::ShutdownComplete),
+            Some((active_thread_id, primary_thread_id))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_returns_none_when_shutdown_exit_is_pending()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.pending_shutdown_exit_thread_id = Some(active_thread_id);
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&EventMsg::ShutdownComplete),
+            None
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_non_primary_shutdown_target_still_switches_for_other_pending_exit_thread()
+    -> Result<()> {
+        let mut app = make_test_app().await;
+        let active_thread_id = ThreadId::new();
+        let primary_thread_id = ThreadId::new();
+        app.active_thread_id = Some(active_thread_id);
+        app.primary_thread_id = Some(primary_thread_id);
+        app.pending_shutdown_exit_thread_id = Some(ThreadId::new());
+
+        assert_eq!(
+            app.active_non_primary_shutdown_target(&EventMsg::ShutdownComplete),
+            Some((active_thread_id, primary_thread_id))
+        );
+        Ok(())
+    }
+
+    async fn make_test_app() -> App {
+        let (chat_widget, app_event_tx, _rx, _op_rx) = make_chatwidget_manual_with_sender().await;
+        let config = chat_widget.config_ref().clone();
+        let server = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider(
+                CodexAuth::from_api_key("Test API Key"),
+                config.model_provider.clone(),
+            ),
+        );
+        let auth_manager = codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::from_api_key("Test API Key"),
+        );
+        let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+        let otel_manager = test_otel_manager(&config, model.as_str());
+
+        App {
+            server,
+            otel_manager,
+            app_event_tx,
+            chat_widget,
+            auth_manager,
+            config,
+            active_profile: None,
+            cli_kv_overrides: Vec::new(),
+            harness_overrides: ConfigOverrides::default(),
+            runtime_approval_policy_override: None,
+            runtime_sandbox_policy_override: None,
+            file_search,
+            transcript_cells: Vec::new(),
+            overlay: None,
+            deferred_history_lines: Vec::new(),
+            has_emitted_history_lines: false,
+            enhanced_keys_supported: false,
+            commit_anim_running: Arc::new(AtomicBool::new(false)),
+            status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+            backtrack: BacktrackState::default(),
+            backtrack_render_pending: false,
+            feedback: codex_feedback::CodexFeedback::new(),
+            feedback_audience: FeedbackAudience::External,
+            pending_update_action: None,
+            suppress_shutdown_complete: false,
+            pending_shutdown_exit_thread_id: None,
+            windows_sandbox: WindowsSandboxState::default(),
+            thread_event_channels: HashMap::new(),
+            active_thread_id: None,
+            active_thread_rx: None,
+            primary_thread_id: None,
+            primary_session_configured: None,
+            pending_primary_events: VecDeque::new(),
+        }
+    }
+
+    async fn make_test_app_with_channels() -> (
+        App,
+        tokio::sync::mpsc::UnboundedReceiver<AppEvent>,
+        tokio::sync::mpsc::UnboundedReceiver<Op>,
+    ) {
+        let (chat_widget, app_event_tx, rx, op_rx) = make_chatwidget_manual_with_sender().await;
+        let config = chat_widget.config_ref().clone();
+        let server = Arc::new(
+            codex_core::test_support::thread_manager_with_models_provider(
+                CodexAuth::from_api_key("Test API Key"),
+                config.model_provider.clone(),
+            ),
+        );
+        let auth_manager = codex_core::test_support::auth_manager_from_auth(
+            CodexAuth::from_api_key("Test API Key"),
+        );
+        let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
+        let model = codex_core::test_support::get_model_offline(config.model.as_deref());
+        let otel_manager = test_otel_manager(&config, model.as_str());
+
+        (
+            App {
+                server,
+                otel_manager,
+                app_event_tx,
+                chat_widget,
+                auth_manager,
+                config,
+                active_profile: None,
+                cli_kv_overrides: Vec::new(),
+                harness_overrides: ConfigOverrides::default(),
+                runtime_approval_policy_override: None,
+                runtime_sandbox_policy_override: None,
+                file_search,
+                transcript_cells: Vec::new(),
+                overlay: None,
+                deferred_history_lines: Vec::new(),
+                has_emitted_history_lines: false,
+                enhanced_keys_supported: false,
+                commit_anim_running: Arc::new(AtomicBool::new(false)),
+                status_line_invalid_items_warned: Arc::new(AtomicBool::new(false)),
+                backtrack: BacktrackState::default(),
+                backtrack_render_pending: false,
+                feedback: codex_feedback::CodexFeedback::new(),
+                feedback_audience: FeedbackAudience::External,
+                pending_update_action: None,
+                suppress_shutdown_complete: false,
+                pending_shutdown_exit_thread_id: None,
+                windows_sandbox: WindowsSandboxState::default(),
+                thread_event_channels: HashMap::new(),
+                active_thread_id: None,
+                active_thread_rx: None,
+                primary_thread_id: None,
+                primary_session_configured: None,
+                pending_primary_events: VecDeque::new(),
+            },
+            rx,
+            op_rx,
+        )
+    }
+
+    fn test_otel_manager(config: &Config, model: &str) -> OtelManager {
+        let model_info = codex_core::test_support::construct_model_info_offline(model, config);
+        OtelManager::new(
+            ThreadId::new(),
+            model,
+            model_info.slug.as_str(),
+            None,
+            None,
+            None,
+            "test_originator".to_string(),
+            false,
+            "test".to_string(),
+            SessionSource::Cli,
+        )
+    }
+
+    fn app_enabled_in_effective_config(config: &Config, app_id: &str) -> Option<bool> {
+        config
+            .config_layer_stack
+            .effective_config()
+            .as_table()
+            .and_then(|table| table.get("apps"))
+            .and_then(TomlValue::as_table)
+            .and_then(|apps| apps.get(app_id))
+            .and_then(TomlValue::as_table)
+            .and_then(|app| app.get("enabled"))
+            .and_then(TomlValue::as_bool)
+    }
+
+    fn all_model_presets() -> Vec<ModelPreset> {
+        codex_core::test_support::all_model_presets().clone()
+    }
+
+    fn model_migration_copy_to_plain_text(
+        copy: &crate::model_migration::ModelMigrationCopy,
+    ) -> String {
+        if let Some(markdown) = copy.markdown.as_ref() {
+            return markdown.clone();
+        }
+        let mut s = String::new();
+        for span in &copy.heading {
+            s.push_str(&span.content);
+        }
+        s.push('\n');
+        s.push('\n');
+        for line in &copy.content {
+            for span in &line.spans {
+                s.push_str(&span.content);
+            }
+            s.push('\n');
+        }
+        s
+    }
+
+    #[tokio::test]
+    async fn model_migration_prompt_only_shows_for_deprecated_models() {
+        let seen = BTreeMap::new();
+        assert!(should_show_model_migration_prompt(
+            "gpt-5",
+            "gpt-5.2-codex",
+            &seen,
+            &all_model_presets()
+        ));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5-codex",
+            "gpt-5.2-codex",
+            &seen,
+            &all_model_presets()
+        ));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5-codex-mini",
+            "gpt-5.2-codex",
+            &seen,
+            &all_model_presets()
+        ));
+        assert!(should_show_model_migration_prompt(
+            "gpt-5.1-codex",
+            "gpt-5.2-codex",
+            &seen,
+            &all_model_presets()
+        ));
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5.1-codex",
+            "gpt-5.1-codex",
+            &seen,
+            &all_model_presets()
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_migration_prompt_respects_hide_flag_and_self_target() {
+        let mut seen = BTreeMap::new();
+        seen.insert("gpt-5".to_string(), "gpt-5.1".to_string());
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5",
+            "gpt-5.1",
+            &seen,
+            &all_model_presets()
+        ));
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5.1",
+            "gpt-5.1",
+            &seen,
+            &all_model_presets()
+        ));
+    }
+
+    #[tokio::test]
+    async fn model_migration_prompt_skips_when_target_missing_or_hidden() {
+        let mut available = all_model_presets();
+        let mut current = available
+            .iter()
+            .find(|preset| preset.model == "gpt-5-codex")
+            .cloned()
+            .expect("preset present");
+        current.upgrade = Some(ModelUpgrade {
+            id: "missing-target".to_string(),
+            reasoning_effort_mapping: None,
+            migration_config_key: HIDE_GPT5_1_MIGRATION_PROMPT_CONFIG.to_string(),
+            model_link: None,
+            upgrade_copy: None,
+            migration_markdown: None,
+        });
+        available.retain(|preset| preset.model != "gpt-5-codex");
+        available.push(current.clone());
+
+        assert!(!should_show_model_migration_prompt(
+            &current.model,
+            "missing-target",
+            &BTreeMap::new(),
+            &available,
+        ));
+
+        assert!(target_preset_for_upgrade(&available, "missing-target").is_none());
+
+        let mut with_hidden_target = all_model_presets();
+        let target = with_hidden_target
+            .iter_mut()
+            .find(|preset| preset.model == "gpt-5.2-codex")
+            .expect("target preset present");
+        target.show_in_picker = false;
+
+        assert!(!should_show_model_migration_prompt(
+            "gpt-5-codex",
+            "gpt-5.2-codex",
+            &BTreeMap::new(),
+            &with_hidden_target,
+        ));
+        assert!(target_preset_for_upgrade(&with_hidden_target, "gpt-5.2-codex").is_none());
+    }
+
+    #[tokio::test]
+    async fn model_migration_prompt_shows_for_hidden_model() {
+        let codex_home = tempdir().expect("temp codex home");
+        let config = ConfigBuilder::default()
+            .codex_home(codex_home.path().to_path_buf())
+            .build()
+            .await
+            .expect("config");
+
+        let available_models = all_model_presets();
+        let current = available_models
+            .iter()
+            .find(|preset| preset.model == "gpt-5.1-codex")
+            .cloned()
+            .expect("gpt-5.1-codex preset present");
+        assert!(
+            !current.show_in_picker,
+            "expected gpt-5.1-codex to be hidden from picker for this test"
+        );
+
+        let upgrade = current.upgrade.as_ref().expect("upgrade configured");
+        assert!(
+            should_show_model_migration_prompt(
+                &current.model,
+                &upgrade.id,
+                &config.notices.model_migrations,
+                &available_models,
+            ),
+            "expected migration prompt to be eligible for hidden model"
+        );
+
+        let target = target_preset_for_upgrade(&available_models, &upgrade.id)
+            .expect("upgrade target present");
+        let target_description =
+            (!target.description.is_empty()).then(|| target.description.clone());
+        let can_opt_out = true;
+        let copy = migration_copy_for_models(
+            &current.model,
+            &upgrade.id,
+            upgrade.model_link.clone(),
+            upgrade.upgrade_copy.clone(),
+            upgrade.migration_markdown.clone(),
+            target.display_name.clone(),
+            target_description,
+            can_opt_out,
+        );
+
+        // Snapshot the copy we would show; rendering is covered by model_migration snapshots.
+        assert_snapshot!(
+            "model_migration_prompt_shows_for_hidden_model",
+            model_migration_copy_to_plain_text(&copy)
+        );
+    }
+
+    #[tokio::test]
+    async fn update_reasoning_effort_updates_collaboration_mode() {
+        let mut app = make_test_app().await;
+        app.chat_widget
+            .set_reasoning_effort(Some(ReasoningEffortConfig::Medium));
+
+        app.on_update_reasoning_effort(Some(ReasoningEffortConfig::High));
+
+        assert_eq!(
+            app.chat_widget.current_reasoning_effort(),
+            Some(ReasoningEffortConfig::High)
+        );
+        assert_eq!(
+            app.config.model_reasoning_effort,
+            Some(ReasoningEffortConfig::High)
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_in_memory_config_from_disk_loads_latest_apps_state() -> Result<()> {
+        let mut app = make_test_app().await;
+        let codex_home = tempdir()?;
+        app.config.codex_home = codex_home.path().to_path_buf();
+        let app_id = "unit_test_refresh_in_memory_config_connector".to_string();
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        ConfigEditsBuilder::new(&app.config.codex_home)
+            .with_edits([
+                ConfigEdit::SetPath {
+                    segments: vec!["apps".to_string(), app_id.clone(), "enabled".to_string()],
+                    value: false.into(),
+                },
+                ConfigEdit::SetPath {
+                    segments: vec![
+                        "apps".to_string(),
+                        app_id.clone(),
+                        "disabled_reason".to_string(),
+                    ],
+                    value: "user".into(),
+                },
+            ])
+            .apply()
+            .await
+            .expect("persist app toggle");
+
+        assert_eq!(app_enabled_in_effective_config(&app.config, &app_id), None);
+
+        app.refresh_in_memory_config_from_disk().await?;
+
+        assert_eq!(
+            app_enabled_in_effective_config(&app.config, &app_id),
+            Some(false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backtrack_selection_with_duplicate_history_targets_unique_turn() {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+
+        let user_cell = |text: &str,
+                         text_elements: Vec<TextElement>,
+                         local_image_paths: Vec<PathBuf>,
+                         remote_image_urls: Vec<String>|
+         -> Arc<dyn HistoryCell> {
+            Arc::new(UserHistoryCell {
+                message: text.to_string(),
+                text_elements,
+                local_image_paths,
+                remote_image_urls,
+            }) as Arc<dyn HistoryCell>
+        };
+        let agent_cell = |text: &str| -> Arc<dyn HistoryCell> {
+            Arc::new(AgentMessageCell::new(
+                vec![Line::from(text.to_string())],
+                true,
+            )) as Arc<dyn HistoryCell>
+        };
+
+        let make_header = |is_first| {
+            let event = SessionConfiguredEvent {
+                session_id: ThreadId::new(),
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: PathBuf::from("/home/user/project"),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
             };
-            match notification.method.as_str() {
-                "thread/name/updated" => {
-                    self.thread_name = notification
-                        .params
-                        .get("thread")
-                        .and_then(|thread| thread.get("name").or_else(|| thread.get("threadName")))
-                        .or_else(|| notification.params.get("threadName"))
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string);
+            Arc::new(new_session_info(
+                app.chat_widget.config_ref(),
+                app.chat_widget.current_model(),
+                event,
+                is_first,
+                None,
+            )) as Arc<dyn HistoryCell>
+        };
+
+        let placeholder = "[Image #1]";
+        let edited_text = format!("follow-up (edited) {placeholder}");
+        let edited_range = edited_text.len().saturating_sub(placeholder.len())..edited_text.len();
+        let edited_text_elements = vec![TextElement::new(edited_range.into(), None)];
+        let edited_local_image_paths = vec![PathBuf::from("/tmp/fake-image.png")];
+
+        // Simulate a transcript with duplicated history (e.g., from prior backtracks)
+        // and an edited turn appended after a session header boundary.
+        app.transcript_cells = vec![
+            make_header(true),
+            user_cell("first question", Vec::new(), Vec::new(), Vec::new()),
+            agent_cell("answer first"),
+            user_cell("follow-up", Vec::new(), Vec::new(), Vec::new()),
+            agent_cell("answer follow-up"),
+            make_header(false),
+            user_cell("first question", Vec::new(), Vec::new(), Vec::new()),
+            agent_cell("answer first"),
+            user_cell(
+                &edited_text,
+                edited_text_elements.clone(),
+                edited_local_image_paths.clone(),
+                vec!["https://example.com/backtrack.png".to_string()],
+            ),
+            agent_cell("answer edited"),
+        ];
+
+        assert_eq!(user_count(&app.transcript_cells), 2);
+
+        let base_id = ThreadId::new();
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: base_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: PathBuf::from("/home/user/project"),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        app.backtrack.base_id = Some(base_id);
+        app.backtrack.primed = true;
+        app.backtrack.nth_user_message = user_count(&app.transcript_cells).saturating_sub(1);
+
+        let selection = app
+            .confirm_backtrack_from_main()
+            .expect("backtrack selection");
+        assert_eq!(selection.nth_user_message, 1);
+        assert_eq!(selection.prefill, edited_text);
+        assert_eq!(selection.text_elements, edited_text_elements);
+        assert_eq!(selection.local_image_paths, edited_local_image_paths);
+        assert_eq!(
+            selection.remote_image_urls,
+            vec!["https://example.com/backtrack.png".to_string()]
+        );
+
+        app.apply_backtrack_rollback(selection);
+        assert_eq!(
+            app.chat_widget.remote_image_urls(),
+            vec!["https://example.com/backtrack.png".to_string()]
+        );
+
+        let mut rollback_turns = None;
+        while let Ok(op) = op_rx.try_recv() {
+            if let Op::ThreadRollback { num_turns } = op {
+                rollback_turns = Some(num_turns);
+            }
+        }
+
+        assert_eq!(rollback_turns, Some(1));
+    }
+
+    #[tokio::test]
+    async fn backtrack_remote_image_only_selection_clears_existing_composer_draft() {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+
+        app.transcript_cells = vec![Arc::new(UserHistoryCell {
+            message: "original".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: Vec::new(),
+        }) as Arc<dyn HistoryCell>];
+        app.chat_widget
+            .set_composer_text("stale draft".to_string(), Vec::new(), Vec::new());
+
+        let remote_image_url = "https://example.com/remote-only.png".to_string();
+        app.apply_backtrack_rollback(BacktrackSelection {
+            nth_user_message: 0,
+            prefill: String::new(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![remote_image_url.clone()],
+        });
+
+        assert_eq!(app.chat_widget.composer_text_with_pending(), "");
+        assert_eq!(app.chat_widget.remote_image_urls(), vec![remote_image_url]);
+
+        let mut rollback_turns = None;
+        while let Ok(op) = op_rx.try_recv() {
+            if let Op::ThreadRollback { num_turns } = op {
+                rollback_turns = Some(num_turns);
+            }
+        }
+        assert_eq!(rollback_turns, Some(1));
+    }
+
+    #[tokio::test]
+    async fn backtrack_resubmit_preserves_data_image_urls_in_user_turn() {
+        let (mut app, _app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+
+        let thread_id = ThreadId::new();
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id: thread_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: PathBuf::from("/home/user/project"),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: None,
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        let data_image_url = "data:image/png;base64,abc123".to_string();
+        app.transcript_cells = vec![Arc::new(UserHistoryCell {
+            message: "please inspect this".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![data_image_url.clone()],
+        }) as Arc<dyn HistoryCell>];
+
+        app.apply_backtrack_rollback(BacktrackSelection {
+            nth_user_message: 0,
+            prefill: "please inspect this".to_string(),
+            text_elements: Vec::new(),
+            local_image_paths: Vec::new(),
+            remote_image_urls: vec![data_image_url.clone()],
+        });
+
+        app.chat_widget
+            .handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        let mut saw_rollback = false;
+        let mut submitted_items: Option<Vec<UserInput>> = None;
+        while let Ok(op) = op_rx.try_recv() {
+            match op {
+                Op::ThreadRollback { .. } => saw_rollback = true,
+                Op::UserTurn { items, .. } => submitted_items = Some(items),
+                _ => {}
+            }
+        }
+
+        assert!(saw_rollback);
+        let items = submitted_items.expect("expected user turn after backtrack resubmit");
+        assert!(items.iter().any(|item| {
+            matches!(
+                item,
+                UserInput::Image { image_url } if image_url == &data_image_url
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn replayed_initial_messages_apply_rollback_in_queue_order() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let session_id = ThreadId::new();
+        app.handle_codex_event_replay(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: PathBuf::from("/home/user/project"),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: Some(vec![
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: "first prompt".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: "second prompt".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                    EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: "third prompt".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                ]),
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        let mut saw_rollback = false;
+        while let Ok(event) = app_event_rx.try_recv() {
+            match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    let cell: Arc<dyn HistoryCell> = cell.into();
+                    app.transcript_cells.push(cell);
                 }
-                "thread/tokenUsage/updated" => {
-                    if let Some((token_info, total_usage)) =
-                        parse_token_usage_updated(&notification.params)
-                    {
-                        self.token_info = Some(token_info);
-                        self.total_token_usage = total_usage;
-                    }
-                }
-                "account/rateLimits/updated" => {
-                    if let Some(snapshot) = notification
-                        .params
-                        .get("rateLimits")
-                        .or_else(|| notification.params.get("rate_limits"))
-                    {
-                        self.apply_rate_limit_snapshot(snapshot);
-                    }
-                }
-                "codex/event/session_configured" | "session/configured" => {
-                    self.session_model = notification
-                        .params
-                        .get("model")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string);
-                    self.session_reasoning_effort = parse_reasoning_effort(
-                        notification
-                            .params
-                            .get("reasoningEffort")
-                            .or_else(|| notification.params.get("reasoning_effort")),
+                AppEvent::ApplyThreadRollback { num_turns } => {
+                    saw_rollback = true;
+                    crate::app_backtrack::trim_transcript_cells_drop_last_n_user_turns(
+                        &mut app.transcript_cells,
+                        num_turns,
                     );
                 }
                 _ => {}
             }
         }
-    }
 
-    fn refresh_from_server(&mut self, state: &CliState, config: &mut crate::config::Config) {
-        if let Ok(Some(cfg)) = read_config_snapshot_for_cwd(state, Some(config.cwd.as_path())) {
-            if let Some(model) = cfg.get("model").and_then(Value::as_str) {
-                config.model = Some(model.to_string());
-            }
-            if let Some(summary) = cfg.get("modelReasoningSummary").and_then(Value::as_str) {
-                config.model_reasoning_summary = match summary.to_ascii_lowercase().as_str() {
-                    "auto" => codex_core::config::ReasoningSummary::Auto,
-                    "concise" => codex_core::config::ReasoningSummary::Concise,
-                    "detailed" => codex_core::config::ReasoningSummary::Detailed,
-                    _ => codex_core::config::ReasoningSummary::None,
-                };
-            }
-            if let Some(approval) = cfg
-                .get("approval_policy")
-                .or_else(|| cfg.get("approvalPolicy"))
-                .and_then(parse_approval_policy_value)
-            {
-                config.permissions.approval_policy.0 = approval;
-            }
-            if let Some(sandbox) = cfg
-                .get("sandbox_mode")
-                .or_else(|| cfg.get("sandboxMode"))
-                .and_then(parse_sandbox_policy_value)
-            {
-                config.permissions.sandbox_policy.0 = sandbox;
-            }
-            if let Some(reasoning_effort) = parse_reasoning_effort(cfg.get("modelReasoningEffort"))
-            {
-                self.session_reasoning_effort = Some(reasoning_effort);
-            }
-        }
-
-        if let Ok(rate_limits) = read_rate_limits(state) {
-            if let Some(by_limit_id) = rate_limits
-                .get("rateLimitsByLimitId")
-                .and_then(Value::as_object)
-            {
-                for snapshot in by_limit_id.values() {
-                    self.apply_rate_limit_snapshot(snapshot);
-                }
-            } else if let Some(snapshot) = rate_limits
-                .get("rateLimits")
-                .or_else(|| rate_limits.get("rate_limits"))
-            {
-                self.apply_rate_limit_snapshot(snapshot);
-            }
-        }
-    }
-
-    fn read_account(
-        &self,
-        state: &CliState,
-    ) -> (
-        crate::AuthManager,
-        Option<codex_protocol::account::PlanType>,
-    ) {
-        let Ok(Some(account)) = read_account_snapshot(state, false) else {
-            return (crate::AuthManager::default(), None);
-        };
-        if !account.is_object() {
-            return (crate::AuthManager::default(), None);
-        }
-
-        let account_type = account
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let email = account
-            .get("email")
-            .or_else(|| account.get("allegedUserEmail"))
-            .or_else(|| account.get("alleged_user_email"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string);
-        let plan_type = parse_plan_type(
-            account
-                .get("planType")
-                .or_else(|| account.get("plan_type"))
-                .or_else(|| account.get("chatgptPlanType"))
-                .or_else(|| account.get("chatgpt_plan_type")),
-        );
-
-        if account_type.eq_ignore_ascii_case("apikey")
-            || account_type.eq_ignore_ascii_case("api_key")
-            || account_type.eq_ignore_ascii_case("apiKey")
-        {
-            (crate::AuthManager::from_api_key(), None)
-        } else if account_type.eq_ignore_ascii_case("chatgpt") || email.is_some() {
-            (crate::AuthManager::from_chatgpt_email(email), plan_type)
-        } else {
-            (crate::AuthManager::default(), None)
-        }
-    }
-
-    fn apply_rate_limit_snapshot(&mut self, snapshot: &Value) {
-        let Some(parsed) = parse_rate_limit_snapshot(snapshot) else {
-            return;
-        };
-        let limit_id = parsed
-            .limit_id
-            .clone()
-            .unwrap_or_else(|| "codex".to_string());
-        let limit_label = parsed
-            .limit_name
-            .clone()
-            .unwrap_or_else(|| limit_id.clone());
-        let display = crate::status::rate_limit_snapshot_display_for_limit(
-            &parsed,
-            limit_label,
-            chrono::Local::now(),
-        );
-        self.rate_limit_snapshots_by_limit_id
-            .insert(limit_id, display);
-    }
-}
-
-fn parse_token_usage_updated(
-    params: &Value,
-) -> Option<(
-    codex_core::protocol::TokenUsageInfo,
-    codex_core::protocol::TokenUsage,
-)> {
-    let token_usage = params
-        .get("tokenUsage")
-        .or_else(|| params.get("token_usage"))?;
-    let total = token_usage.get("total")?;
-    let last = token_usage.get("last")?;
-
-    let total_usage = parse_token_usage_breakdown(total);
-    let last_usage = parse_token_usage_breakdown(last);
-    let model_context_window = token_usage
-        .get("modelContextWindow")
-        .or_else(|| token_usage.get("model_context_window"))
-        .and_then(Value::as_i64);
-
-    Some((
-        codex_core::protocol::TokenUsageInfo {
-            last_token_usage: last_usage,
-            model_context_window,
-        },
-        total_usage,
-    ))
-}
-
-fn parse_token_usage_breakdown(value: &Value) -> codex_core::protocol::TokenUsage {
-    codex_core::protocol::TokenUsage {
-        total_tokens: value
-            .get("totalTokens")
-            .or_else(|| value.get("total_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        input_tokens: value
-            .get("inputTokens")
-            .or_else(|| value.get("input_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        cached_input_tokens: value
-            .get("cachedInputTokens")
-            .or_else(|| value.get("cached_input_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        output_tokens: value
-            .get("outputTokens")
-            .or_else(|| value.get("output_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-        reasoning_output_tokens: value
-            .get("reasoningOutputTokens")
-            .or_else(|| value.get("reasoning_output_tokens"))
-            .and_then(Value::as_i64)
-            .unwrap_or_default(),
-    }
-}
-
-fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::RateLimitSnapshot> {
-    let primary = parse_rate_limit_window(value.get("primary"));
-    let secondary = parse_rate_limit_window(value.get("secondary"));
-    let credits = value.get("credits").and_then(|credits| {
-        Some(codex_core::protocol::CreditsSnapshot {
-            has_credits: credits
-                .get("hasCredits")
-                .or_else(|| credits.get("has_credits"))
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            unlimited: credits
-                .get("unlimited")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            balance: credits
-                .get("balance")
-                .and_then(Value::as_str)
-                .map(ToString::to_string),
-        })
-    });
-
-    Some(codex_core::protocol::RateLimitSnapshot {
-        limit_id: value
-            .get("limitId")
-            .or_else(|| value.get("limit_id"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        limit_name: value
-            .get("limitName")
-            .or_else(|| value.get("limit_name"))
-            .and_then(Value::as_str)
-            .map(ToString::to_string),
-        primary,
-        secondary,
-        credits,
-    })
-}
-
-fn parse_rate_limit_window(value: Option<&Value>) -> Option<codex_core::protocol::RateLimitWindow> {
-    let value = value?;
-    let used_percent = value
-        .get("usedPercent")
-        .or_else(|| value.get("used_percent"))
-        .and_then(Value::as_f64)
-        .or_else(|| {
-            value
-                .get("usedPercent")
-                .or_else(|| value.get("used_percent"))
-                .and_then(Value::as_i64)
-                .map(|v| v as f64)
-        })
-        .unwrap_or_default();
-
-    Some(codex_core::protocol::RateLimitWindow {
-        used_percent,
-        resets_at: value
-            .get("resetsAt")
-            .or_else(|| value.get("resets_at"))
-            .and_then(Value::as_i64),
-        window_minutes: value
-            .get("windowDurationMins")
-            .or_else(|| value.get("windowMinutes"))
-            .or_else(|| value.get("window_minutes"))
-            .and_then(Value::as_i64),
-    })
-}
-
-fn parse_reasoning_effort(
-    value: Option<&Value>,
-) -> Option<codex_protocol::openai_models::ReasoningEffort> {
-    let raw = value.and_then(Value::as_str)?.to_ascii_lowercase();
-    match raw.as_str() {
-        "none" => Some(codex_protocol::openai_models::ReasoningEffort::None),
-        "minimal" => Some(codex_protocol::openai_models::ReasoningEffort::Minimal),
-        "low" => Some(codex_protocol::openai_models::ReasoningEffort::Low),
-        "medium" => Some(codex_protocol::openai_models::ReasoningEffort::Medium),
-        "high" => Some(codex_protocol::openai_models::ReasoningEffort::High),
-        "xhigh" | "x_high" | "x-high" => {
-            Some(codex_protocol::openai_models::ReasoningEffort::XHigh)
-        }
-        _ => None,
-    }
-}
-
-fn personality_label(personality: codex_protocol::config_types::Personality) -> &'static str {
-    match personality {
-        codex_protocol::config_types::Personality::None => "None",
-        codex_protocol::config_types::Personality::Friendly => "Friendly",
-        codex_protocol::config_types::Personality::Pragmatic => "Pragmatic",
-    }
-}
-
-fn personality_description(personality: codex_protocol::config_types::Personality) -> &'static str {
-    match personality {
-        codex_protocol::config_types::Personality::None => "No personality instructions.",
-        codex_protocol::config_types::Personality::Friendly => "Warm, collaborative, and helpful.",
-        codex_protocol::config_types::Personality::Pragmatic => {
-            "Concise, task-focused, and direct."
-        }
-    }
-}
-
-fn personality_config_value(
-    personality: codex_protocol::config_types::Personality,
-) -> &'static str {
-    match personality {
-        codex_protocol::config_types::Personality::None => "none",
-        codex_protocol::config_types::Personality::Friendly => "friendly",
-        codex_protocol::config_types::Personality::Pragmatic => "pragmatic",
-    }
-}
-
-fn collaboration_mode_from_mask(
-    mask: Option<codex_protocol::config_types::CollaborationModeMask>,
-    session_model: Option<String>,
-    session_effort: Option<codex_protocol::openai_models::ReasoningEffort>,
-) -> Option<codex_protocol::config_types::CollaborationMode> {
-    let mask = mask?;
-    let mode = mask.mode?;
-    let model = mask.model.or(session_model)?;
-    let reasoning_effort = mask.reasoning_effort.unwrap_or(session_effort);
-    let developer_instructions = mask.developer_instructions.unwrap_or(None);
-    Some(codex_protocol::config_types::CollaborationMode {
-        mode,
-        settings: codex_protocol::config_types::Settings {
-            model,
-            reasoning_effort,
-            developer_instructions,
-        },
-    })
-}
-
-fn parse_plan_type(value: Option<&Value>) -> Option<codex_protocol::account::PlanType> {
-    let raw = value.and_then(Value::as_str)?.to_ascii_lowercase();
-    match raw.as_str() {
-        "free" => Some(codex_protocol::account::PlanType::Free),
-        "go" => Some(codex_protocol::account::PlanType::Go),
-        "plus" => Some(codex_protocol::account::PlanType::Plus),
-        "pro" => Some(codex_protocol::account::PlanType::Pro),
-        "team" => Some(codex_protocol::account::PlanType::Team),
-        "business" => Some(codex_protocol::account::PlanType::Business),
-        "enterprise" => Some(codex_protocol::account::PlanType::Enterprise),
-        _ => None,
-    }
-}
-
-fn resolve_initial_thread_id(
-    state: &CliState,
-    explicit_thread_id: Option<String>,
-    cached_thread_id: Option<String>,
-) -> Result<(String, String, Vec<codex_core::UiEvent>)> {
-    if let Some(thread_id) = explicit_thread_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        let resumed = resume_thread_detailed(state, &thread_id).with_context(|| {
-            format!("resume explicit thread id before tui startup: {thread_id}")
-        })?;
-        let resolved = resumed.thread_id.unwrap_or(thread_id);
-        return Ok((
-            resolved,
-            "connected to app-server websocket".to_string(),
-            resumed.replay_events,
-        ));
-    }
-
-    if let Some(thread_id) = cached_thread_id
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-    {
-        match resume_thread_detailed(state, &thread_id) {
-            Ok(resumed) => {
-                if let Some(resumed_thread_id) = resumed.thread_id {
-                    return Ok((
-                        resumed_thread_id,
-                        "connected to app-server websocket".to_string(),
-                        resumed.replay_events,
-                    ));
-                }
-            }
-            Err(_) => {}
-        }
-
-        let new_thread_id = start_thread(state)?;
-        return Ok((
-            new_thread_id,
-            "cached thread was unavailable; started a new thread".to_string(),
-            Vec::new(),
-        ));
-    }
-
-    let thread_id = start_thread(state)?;
-    Ok((
-        thread_id,
-        "connected to app-server websocket".to_string(),
-        Vec::new(),
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Public entry points — backward compatible with existing callers
-// ---------------------------------------------------------------------------
-
-pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
-    let mut app = App::new(args, state.clone())?;
-
-    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
-        *state = app.into_state();
-        return Ok(CommandOutput::Json(json!({
-            "ok": true,
-            "action": "tui",
-            "thread_id": state.last_thread_id,
-            "app_server_endpoint": state.config.app_server_endpoint,
-        })));
-    }
-
-    let exit_info = app.run().await?;
-    *state = app.into_state();
-    Ok(CommandOutput::Text(format!(
-        "thread={} detached",
-        exit_info.thread_id.as_deref().unwrap_or("unknown")
-    )))
-}
-
-pub async fn handle_attach_tui_interactive(
-    session_id: String,
-    initial_events: Vec<DaemonStreamEnvelope>,
-    state: &mut CliState,
-) -> Result<CommandOutput> {
-    let mut app = App::attach(session_id, initial_events, state.clone())?;
-    let exit_info = app.run().await?;
-    *state = app.into_state();
-    Ok(CommandOutput::Text(format!(
-        "session={} detached",
-        exit_info.thread_id.as_deref().unwrap_or("unknown")
-    )))
-}
-
-fn handle_app_server_approval_decision(
-    state: &mut CliState,
-    ui: &mut LiveAttachTui,
-    arg: &str,
-    approve: bool,
-) -> Result<()> {
-    let approval_key = if arg.is_empty() {
-        ui.pending_approvals.keys().next_back().cloned()
-    } else {
-        Some(arg.to_string())
-    }
-    .ok_or_else(|| anyhow!("no pending approval request"))?;
-    let Some(request) = ui.pending_approvals.remove(&approval_key) else {
-        bail!("pending approval id not found: {approval_key}");
-    };
-    respond_to_approval(state, request.request_id, &request.method, approve)?;
-    ui.set_status_message(Some(format!(
-        "{} request {}",
-        if approve { "approved" } else { "denied" },
-        approval_key
-    )));
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Utility functions
-// ---------------------------------------------------------------------------
-
-fn fetch_skills_for_cwd(state: &CliState) -> Result<Vec<codex_core::skills::model::SkillMetadata>> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-    Ok(list_skills_for_cwd(state, &cwd, false)?
-        .into_iter()
-        .map(|skill| codex_core::skills::model::SkillMetadata {
-            name: skill.name,
-            description: skill.description,
-            short_description: skill.short_description,
-            interface: None,
-            path: skill.path,
-            scope: codex_core::protocol::SkillScope::User,
-        })
-        .collect())
-}
-
-struct SkillToggleEntry {
-    path: std::path::PathBuf,
-    name: String,
-    description: String,
-    enabled: bool,
-}
-
-fn fetch_skills_toggle_entries(state: &CliState) -> Result<Vec<SkillToggleEntry>> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir());
-    Ok(list_skills_for_cwd(state, &cwd, false)?
-        .into_iter()
-        .map(|skill| SkillToggleEntry {
-            path: skill.path,
-            name: skill.name,
-            description: skill.description,
-            enabled: skill.enabled,
-        })
-        .collect())
-}
-
-fn fetch_connectors(state: &CliState) -> Result<crate::app_event::ConnectorsSnapshot> {
-    let connectors = list_connectors(state)?;
-    Ok(crate::app_event::ConnectorsSnapshot { connectors })
-}
-
-#[derive(Clone)]
-struct CommitPickerEntry {
-    sha: String,
-    subject: String,
-}
-
-fn git_command_output(cwd: &std::path::Path, args: &[&str]) -> Option<String> {
-    let output = std::process::Command::new("git")
-        .args(args)
-        .current_dir(cwd)
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
-}
-
-fn git_current_branch_name(cwd: &std::path::Path) -> Option<String> {
-    git_command_output(cwd, &["branch", "--show-current"])
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
-
-fn git_local_branches(cwd: &std::path::Path) -> Vec<String> {
-    let mut branches = git_command_output(cwd, &["branch", "--format=%(refname:short)"])
-        .map(|out| {
-            out.lines()
-                .map(str::trim)
-                .filter(|line| !line.is_empty())
-                .map(ToString::to_string)
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    branches.sort_unstable();
-    branches
-}
-
-fn git_recent_commits(cwd: &std::path::Path, limit: usize) -> Vec<CommitPickerEntry> {
-    let mut args = vec!["log".to_string()];
-    if limit > 0 {
-        args.push("-n".to_string());
-        args.push(limit.to_string());
-    }
-    args.push("--pretty=format:%H%x1f%ct%x1f%s".to_string());
-    let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let Some(out) = git_command_output(cwd, &arg_refs) else {
-        return Vec::new();
-    };
-    out.lines()
-        .filter_map(|line| {
-            let mut parts = line.split('\u{001f}');
-            let sha = parts.next()?.trim();
-            let _timestamp = parts.next()?.trim();
-            let subject = parts.next().unwrap_or_default().trim();
-            if sha.is_empty() {
-                return None;
-            }
-            Some(CommitPickerEntry {
-                sha: sha.to_string(),
-                subject: subject.to_string(),
-            })
-        })
-        .collect()
-}
-
-fn fetch_mcp_tools_output(state: &CliState) -> Result<crate::history_cell::PlainHistoryCell> {
-    let statuses = list_mcp_server_statuses(state, 200)?;
-    if statuses.is_empty() {
-        return Ok(crate::history_cell::empty_mcp_output());
-    }
-
-    let mut tools: std::collections::HashMap<String, codex_protocol::mcp::Tool> =
-        std::collections::HashMap::new();
-    let mut resources: std::collections::HashMap<String, Vec<codex_protocol::mcp::Resource>> =
-        std::collections::HashMap::new();
-    let mut resource_templates: std::collections::HashMap<
-        String,
-        Vec<codex_protocol::mcp::ResourceTemplate>,
-    > = std::collections::HashMap::new();
-    let mut auth_statuses: std::collections::HashMap<String, codex_core::protocol::McpAuthStatus> =
-        std::collections::HashMap::new();
-    let mut server_configs =
-        std::collections::BTreeMap::<String, codex_core::config::types::McpServerConfig>::new();
-
-    for entry in statuses {
-        let Some(name) = entry.get("name").and_then(Value::as_str) else {
-            continue;
-        };
-        let server_name = name.to_string();
-
-        if let Some(tool_map) = entry.get("tools")
-            && let Ok(map) = serde_json::from_value::<
-                std::collections::HashMap<String, codex_protocol::mcp::Tool>,
-            >(tool_map.clone())
-        {
-            for (tool_name, tool) in map {
-                tools.insert(format!("mcp__{server_name}__{tool_name}"), tool);
-            }
-        }
-
-        if let Some(raw_resources) = entry.get("resources")
-            && let Ok(parsed) =
-                serde_json::from_value::<Vec<codex_protocol::mcp::Resource>>(raw_resources.clone())
-        {
-            resources.insert(server_name.clone(), parsed);
-        }
-
-        if let Some(raw_templates) = entry
-            .get("resourceTemplates")
-            .or_else(|| entry.get("resource_templates"))
-            && let Ok(parsed) = serde_json::from_value::<Vec<codex_protocol::mcp::ResourceTemplate>>(
-                raw_templates.clone(),
-            )
-        {
-            resource_templates.insert(server_name.clone(), parsed);
-        }
-
-        if let Some(raw_auth) = entry.get("authStatus").or_else(|| entry.get("auth_status"))
-            && let Ok(auth) =
-                serde_json::from_value::<codex_core::protocol::McpAuthStatus>(raw_auth.clone())
-        {
-            auth_statuses.insert(server_name.clone(), auth);
-        }
-
-        server_configs.insert(
-            server_name,
-            codex_core::config::types::McpServerConfig {
-                transport: codex_core::config::types::McpServerTransportConfig::default(),
-                enabled: true,
-                disabled_reason: None,
-            },
-        );
-    }
-
-    let mut config = codex_core::config::Config::default();
-    config.mcp_servers = codex_core::config::McpServers(server_configs);
-    Ok(crate::history_cell::new_mcp_tools_output(
-        &config,
-        tools,
-        resources,
-        resource_templates,
-        &auth_statuses,
-    ))
-}
-
-struct ResumeThreadEntry {
-    thread_id: String,
-    thread_name: Option<String>,
-}
-
-struct ModelPickerEntry {
-    slug: String,
-    display_name: String,
-    description: String,
-}
-
-struct PermissionsPresetEntry {
-    label: &'static str,
-    description: &'static str,
-    approval: codex_core::protocol::AskForApproval,
-    sandbox: codex_core::protocol::SandboxPolicy,
-}
-
-fn fetch_resume_threads(state: &CliState, show_all: bool) -> Result<Vec<ResumeThreadEntry>> {
-    let filter_cwd = if show_all {
-        None
-    } else {
-        std::env::current_dir().ok()
-    };
-    let page = list_threads_page(
-        state,
-        None,
-        50,
-        codex_core::ThreadSortKey::UpdatedAt,
-        false,
-        filter_cwd,
-    )?;
-
-    Ok(page
-        .items
-        .into_iter()
-        .map(|thread| ResumeThreadEntry {
-            thread_id: thread.id,
-            thread_name: thread.thread_name,
-        })
-        .collect())
-}
-
-fn fetch_collaboration_modes(
-    state: &CliState,
-) -> Result<Vec<codex_protocol::config_types::CollaborationModeMask>> {
-    let mut modes = list_collaboration_modes(state)?;
-    modes.retain(|mask| mask.mode.is_some_and(|mode| mode.is_tui_visible()));
-    Ok(modes)
-}
-
-fn fetch_experimental_features(
-    state: &CliState,
-) -> Result<Vec<crate::bottom_pane::ExperimentalFeatureItem>> {
-    let mut cursor: Option<String> = None;
-    let mut out = Vec::new();
-    loop {
-        let payload = list_experimental_features_page(state, cursor)?;
-
-        for feature in payload.data {
-            let Some(mapped_feature) = codex_core::features::Feature::from_key(&feature.name)
-            else {
-                continue;
-            };
-            let description = feature
-                .description
-                .unwrap_or_else(|| format!("Stage: {}", feature.stage));
-            out.push(crate::bottom_pane::ExperimentalFeatureItem {
-                feature: mapped_feature,
-                name: feature.display_name.unwrap_or(feature.name),
-                description,
-                enabled: feature.enabled,
-            });
-        }
-
-        cursor = payload.next_cursor;
-        if cursor.is_none() {
-            break;
-        }
-    }
-    Ok(out)
-}
-
-fn fetch_model_picker_entries(state: &CliState) -> Result<Vec<ModelPickerEntry>> {
-    Ok(list_models(state, false, 100)?
-        .into_iter()
-        .map(|model| ModelPickerEntry {
-            slug: model.slug,
-            display_name: model.display_name,
-            description: model.description,
-        })
-        .collect())
-}
-
-fn fetch_current_model_from_config(state: &CliState) -> Option<String> {
-    let config = read_config_snapshot(state).ok().flatten()?;
-    config
-        .get("model")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-}
-
-fn permissions_presets() -> Vec<PermissionsPresetEntry> {
-    vec![
-        PermissionsPresetEntry {
-            label: "Default",
-            description: "Read and edit files in the current directory. Ask before commands and network.",
-            approval: codex_core::protocol::AskForApproval::OnRequest,
-            sandbox: codex_core::protocol::SandboxPolicy::new_workspace_write_policy(),
-        },
-        PermissionsPresetEntry {
-            label: "Auto",
-            description: "Read and edit files in the current directory. Run commands and network automatically.",
-            approval: codex_core::protocol::AskForApproval::Never,
-            sandbox: codex_core::protocol::SandboxPolicy::new_workspace_write_policy(),
-        },
-        PermissionsPresetEntry {
-            label: "Read Only",
-            description: "Read files and ask before commands.",
-            approval: codex_core::protocol::AskForApproval::OnRequest,
-            sandbox: codex_core::protocol::SandboxPolicy::new_read_only_policy(),
-        },
-        PermissionsPresetEntry {
-            label: "Full Access",
-            description: "Read and edit all files. Run commands and network automatically.",
-            approval: codex_core::protocol::AskForApproval::Never,
-            sandbox: codex_core::protocol::SandboxPolicy::DangerFullAccess,
-        },
-    ]
-}
-
-fn fetch_current_permissions_from_config(
-    state: &CliState,
-) -> Option<(
-    codex_core::protocol::AskForApproval,
-    codex_core::protocol::SandboxPolicy,
-)> {
-    let config = read_config_snapshot(state).ok().flatten()?;
-    let approval = config
-        .get("approval_policy")
-        .or_else(|| config.get("approvalPolicy"))
-        .and_then(parse_approval_policy_value)?;
-    let sandbox = config
-        .get("sandbox_mode")
-        .or_else(|| config.get("sandboxMode"))
-        .and_then(parse_sandbox_policy_value)?;
-    Some((approval, sandbox))
-}
-
-fn parse_approval_policy_value(value: &Value) -> Option<codex_core::protocol::AskForApproval> {
-    let raw = value.as_str()?.to_ascii_lowercase();
-    match raw.as_str() {
-        "untrusted" => Some(codex_core::protocol::AskForApproval::UnlessTrusted),
-        "on-failure" | "on_failure" => Some(codex_core::protocol::AskForApproval::OnFailure),
-        "on-request" | "on_request" => Some(codex_core::protocol::AskForApproval::OnRequest),
-        "never" => Some(codex_core::protocol::AskForApproval::Never),
-        _ => None,
-    }
-}
-
-fn parse_sandbox_policy_value(value: &Value) -> Option<codex_core::protocol::SandboxPolicy> {
-    let raw = value.as_str()?.to_ascii_lowercase();
-    match raw.as_str() {
-        "read-only" | "read_only" => {
-            Some(codex_core::protocol::SandboxPolicy::new_read_only_policy())
-        }
-        "workspace-write" | "workspace_write" => {
-            Some(codex_core::protocol::SandboxPolicy::new_workspace_write_policy())
-        }
-        "danger-full-access" | "danger_full_access" => {
-            Some(codex_core::protocol::SandboxPolicy::DangerFullAccess)
-        }
-        _ => None,
-    }
-}
-
-fn run_diff_now() -> String {
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build();
-    let Ok(runtime) = runtime else {
-        return "failed to initialize runtime for /diff".to_string();
-    };
-    match runtime.block_on(get_git_diff()) {
-        Ok((is_git_repo, text)) => {
-            if is_git_repo {
-                text
-            } else {
-                "`/diff` — _not inside a git repository_".to_string()
-            }
-        }
-        Err(err) => format!("Failed to compute diff: {err}"),
-    }
-}
-
-fn truncate_for_width(text: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    if width <= 3 {
-        return ".".repeat(width);
-    }
-    let mut truncated = text.chars().take(width - 3).collect::<String>();
-    truncated.push_str("...");
-    truncated
-}
-
-pub(crate) fn align_left_right(left: &str, right: &str, width: usize) -> String {
-    if width == 0 {
-        return String::new();
-    }
-
-    let left = truncate_for_width(left, width);
-    let right = truncate_for_width(right, width);
-    let left_width = left.chars().count();
-    let right_width = right.chars().count();
-
-    if left_width + right_width + 1 <= width {
-        let spacing = width.saturating_sub(left_width + right_width);
-        return format!("{left}{}{right}", " ".repeat(spacing));
-    }
-
-    if right_width + 1 >= width {
-        return truncate_for_width(&right, width);
-    }
-
-    let left_budget = width.saturating_sub(right_width + 1);
-    let left_truncated = truncate_for_width(&left, left_budget);
-    format!("{left_truncated} {right}")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::App;
-    use super::AppEventSender;
-    use super::CliState;
-    use super::LiveTuiAction;
-    use crate::app_event_sender::AppEventSender as WidgetAppEventSender;
-    use crate::bottom_pane::MentionBinding;
-    use crate::chatwidget::ChatWidget;
-    use crate::file_search::FileSearchManager;
-    use crossterm::event::KeyCode;
-    use crossterm::event::KeyEvent;
-    use crossterm::event::KeyModifiers;
-
-    fn make_test_app() -> App {
-        let widget = ChatWidget::new("sess_test".to_string());
-        let state = CliState::default();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let (widget_tx, widget_rx) = tokio::sync::mpsc::unbounded_channel();
-        let widget_sender = WidgetAppEventSender::new(widget_tx);
-        let file_search = FileSearchManager::new(std::env::temp_dir(), widget_sender);
-
-        App {
-            widget,
-            state,
-            thread_id: "sess_test".to_string(),
-            app_event_tx: AppEventSender::new(tx),
-            app_event_rx: rx,
-            widget_event_rx: widget_rx,
-            file_search,
-        }
-    }
-
-    #[test]
-    fn handle_submit_status_sets_visible_status_message() {
-        let mut app = make_test_app();
-        let action = app
-            .handle_submit("/status", Vec::new(), Vec::<MentionBinding>::new())
-            .expect("status submit should not fail");
-        assert!(matches!(action, LiveTuiAction::Continue));
-        let status = app
-            .widget
-            .ui_mut()
-            .status_message
-            .clone()
-            .expect("status message should be set");
-        assert!(status.contains("thread=sess_test"), "status={status}");
-    }
-
-    #[test]
-    fn handle_key_event_status_command_dispatches_from_composer() {
-        let mut app = make_test_app();
-        app.widget.ui_mut().bottom_pane_insert_str("/status");
-        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
-        let action = app
-            .handle_key_event(enter)
-            .expect("handle key event should succeed");
-        assert!(matches!(action, LiveTuiAction::Continue));
-        let status = app
-            .widget
-            .ui_mut()
-            .status_message
-            .clone()
-            .expect("status message should be set");
-        assert!(status.contains("thread=sess_test"), "status={status}");
-    }
-
-    use super::LiveAttachTui;
-
-    #[test]
-    fn live_tui_input_editing_respects_cursor_boundaries() {
-        let mut ui = LiveAttachTui::new("sess_input".to_string(), "active".to_string());
-
-        ui.input_insert_str("hello");
-        ui.move_input_cursor_left();
-        ui.move_input_cursor_left();
-        ui.input_insert_char('X');
-        assert_eq!(ui.input, "helXlo");
-
-        ui.input_delete();
-        assert_eq!(ui.input, "helXo");
-
-        ui.input_backspace();
-        assert_eq!(ui.input, "helo");
-
-        ui.move_input_cursor_home();
-        ui.input_insert_char('[');
-        ui.move_input_cursor_end();
-        ui.input_insert_char(']');
-        assert_eq!(ui.input, "[helo]");
-    }
-
-    #[test]
-    fn live_tui_history_navigation_replays_previous_entries() {
-        let mut ui = LiveAttachTui::new("sess_history".to_string(), "active".to_string());
-        ui.remember_history_entry("first");
-        ui.remember_history_entry("second");
-
-        ui.history_prev();
-        assert_eq!(ui.input, "second");
-
-        ui.history_prev();
-        assert_eq!(ui.input, "first");
-
-        ui.history_next();
-        assert_eq!(ui.input, "second");
-
-        ui.history_next();
-        assert_eq!(ui.input, "");
-    }
-
-    #[test]
-    fn live_tui_slash_picker_opens_and_filters_commands() {
-        let mut ui = LiveAttachTui::new("sess_picker".to_string(), "active".to_string());
-        ui.input_insert_char('/');
-        assert!(ui.slash_picker_is_active());
-        assert_eq!(
-            ui.selected_slash_entry().map(|entry| entry.command),
-            Some("model")
-        );
-
-        ui.input_insert_str("re");
-        let filtered = ui
-            .slash_picker_entries()
+        assert!(saw_rollback);
+        let user_messages: Vec<String> = app
+            .transcript_cells
             .iter()
-            .map(|entry| entry.command)
-            .collect::<Vec<_>>();
-        assert_eq!(filtered, vec!["review", "rename", "resume"]);
+            .filter_map(|cell| {
+                cell.as_any()
+                    .downcast_ref::<UserHistoryCell>()
+                    .map(|cell| cell.message.clone())
+            })
+            .collect();
+        assert_eq!(
+            user_messages,
+            vec!["first prompt".to_string(), "third prompt".to_string()]
+        );
     }
 
-    #[test]
-    fn live_tui_slash_picker_selection_applies_command() {
-        let mut ui = LiveAttachTui::new("sess_picker_select".to_string(), "active".to_string());
-        ui.input_insert_char('/');
-        ui.slash_picker_move_down();
-        assert_eq!(
-            ui.selected_slash_entry().map(|entry| entry.command),
-            Some("permissions")
-        );
-        assert!(ui.should_apply_slash_picker_on_enter());
-        assert!(ui.apply_selected_slash_entry());
-        assert_eq!(ui.input, "/permissions");
-        assert!(!ui.should_apply_slash_picker_on_enter());
+    #[tokio::test]
+    async fn live_rollback_during_replay_is_applied_in_app_event_order() {
+        let (mut app, mut app_event_rx, _op_rx) = make_test_app_with_channels().await;
+
+        let session_id = ThreadId::new();
+        app.handle_codex_event_replay(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(SessionConfiguredEvent {
+                session_id,
+                forked_from_id: None,
+                thread_name: None,
+                model: "gpt-test".to_string(),
+                model_provider_id: "test-provider".to_string(),
+                approval_policy: AskForApproval::Never,
+                sandbox_policy: SandboxPolicy::new_read_only_policy(),
+                cwd: PathBuf::from("/home/user/project"),
+                reasoning_effort: None,
+                history_log_id: 0,
+                history_entry_count: 0,
+                initial_messages: Some(vec![
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: "first prompt".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                    EventMsg::UserMessage(UserMessageEvent {
+                        message: "second prompt".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                ]),
+                network_proxy: None,
+                rollout_path: Some(PathBuf::new()),
+            }),
+        });
+
+        // Simulate a live rollback arriving before queued replay inserts are drained.
+        app.handle_codex_event_now(Event {
+            id: "live-rollback".to_string(),
+            msg: EventMsg::ThreadRolledBack(ThreadRolledBackEvent { num_turns: 1 }),
+        });
+
+        let mut saw_rollback = false;
+        while let Ok(event) = app_event_rx.try_recv() {
+            match event {
+                AppEvent::InsertHistoryCell(cell) => {
+                    let cell: Arc<dyn HistoryCell> = cell.into();
+                    app.transcript_cells.push(cell);
+                }
+                AppEvent::ApplyThreadRollback { num_turns } => {
+                    saw_rollback = true;
+                    crate::app_backtrack::trim_transcript_cells_drop_last_n_user_turns(
+                        &mut app.transcript_cells,
+                        num_turns,
+                    );
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_rollback);
+        let user_messages: Vec<String> = app
+            .transcript_cells
+            .iter()
+            .filter_map(|cell| {
+                cell.as_any()
+                    .downcast_ref::<UserHistoryCell>()
+                    .map(|cell| cell.message.clone())
+            })
+            .collect();
+        assert_eq!(user_messages, vec!["first prompt".to_string()]);
     }
 
-    #[test]
-    fn live_tui_special_token_hints_match_native_modes() {
-        let mut ui = LiveAttachTui::new("sess_tokens".to_string(), "active".to_string());
+    #[tokio::test]
+    async fn queued_rollback_syncs_overlay_and_clears_deferred_history() {
+        let mut app = make_test_app().await;
+        app.transcript_cells = vec![
+            Arc::new(UserHistoryCell {
+                message: "first".to_string(),
+                text_elements: Vec::new(),
+                local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
+            }) as Arc<dyn HistoryCell>,
+            Arc::new(AgentMessageCell::new(
+                vec![Line::from("after first")],
+                false,
+            )) as Arc<dyn HistoryCell>,
+            Arc::new(UserHistoryCell {
+                message: "second".to_string(),
+                text_elements: Vec::new(),
+                local_image_paths: Vec::new(),
+                remote_image_urls: Vec::new(),
+            }) as Arc<dyn HistoryCell>,
+            Arc::new(AgentMessageCell::new(
+                vec![Line::from("after second")],
+                false,
+            )) as Arc<dyn HistoryCell>,
+        ];
+        app.overlay = Some(Overlay::new_transcript(app.transcript_cells.clone()));
+        app.deferred_history_lines = vec![Line::from("stale buffered line")];
+        app.backtrack.overlay_preview_active = true;
+        app.backtrack.nth_user_message = 1;
 
-        ui.replace_input("!ls -la".to_string());
+        let changed = app.apply_non_pending_thread_rollback(1);
+
+        assert!(changed);
+        assert!(app.backtrack_render_pending);
+        assert!(app.deferred_history_lines.is_empty());
+        assert_eq!(app.backtrack.nth_user_message, 0);
+        let user_messages: Vec<String> = app
+            .transcript_cells
+            .iter()
+            .filter_map(|cell| {
+                cell.as_any()
+                    .downcast_ref::<UserHistoryCell>()
+                    .map(|cell| cell.message.clone())
+            })
+            .collect();
+        assert_eq!(user_messages, vec!["first".to_string()]);
+        let overlay_cell_count = match app.overlay.as_ref() {
+            Some(Overlay::Transcript(t)) => t.committed_cell_count(),
+            _ => panic!("expected transcript overlay"),
+        };
+        assert_eq!(overlay_cell_count, app.transcript_cells.len());
+    }
+
+    #[tokio::test]
+    async fn new_session_requests_shutdown_for_previous_conversation() {
+        let (mut app, mut app_event_rx, mut op_rx) = make_test_app_with_channels().await;
+
+        let thread_id = ThreadId::new();
+        let event = SessionConfiguredEvent {
+            session_id: thread_id,
+            forked_from_id: None,
+            thread_name: None,
+            model: "gpt-test".to_string(),
+            model_provider_id: "test-provider".to_string(),
+            approval_policy: AskForApproval::Never,
+            sandbox_policy: SandboxPolicy::new_read_only_policy(),
+            cwd: PathBuf::from("/home/user/project"),
+            reasoning_effort: None,
+            history_log_id: 0,
+            history_entry_count: 0,
+            initial_messages: None,
+            network_proxy: None,
+            rollout_path: Some(PathBuf::new()),
+        };
+
+        app.chat_widget.handle_codex_event(Event {
+            id: String::new(),
+            msg: EventMsg::SessionConfigured(event),
+        });
+
+        while app_event_rx.try_recv().is_ok() {}
+        while op_rx.try_recv().is_ok() {}
+
+        app.shutdown_current_thread().await;
+
+        match op_rx.try_recv() {
+            Ok(Op::Shutdown) => {}
+            Ok(other) => panic!("expected Op::Shutdown, got {other:?}"),
+            Err(_) => panic!("expected shutdown op to be sent"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_summary_skip_zero_usage() {
+        assert!(session_summary(TokenUsage::default(), None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn session_summary_includes_resume_hint() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        };
+        let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        let summary = session_summary(usage, Some(conversation), None).expect("summary");
         assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  ! shell command mode")
+            summary.usage_line,
+            "Token usage: total=12 input=10 output=2"
         );
-
-        ui.replace_input("@src/main.rs".to_string());
         assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  @ file mention mode")
+            summary.resume_command,
+            Some("codex resume 123e4567-e89b-12d3-a456-426614174000".to_string())
         );
+    }
 
-        ui.replace_input("$VAR".to_string());
+    #[tokio::test]
+    async fn session_summary_prefers_name_over_id() {
+        let usage = TokenUsage {
+            input_tokens: 10,
+            output_tokens: 2,
+            total_tokens: 12,
+            ..Default::default()
+        };
+        let conversation = ThreadId::from_string("123e4567-e89b-12d3-a456-426614174000").unwrap();
+
+        let summary = session_summary(usage, Some(conversation), Some("my-session".to_string()))
+            .expect("summary");
         assert_eq!(
-            ui.live_input_hint().as_deref(),
-            Some("  $ variable/prompt mode")
+            summary.resume_command,
+            Some("codex resume my-session".to_string())
         );
     }
 }

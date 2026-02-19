@@ -3,4 +3,4 @@ This project uses a Nix flake to set up the development environment.
 
 Stop and ask me if you need some external set up like database.
 
-For codex TUI, just copy the logic from Codex. Do not implement your own without referencing Codex source.
+For codex TUI, just copy the logic from Codex. Do not implement your own without referencing Codex source. Never come up with your own hack to fix an issue
