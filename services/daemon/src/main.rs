@@ -4,6 +4,12 @@ use axum::Router;
 use axum::extract::Path;
 use axum::extract::Query;
 use axum::extract::State;
+use axum::extract::WebSocketUpgrade;
+use axum::extract::ws::CloseFrame as AxumCloseFrame;
+use axum::extract::ws::Message as AxumWsMessage;
+use axum::extract::ws::Utf8Bytes;
+use axum::extract::ws::WebSocket;
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::routing::get;
@@ -35,6 +41,8 @@ use crabbot_protocol::DaemonStreamEvent;
 use crabbot_protocol::DaemonTurnCompleted;
 use crabbot_protocol::DaemonTurnStreamDelta;
 use crabbot_protocol::HealthResponse;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use serde::Deserialize;
 use serde_json::Value;
 use serde_json::json;
@@ -62,9 +70,14 @@ use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
 use tokio::task::JoinError;
+use tokio_tungstenite::connect_async;
+use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
+use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+use tokio_tungstenite::tungstenite::protocol::CloseFrame as UpstreamCloseFrame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::CloseCode as UpstreamCloseCode;
 
 const DEFAULT_DAEMON_BIND: &str = "127.0.0.1:8788";
-const DEFAULT_CODEX_APP_SERVER_ENDPOINT: &str = "http://127.0.0.1:8789";
+const DEFAULT_CODEX_APP_SERVER_ENDPOINT: &str = "ws://127.0.0.1:8789";
 const CODEX_PROTOCOL_VERSION: &str = "2026-02-14";
 const DAEMON_RUNTIME_USER_ID: &str = "daemon_local_user";
 const DEFAULT_CODEX_BIN: &str = "codex";
@@ -76,6 +89,26 @@ struct AppState {
     sessions: Arc<RwLock<HashMap<String, SessionRuntime>>>,
     codex_client: CodexAppServerClient,
     rpc_runtime: Option<CodexRpcRuntime>,
+    ws_relay: Arc<WebSocketRelayState>,
+}
+
+struct SpawnedAppServer {
+    child: Mutex<Child>,
+}
+
+impl Drop for SpawnedAppServer {
+    fn drop(&mut self) {
+        if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+#[derive(Clone)]
+struct WebSocketRelayState {
+    upstream_endpoint: String,
+    _spawned_app_server: Option<Arc<SpawnedAppServer>>,
 }
 
 #[derive(Debug, Clone)]
@@ -381,6 +414,7 @@ fn router() -> Router {
 
 fn router_with_state(state: AppState) -> Router {
     Router::new()
+        .route("/", get(app_server_ws_proxy))
         .route("/health", get(health))
         .route("/v1/sessions/start", post(start_session))
         .route("/v1/sessions/{session_id}/resume", post(resume_session))
@@ -399,10 +433,14 @@ fn router_with_state(state: AppState) -> Router {
 
 impl AppState {
     fn from_env() -> anyhow::Result<Self> {
-        let endpoint = env::var("CRABBOT_CODEX_APP_SERVER_ENDPOINT")
-            .unwrap_or_else(|_| DEFAULT_CODEX_APP_SERVER_ENDPOINT.to_string());
-        let codex_client = CodexAppServerClient::new(&endpoint)
-            .with_context(|| format!("initialize codex app server client for {endpoint}"))?;
+        let ws_relay = WebSocketRelayState::from_env()?;
+        let codex_client =
+            CodexAppServerClient::new(&ws_relay.upstream_endpoint).with_context(|| {
+                format!(
+                    "initialize codex app server client for {}",
+                    ws_relay.upstream_endpoint
+                )
+            })?;
         let rpc_runtime = match CodexRpcRuntime::from_env() {
             Ok(runtime) => Some(runtime),
             Err(error) => {
@@ -414,6 +452,7 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
             rpc_runtime,
+            ws_relay: Arc::new(ws_relay),
         })
     }
 
@@ -425,7 +464,176 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
             rpc_runtime: None,
+            ws_relay: Arc::new(WebSocketRelayState {
+                upstream_endpoint: endpoint.to_string(),
+                _spawned_app_server: None,
+            }),
         })
+    }
+}
+
+impl WebSocketRelayState {
+    fn from_env() -> anyhow::Result<Self> {
+        let upstream_endpoint = env::var("CRABBOT_CODEX_APP_SERVER_ENDPOINT")
+            .unwrap_or_else(|_| DEFAULT_CODEX_APP_SERVER_ENDPOINT.to_string());
+        let spawn_upstream = env_flag("CRABBOT_DAEMON_SPAWN_CODEX_APP_SERVER", true);
+        let spawned_app_server = if spawn_upstream {
+            let codex_bin =
+                env::var("CRABBOT_CODEX_BIN").unwrap_or_else(|_| DEFAULT_CODEX_BIN.to_string());
+            let child = Command::new(&codex_bin)
+                .arg("app-server")
+                .arg("--listen")
+                .arg(&upstream_endpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .with_context(|| {
+                    format!("spawn `{codex_bin} app-server --listen {upstream_endpoint}`")
+                })?;
+            Some(Arc::new(SpawnedAppServer {
+                child: Mutex::new(child),
+            }))
+        } else {
+            None
+        };
+
+        Ok(Self {
+            upstream_endpoint,
+            _spawned_app_server: spawned_app_server,
+        })
+    }
+}
+
+fn env_flag(name: &str, default: bool) -> bool {
+    match env::var(name) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "yes" | "on"
+        ),
+        Err(_) => default,
+    }
+}
+
+async fn app_server_ws_proxy(
+    ws: WebSocketUpgrade,
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let upstream_endpoint = state.ws_relay.upstream_endpoint.clone();
+    let upstream_headers = sanitize_upstream_ws_headers(&headers);
+    ws.on_upgrade(move |client_socket| async move {
+        if let Err(error) =
+            proxy_websocket_connection(client_socket, upstream_endpoint, upstream_headers).await
+        {
+            eprintln!("warning: websocket relay session ended with error: {error:#}");
+        }
+    })
+}
+
+fn sanitize_upstream_ws_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in headers {
+        let key = name.as_str().to_ascii_lowercase();
+        if matches!(
+            key.as_str(),
+            "connection"
+                | "upgrade"
+                | "host"
+                | "sec-websocket-key"
+                | "sec-websocket-version"
+                | "sec-websocket-extensions"
+        ) {
+            continue;
+        }
+        out.insert(name.clone(), value.clone());
+    }
+    out
+}
+
+async fn proxy_websocket_connection(
+    client_socket: WebSocket,
+    upstream_endpoint: String,
+    upstream_headers: HeaderMap,
+) -> anyhow::Result<()> {
+    let mut request = upstream_endpoint
+        .as_str()
+        .into_client_request()
+        .context("build upstream websocket request")?;
+    request.headers_mut().extend(upstream_headers);
+    request.headers_mut().remove("Sec-WebSocket-Extensions");
+
+    let (upstream_socket, _) = connect_async(request)
+        .await
+        .context("connect upstream websocket app-server")?;
+
+    let (mut client_sender, mut client_receiver) = client_socket.split();
+    let (mut upstream_sender, mut upstream_receiver) = upstream_socket.split();
+
+    let client_to_upstream = async {
+        while let Some(message) = client_receiver.next().await {
+            let message = message.context("read message from websocket client")?;
+            let mapped = map_client_to_upstream_message(message);
+            upstream_sender
+                .send(mapped)
+                .await
+                .context("forward message to upstream websocket")?;
+        }
+        anyhow::Ok(())
+    };
+
+    let upstream_to_client = async {
+        while let Some(message) = upstream_receiver.next().await {
+            let message = message.context("read message from upstream websocket")?;
+            let Some(mapped) = map_upstream_to_client_message(message) else {
+                continue;
+            };
+            client_sender
+                .send(mapped)
+                .await
+                .context("forward message to websocket client")?;
+        }
+        anyhow::Ok(())
+    };
+
+    tokio::select! {
+        result = client_to_upstream => result,
+        result = upstream_to_client => result,
+    }
+}
+
+fn map_client_to_upstream_message(message: AxumWsMessage) -> UpstreamWsMessage {
+    match message {
+        AxumWsMessage::Text(text) => UpstreamWsMessage::Text(text.to_string().into()),
+        AxumWsMessage::Binary(binary) => UpstreamWsMessage::Binary(binary),
+        AxumWsMessage::Ping(payload) => UpstreamWsMessage::Ping(payload),
+        AxumWsMessage::Pong(payload) => UpstreamWsMessage::Pong(payload),
+        AxumWsMessage::Close(frame) => {
+            let mapped = frame.map(|f| UpstreamCloseFrame {
+                code: UpstreamCloseCode::from(f.code),
+                reason: f.reason.to_string().into(),
+            });
+            UpstreamWsMessage::Close(mapped)
+        }
+    }
+}
+
+fn map_upstream_to_client_message(message: UpstreamWsMessage) -> Option<AxumWsMessage> {
+    match message {
+        UpstreamWsMessage::Text(text) => {
+            Some(AxumWsMessage::Text(Utf8Bytes::from(text.to_string())))
+        }
+        UpstreamWsMessage::Binary(binary) => Some(AxumWsMessage::Binary(binary)),
+        UpstreamWsMessage::Ping(payload) => Some(AxumWsMessage::Ping(payload)),
+        UpstreamWsMessage::Pong(payload) => Some(AxumWsMessage::Pong(payload)),
+        UpstreamWsMessage::Close(frame) => {
+            let mapped = frame.map(|f| AxumCloseFrame {
+                code: u16::from(f.code),
+                reason: Utf8Bytes::from(f.reason.to_string()),
+            });
+            Some(AxumWsMessage::Close(mapped))
+        }
+        UpstreamWsMessage::Frame(_) => None,
     }
 }
 

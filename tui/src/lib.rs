@@ -3320,6 +3320,10 @@ pub fn set_app_server_connection_raw(app_server_endpoint: &str, auth_token: Opti
     set_shim_backend_config(app_server_endpoint, auth_token);
 }
 
+pub fn set_daemon_connection_raw(daemon_endpoint: &str, auth_token: Option<&str>) {
+    set_app_server_connection_raw(daemon_endpoint, auth_token);
+}
+
 pub async fn run_main(
     cli: Cli,
     _codex_linux_sandbox_exe: Option<PathBuf>,
@@ -3966,6 +3970,10 @@ pub fn ensure_app_server_ready_raw(
     with_app_server_ws_client(app_server_endpoint, auth_token, |_client| Ok(()))
 }
 
+pub fn ensure_daemon_ready_raw(daemon_endpoint: &str, auth_token: Option<&str>) -> Result<()> {
+    ensure_app_server_ready_raw(daemon_endpoint, auth_token)
+}
+
 fn app_server_rpc_respond(
     app_server_endpoint: &str,
     auth_token: Option<&str>,
@@ -4155,7 +4163,7 @@ fn build_attach_footer(
     columns: usize,
 ) -> String {
     let full = format!(
-        "session={session_id} state={state} events={received_events} seq={last_sequence} app_server={app_server_endpoint}"
+        "session={session_id} state={state} events={received_events} seq={last_sequence} daemon={app_server_endpoint}"
     );
     if full.len() <= columns {
         return full;

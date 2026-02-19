@@ -1824,10 +1824,12 @@ dependencies = [
  "axum",
  "crabbot_codex_app_server",
  "crabbot_protocol",
+ "futures-util",
  "http-body-util",
  "serde",
  "serde_json",
  "tokio",
+ "tokio-tungstenite",
  "tower",
 ]
 

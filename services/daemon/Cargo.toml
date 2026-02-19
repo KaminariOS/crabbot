@@ -6,12 +6,14 @@ license.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 crabbot_codex_app_server = { path = "../../crates/codex_app_server" }
 crabbot_protocol = { path = "../../crates/protocol" }
+futures-util = "0.3"
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
+tokio-tungstenite = "0.28"
 
 [dev-dependencies]
 http-body-util = "0.1"

@@ -86,7 +86,7 @@ struct DaemonCommand {
 
 #[derive(Debug, Subcommand)]
 enum DaemonSubcommand {
-    /// Start `codex app-server` in the background.
+    /// Start `crabbot_daemon` in the background.
     Up(DaemonUpArgs),
     /// Stop the background daemon.
     Down,
@@ -416,7 +416,7 @@ fn handle_tui_with_crate(
     interactive: Option<&InteractiveArgs>,
     state: &mut CliState,
 ) -> Result<CommandOutput> {
-    crabbot_tui::set_app_server_connection_raw(
+    crabbot_tui::set_daemon_connection_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
     );
@@ -1254,29 +1254,29 @@ fn ensure_daemon_ready(state: &CliState) -> Result<()> {
             return Ok(());
         }
     } else {
-        crabbot_tui::ensure_app_server_ready_raw(
+        crabbot_tui::ensure_daemon_ready_raw(
             &state.config.daemon_endpoint,
             state.config.auth_token.as_deref(),
         )
         .with_context(|| {
             format!(
-                "app-server is not reachable at {}; run `codex app-server --listen {}`",
-                state.config.daemon_endpoint, state.config.daemon_endpoint
+                "daemon is not reachable at {}; run `crabbot daemon up`",
+                state.config.daemon_endpoint
             )
         })?;
         return Ok(());
     }
 
-    // For HTTP endpoints, surface a useful message that keeps parity with ws endpoints.
-    // The daemon HTTP API remains compatible with the app-server transport.
-    crabbot_tui::ensure_app_server_ready_raw(
+    // For HTTP endpoints, surface a useful message that keeps parity with WS endpoints.
+    // The daemon HTTP API remains compatible with the websocket transport.
+    crabbot_tui::ensure_daemon_ready_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
     )
     .with_context(|| {
         format!(
-            "app-server is not reachable at {}; run `codex app-server --listen {}`",
-            state.config.daemon_endpoint, state.config.daemon_endpoint
+            "daemon is not reachable at {}; run `crabbot daemon up`",
+            state.config.daemon_endpoint
         )
     })
 }

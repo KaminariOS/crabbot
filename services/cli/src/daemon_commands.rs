@@ -30,6 +30,8 @@ fn daemon_up(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -> Res
     let pid_path = daemon_pid_path(state_path)?;
     let log_path = daemon_log_path(state_path)?;
     let listen_endpoint = resolve_daemon_listen_endpoint(state_path, state, args)?;
+    let daemon_bind = daemon_bind_for_endpoint(&listen_endpoint)?;
+    let codex_app_server_endpoint = derive_internal_app_server_endpoint(&listen_endpoint);
 
     if daemon_is_healthy(&listen_endpoint, state.config.auth_token.as_deref()) {
         return Ok(format!(
@@ -64,15 +66,12 @@ fn daemon_up(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -> Res
         .try_clone()
         .with_context(|| format!("clone daemon log handle {}", log_path.display()))?;
 
-    let child = Command::new("codex")
-        .arg("app-server")
-        .arg("--listen")
-        .arg(&listen_endpoint)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(log_file))
-        .stderr(Stdio::from(stderr_log))
-        .spawn()
-        .context("start codex app-server")?;
+    let child = spawn_daemon_process(
+        &daemon_bind,
+        &codex_app_server_endpoint,
+        &log_file,
+        &stderr_log,
+    )?;
     let pid = child.id();
 
     save_daemon_process_state(
@@ -218,6 +217,88 @@ fn websocket_url_for_daemon_endpoint(endpoint: &str) -> String {
         return format!("wss://{rest}");
     }
     trimmed.to_string()
+}
+
+fn daemon_bind_for_endpoint(endpoint: &str) -> Result<String> {
+    let (_, authority, _) = split_endpoint(endpoint)
+        .ok_or_else(|| anyhow!("invalid daemon endpoint for bind resolution: {endpoint}"))?;
+    Ok(authority)
+}
+
+fn spawn_daemon_process(
+    daemon_bind: &str,
+    codex_app_server_endpoint: &str,
+    log_file: &fs::File,
+    stderr_log: &fs::File,
+) -> Result<std::process::Child> {
+    let mut candidates = Vec::new();
+    if let Ok(bin) = env::var("CRABBOT_DAEMON_BIN")
+        && !bin.trim().is_empty()
+    {
+        candidates.push(bin);
+    }
+    if let Ok(current_exe) = env::current_exe()
+        && let Some(dir) = current_exe.parent()
+    {
+        candidates.push(dir.join("crabbot_daemon").display().to_string());
+    }
+    candidates.push("crabbot_daemon".to_string());
+
+    let mut last_error: Option<anyhow::Error> = None;
+    for bin in candidates {
+        let spawn_result = Command::new(&bin)
+            .env("CRABBOT_DAEMON_BIND", daemon_bind)
+            .env(
+                "CRABBOT_CODEX_APP_SERVER_ENDPOINT",
+                codex_app_server_endpoint,
+            )
+            .env("CRABBOT_DAEMON_SPAWN_CODEX_APP_SERVER", "true")
+            .env("CRABBOT_CODEX_BIN", "codex")
+            .stdin(Stdio::null())
+            .stdout(
+                log_file
+                    .try_clone()
+                    .with_context(|| format!("clone daemon log handle for {bin}"))?,
+            )
+            .stderr(
+                stderr_log
+                    .try_clone()
+                    .with_context(|| format!("clone daemon stderr handle for {bin}"))?,
+            )
+            .spawn();
+
+        match spawn_result {
+            Ok(child) => return Ok(child),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                last_error = Some(anyhow!("daemon binary not found: {bin}"));
+                continue;
+            }
+            Err(error) => {
+                return Err(error).with_context(|| format!("start daemon via {bin}"));
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| anyhow!("unable to start crabbot_daemon")))
+}
+
+fn derive_internal_app_server_endpoint(listen_endpoint: &str) -> String {
+    let relay_port = split_endpoint(listen_endpoint)
+        .and_then(|(_, authority, _)| parse_port_from_authority(&authority))
+        .filter(|port| *port < u16::MAX)
+        .map(|port| port + 1)
+        .unwrap_or(8789);
+    format!("ws://127.0.0.1:{relay_port}")
+}
+
+fn parse_port_from_authority(authority: &str) -> Option<u16> {
+    if authority.starts_with('[') {
+        let idx = authority.rfind("]:")?;
+        authority.get(idx + 2..)?.parse::<u16>().ok()
+    } else {
+        let (_, port) = authority.rsplit_once(':')?;
+        port.parse::<u16>().ok()
+    }
 }
 
 fn resolve_daemon_listen_endpoint(
@@ -513,6 +594,25 @@ fn terminate_process(pid: u32, signal: &str) -> Result<()> {
 }
 
 fn find_unmanaged_daemon_pid(endpoint: &str) -> Result<Option<u32>> {
+    let daemon_output = Command::new("pgrep")
+        .args(["-af", "crabbot_daemon"])
+        .output()
+        .context("run pgrep for crabbot_daemon")?;
+    if daemon_output.status.success() {
+        let stdout = String::from_utf8_lossy(&daemon_output.stdout);
+        for line in stdout.lines() {
+            let mut parts = line.trim().splitn(2, char::is_whitespace);
+            let pid_raw = parts.next().unwrap_or_default();
+            let cmdline = parts.next().unwrap_or_default();
+            if cmdline.contains("crabbot_daemon")
+                && !cmdline.contains("pgrep")
+                && let Ok(pid) = pid_raw.parse::<u32>()
+            {
+                return Ok(Some(pid));
+            }
+        }
+    }
+
     let output = Command::new("pgrep")
         .args(["-af", "codex app-server"])
         .output()
