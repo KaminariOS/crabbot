@@ -87,13 +87,32 @@ struct DaemonCommand {
 #[derive(Debug, Subcommand)]
 enum DaemonSubcommand {
     /// Start `codex app-server` in the background.
-    Up,
+    Up(DaemonUpArgs),
     /// Stop the background daemon.
     Down,
     /// Show daemon process and health status.
     Status,
     /// Show daemon logs (follows by default).
     Logs(DaemonLogsArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct DaemonUpArgs {
+    /// Bind daemon to Tailscale IPv4.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["wifi", "local", "bind_all"])]
+    tailscale: bool,
+    /// Bind daemon to Wi-Fi/LAN IPv4 (default).
+    #[arg(long, default_value_t = false, conflicts_with_all = ["tailscale", "local", "bind_all"])]
+    wifi: bool,
+    /// Bind daemon to localhost.
+    #[arg(long, default_value_t = false, conflicts_with_all = ["tailscale", "wifi", "bind_all"])]
+    local: bool,
+    /// Bind daemon to all interfaces (0.0.0.0).
+    #[arg(long = "all", default_value_t = false, conflicts_with_all = ["tailscale", "wifi", "local"])]
+    bind_all: bool,
+    /// Override daemon listen port.
+    #[arg(long)]
+    port: Option<u16>,
 }
 
 #[derive(Debug, Args)]
@@ -2560,6 +2579,21 @@ mod tests {
         assert_eq!(
             daemon_commands::replace_endpoint_host_for_test("https://localhost:443", "100.64.0.2"),
             Some("https://100.64.0.2:443".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_endpoint_port_preserves_scheme_host_and_path() {
+        assert_eq!(
+            daemon_commands::replace_endpoint_port_for_test(
+                "ws://127.0.0.1:8765/v1/sessions",
+                9000
+            ),
+            Some("ws://127.0.0.1:9000/v1/sessions".to_string())
+        );
+        assert_eq!(
+            daemon_commands::replace_endpoint_port_for_test("https://localhost:443", 8443),
+            Some("https://localhost:8443".to_string())
         );
     }
 

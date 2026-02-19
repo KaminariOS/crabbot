@@ -5,6 +5,8 @@ use std::fs::OpenOptions;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::net::IpAddr;
+use std::net::UdpSocket;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonProcessState {
@@ -14,19 +16,19 @@ struct DaemonProcessState {
 }
 
 pub(super) fn run_daemon(command: DaemonCommand, state_path: &Path) -> Result<String> {
-    let state = load_state(state_path)?;
+    let mut state = load_state(state_path)?;
     match command.command {
-        DaemonSubcommand::Up => daemon_up(state_path, &state),
+        DaemonSubcommand::Up(args) => daemon_up(state_path, &mut state, args),
         DaemonSubcommand::Down => daemon_down(state_path, &state),
         DaemonSubcommand::Status => daemon_status(state_path, &state),
         DaemonSubcommand::Logs(args) => daemon_logs(state_path, args),
     }
 }
 
-fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
+fn daemon_up(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -> Result<String> {
     let pid_path = daemon_pid_path(state_path)?;
     let log_path = daemon_log_path(state_path)?;
-    let listen_endpoint = resolve_daemon_listen_endpoint(state_path, state)?;
+    let listen_endpoint = resolve_daemon_listen_endpoint(state_path, state, args)?;
 
     if daemon_is_healthy(&listen_endpoint, state.config.auth_token.as_deref()) {
         return Ok(format!(
@@ -211,25 +213,48 @@ fn websocket_url_for_daemon_endpoint(endpoint: &str) -> String {
     trimmed.to_string()
 }
 
-fn resolve_daemon_listen_endpoint(state_path: &Path, state: &CliState) -> Result<String> {
+fn resolve_daemon_listen_endpoint(
+    state_path: &Path,
+    state: &mut CliState,
+    args: DaemonUpArgs,
+) -> Result<String> {
     let configured = state.config.daemon_endpoint.trim().to_string();
-    let Some(tailscale_ip) = detect_tailscale_ipv4() else {
-        return Ok(configured);
-    };
-    if !endpoint_host_is_local(&configured) {
-        return Ok(configured);
-    }
-    let Some(tailscale_endpoint) = replace_endpoint_host(&configured, &tailscale_ip) else {
-        return Ok(configured);
-    };
-
-    if tailscale_endpoint != configured {
-        let mut updated = state.clone();
-        updated.config.daemon_endpoint = tailscale_endpoint.clone();
-        save_state(state_path, &updated)?;
+    let host = resolve_bind_host(&args)?;
+    let mut endpoint = replace_endpoint_host(&configured, &host).ok_or_else(|| {
+        anyhow!("cannot replace endpoint host in configured daemon endpoint: {configured}")
+    })?;
+    if let Some(port) = args.port {
+        endpoint = replace_endpoint_port(&endpoint, port).ok_or_else(|| {
+            anyhow!("cannot replace endpoint port in configured daemon endpoint: {endpoint}")
+        })?;
     }
 
-    Ok(tailscale_endpoint)
+    if endpoint != state.config.daemon_endpoint {
+        state.config.daemon_endpoint = endpoint.clone();
+        save_state(state_path, state)?;
+    }
+
+    Ok(endpoint)
+}
+
+fn resolve_bind_host(args: &DaemonUpArgs) -> Result<String> {
+    if args.tailscale {
+        return detect_tailscale_ipv4()
+            .ok_or_else(|| anyhow!("cannot detect tailscale IPv4; try --wifi, --local, or --all"));
+    }
+    if args.local {
+        return Ok("127.0.0.1".to_string());
+    }
+    if args.bind_all {
+        return Ok("0.0.0.0".to_string());
+    }
+    if args.wifi {
+        return detect_wifi_ipv4()
+            .ok_or_else(|| anyhow!("cannot detect Wi-Fi/LAN IPv4; try --local or --all"));
+    }
+
+    // Default mode is Wi-Fi/LAN. If detection fails, fall back to localhost.
+    Ok(detect_wifi_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()))
 }
 
 fn detect_tailscale_ipv4() -> Option<String> {
@@ -245,6 +270,16 @@ fn detect_tailscale_ipv4() -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn detect_wifi_ipv4() -> Option<String> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("1.1.1.1:80").ok()?;
+    let addr = socket.local_addr().ok()?;
+    match addr.ip() {
+        IpAddr::V4(ip) if !ip.is_loopback() => Some(ip.to_string()),
+        _ => None,
+    }
+}
+
 fn is_plain_ipv4(value: &str) -> bool {
     let mut parts = value.split('.');
     for _ in 0..4 {
@@ -258,6 +293,7 @@ fn is_plain_ipv4(value: &str) -> bool {
     parts.next().is_none()
 }
 
+#[cfg(test)]
 fn endpoint_host_is_local(endpoint: &str) -> bool {
     let Some((_, authority, _)) = split_endpoint(endpoint) else {
         return false;
@@ -287,6 +323,18 @@ fn replace_endpoint_host(endpoint: &str, host: &str) -> Option<String> {
         port.to_string()
     } else {
         return None;
+    };
+    Some(format!("{scheme}://{host}:{port}{suffix}"))
+}
+
+fn replace_endpoint_port(endpoint: &str, port: u16) -> Option<String> {
+    let (scheme, authority, suffix) = split_endpoint(endpoint)?;
+    let host = if authority.starts_with('[') {
+        let idx = authority.rfind("]:")?;
+        authority.get(..=idx)?.to_string()
+    } else {
+        let (host, _) = authority.rsplit_once(':')?;
+        host.to_string()
     };
     Some(format!("{scheme}://{host}:{port}{suffix}"))
 }
@@ -501,4 +549,9 @@ pub(super) fn replace_endpoint_host_for_test(endpoint: &str, host: &str) -> Opti
 #[cfg(test)]
 pub(super) fn endpoint_host_is_local_for_test(endpoint: &str) -> bool {
     endpoint_host_is_local(endpoint)
+}
+
+#[cfg(test)]
+pub(super) fn replace_endpoint_port_for_test(endpoint: &str, port: u16) -> Option<String> {
+    replace_endpoint_port(endpoint, port)
 }
