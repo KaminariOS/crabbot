@@ -47,6 +47,7 @@ use crate::status::rate_limit_snapshot_display_for_limit;
 use crate::text_formatting::proper_join;
 use crate::version::CODEX_CLI_VERSION;
 use codex_app_server_protocol::ConfigLayerSource;
+use codex_backend_client::Client as BackendClient;
 use codex_core::config::Config;
 use codex_core::config::ConstraintResult;
 use codex_core::config::types::Notifications;
@@ -3819,7 +3820,7 @@ impl ChatWidget {
 
             let app_mentions = find_app_mentions(&mentions, apps, &skill_names_lower);
             for app in app_mentions {
-                let slug = codex_core::connectors::connector_mention_slug(&app);
+                let slug = connectors::connector_mention_slug(&app);
                 if bound_names.contains(&slug) || !selected_app_ids.insert(app.id.clone()) {
                     continue;
                 }
@@ -7265,8 +7266,34 @@ fn extract_first_bold(s: &str) -> Option<String> {
     None
 }
 
-async fn fetch_rate_limits(_base_url: String, _auth: CodexAuth) -> Vec<RateLimitSnapshot> {
-    Vec::new()
+async fn fetch_rate_limits(base_url: String, auth: CodexAuth) -> Vec<RateLimitSnapshot> {
+    let mut client = match BackendClient::new(base_url) {
+        Ok(client) => client,
+        Err(err) => {
+            debug!(error = ?err, "failed to construct backend client for rate limits");
+            return Vec::new();
+        }
+    };
+
+    let backend = crate::get_shim_backend_config();
+    if let Some(token) = backend.auth_token {
+        client = client.with_bearer_token(token);
+    }
+    if let Some(account_id) = auth.get_account_id() {
+        client = client.with_chatgpt_account_id(account_id);
+    }
+
+    match client.get_rate_limits_many().await {
+        Ok(snapshots) => snapshots
+            .into_iter()
+            .filter_map(|snapshot| serde_json::to_value(snapshot).ok())
+            .filter_map(|value| serde_json::from_value::<RateLimitSnapshot>(value).ok())
+            .collect(),
+        Err(err) => {
+            debug!(error = ?err, "failed to fetch rate limits from /usage");
+            Vec::new()
+        }
+    }
 }
 
 #[cfg(test)]

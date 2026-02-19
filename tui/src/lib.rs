@@ -768,7 +768,7 @@ fn set_shim_backend_config(app_server_endpoint: &str, auth_token: Option<&str>) 
     }
 }
 
-fn get_shim_backend_config() -> ShimBackendConfig {
+pub(crate) fn get_shim_backend_config() -> ShimBackendConfig {
     SHIM_BACKEND_CONFIG
         .lock()
         .map(|cfg| cfg.clone())
@@ -1891,101 +1891,82 @@ pub mod test_support {
         &ALL_MODEL_PRESETS
     }
 }
-/// Stub backing `codex_chatgpt::connectors`.
-mod codex_chatgpt_stub {
-    pub mod connectors {
-        /// App connector info.
-        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-        pub struct AppInfo {
-            pub id: String,
-            pub name: String,
-            pub description: Option<String>,
-            pub logo_url: Option<String>,
-            pub logo_url_dark: Option<String>,
-            pub distribution_channel: Option<String>,
-            #[serde(default)]
-            pub branding: Option<serde_json::Value>,
-            #[serde(default)]
-            pub app_metadata: Option<serde_json::Value>,
-            #[serde(default)]
-            pub labels: Option<std::collections::HashMap<String, String>>,
-            pub install_url: Option<String>,
-            #[serde(default)]
-            pub is_accessible: bool,
-            #[serde(default)]
-            pub is_enabled: bool,
-        }
+pub mod connectors {
+    pub use codex_chatgpt::connectors::AppInfo;
 
-        pub fn connector_display_label(connector: &AppInfo) -> String {
-            connector.name.clone()
-        }
+    pub fn connector_display_label(connector: &AppInfo) -> String {
+        connector.name.clone()
+    }
 
-        pub fn connector_mention_slug(connector: &AppInfo) -> String {
-            connector_name_slug(&connector.name)
-        }
-
-        pub async fn list_accessible_connectors_from_mcp_tools_with_options(
-            _config: &crate::config::Config,
-            _force_refetch: bool,
-        ) -> anyhow::Result<Vec<AppInfo>> {
-            Ok(Vec::new())
-        }
-
-        pub async fn list_all_connectors(
-            _config: &crate::config::Config,
-        ) -> anyhow::Result<Vec<AppInfo>> {
-            Ok(Vec::new())
-        }
-
-        pub fn merge_connectors_with_accessible(
-            mut all_connectors: Vec<AppInfo>,
-            accessible_connectors: Vec<AppInfo>,
-            allow_inaccessible: bool,
-        ) -> Vec<AppInfo> {
-            let mut by_id = std::collections::HashMap::new();
-            for mut connector in all_connectors.drain(..) {
-                by_id.insert(connector.id.clone(), connector.clone());
-                if let Some(existing) = by_id.get_mut(&connector.id) {
-                    *existing = connector;
-                }
-            }
-            for accessible in accessible_connectors {
-                by_id.insert(accessible.id.clone(), accessible);
-            }
-            let mut connectors: Vec<AppInfo> = by_id.into_values().collect();
-            if !allow_inaccessible {
-                connectors.retain(|c| c.is_accessible);
-            }
-            connectors.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()));
-            connectors
-        }
-
-        pub fn with_app_enabled_state(
-            connectors: Vec<AppInfo>,
-            _config: &crate::config::Config,
-        ) -> Vec<AppInfo> {
-            connectors
-        }
-
-        fn connector_name_slug(name: &str) -> String {
-            let mut normalized = String::with_capacity(name.len());
-            for character in name.chars() {
-                if character.is_ascii_alphanumeric() {
-                    normalized.push(character.to_ascii_lowercase());
-                } else {
-                    normalized.push('-');
-                }
-            }
-            let normalized = normalized.trim_matches('-');
-            if normalized.is_empty() {
-                "app".to_string()
+    pub fn connector_mention_slug(connector: &AppInfo) -> String {
+        let mut normalized = String::with_capacity(connector.name.len());
+        for character in connector.name.chars() {
+            if character.is_ascii_alphanumeric() {
+                normalized.push(character.to_ascii_lowercase());
             } else {
-                normalized.to_string()
+                normalized.push('-');
             }
+        }
+        let normalized = normalized.trim_matches('-');
+        if normalized.is_empty() {
+            "app".to_string()
+        } else {
+            normalized.to_string()
         }
     }
+
+    pub async fn list_accessible_connectors_from_mcp_tools_with_options(
+        _config: &crate::config::Config,
+        _force_refetch: bool,
+    ) -> anyhow::Result<Vec<AppInfo>> {
+        let backend = crate::get_shim_backend_config();
+        let mut state = crate::CliState::default();
+        state.config.app_server_endpoint = backend.app_server_endpoint;
+        state.config.auth_token = backend.auth_token;
+        let connectors = crate::core_compat::list_connectors(&state)?;
+        Ok(connectors
+            .into_iter()
+            .filter(|connector| connector.is_accessible)
+            .collect())
+    }
+
+    pub async fn list_all_connectors(
+        _config: &crate::config::Config,
+    ) -> anyhow::Result<Vec<AppInfo>> {
+        let backend = crate::get_shim_backend_config();
+        let mut state = crate::CliState::default();
+        state.config.app_server_endpoint = backend.app_server_endpoint;
+        state.config.auth_token = backend.auth_token;
+        crate::core_compat::list_connectors(&state)
+    }
+
+    pub fn merge_connectors_with_accessible(
+        mut all_connectors: Vec<AppInfo>,
+        accessible_connectors: Vec<AppInfo>,
+        allow_inaccessible: bool,
+    ) -> Vec<AppInfo> {
+        let mut by_id = std::collections::HashMap::new();
+        for connector in all_connectors.drain(..) {
+            by_id.insert(connector.id.clone(), connector);
+        }
+        for accessible in accessible_connectors {
+            by_id.insert(accessible.id.clone(), accessible);
+        }
+        let mut connectors: Vec<AppInfo> = by_id.into_values().collect();
+        if !allow_inaccessible {
+            connectors.retain(|connector| connector.is_accessible);
+        }
+        connectors.sort_by(|left, right| left.name.to_lowercase().cmp(&right.name.to_lowercase()));
+        connectors
+    }
+
+    pub fn with_app_enabled_state(
+        connectors: Vec<AppInfo>,
+        _config: &crate::config::Config,
+    ) -> Vec<AppInfo> {
+        connectors
+    }
 }
-pub use codex_chatgpt_stub::connectors;
 
 /// Stub backing `codex_file_search`.
 mod codex_file_search_stub {

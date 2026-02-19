@@ -2564,8 +2564,12 @@ pub(crate) fn list_connectors(state: &CliState) -> Result<Vec<crate::connectors:
                     .get("distributionChannel")
                     .and_then(Value::as_str)
                     .map(ToString::to_string),
-                branding: app.get("branding").cloned(),
-                app_metadata: app.get("appMetadata").cloned(),
+                branding: app
+                    .get("branding")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
+                app_metadata: app
+                    .get("appMetadata")
+                    .and_then(|value| serde_json::from_value(value.clone()).ok()),
                 labels: app
                     .get("labels")
                     .and_then(|labels| serde_json::from_value(labels.clone()).ok()),
