@@ -90,6 +90,8 @@ enum DaemonSubcommand {
     Up(DaemonUpArgs),
     /// Stop the background daemon.
     Down,
+    /// Restart the background daemon.
+    Restart(DaemonUpArgs),
     /// Show daemon process and health status.
     Status,
     /// Show daemon logs (follows by default).

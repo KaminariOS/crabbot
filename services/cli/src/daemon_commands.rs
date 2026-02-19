@@ -20,6 +20,7 @@ pub(super) fn run_daemon(command: DaemonCommand, state_path: &Path) -> Result<St
     match command.command {
         DaemonSubcommand::Up(args) => daemon_up(state_path, &mut state, args),
         DaemonSubcommand::Down => daemon_down(state_path, &state),
+        DaemonSubcommand::Restart(args) => daemon_restart(state_path, &mut state, args),
         DaemonSubcommand::Status => daemon_status(state_path, &state),
         DaemonSubcommand::Logs(args) => daemon_logs(state_path, args),
     }
@@ -154,6 +155,12 @@ fn daemon_down(state_path: &Path, state: &CliState) -> Result<String> {
     }
 
     Ok("daemon is not running".to_string())
+}
+
+fn daemon_restart(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -> Result<String> {
+    let stop_output = daemon_down(state_path, state)?;
+    let start_output = daemon_up(state_path, state, args)?;
+    Ok(format!("{stop_output}\n{start_output}"))
 }
 
 fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
