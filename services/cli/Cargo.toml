@@ -12,6 +12,7 @@ crabbot_tui = { path = "../../tui" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 ratatui = "0.29"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+qrcode = "0.14"
 serde.workspace = true
 serde_json = { workspace = true, features = ["preserve_order"] }
 supports-color = "3"

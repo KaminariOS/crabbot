@@ -8,42 +8,16 @@ use clap::Parser;
 use clap::Subcommand;
 use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
-use crabbot_protocol::DaemonRpcNotification;
-use crabbot_protocol::DaemonRpcRequest;
 use crabbot_protocol::DaemonRpcRequestResponse;
 use crabbot_protocol::DaemonRpcRespondRequest;
-use crabbot_protocol::DaemonRpcServerRequest;
 use crabbot_protocol::DaemonRpcStreamEnvelope;
-use crabbot_protocol::DaemonRpcStreamEvent;
 use crabbot_protocol::DaemonSessionStatusResponse;
 use crabbot_protocol::DaemonStartSessionRequest;
 use crabbot_protocol::DaemonStreamEnvelope;
 use crabbot_protocol::DaemonStreamEvent;
 use crabbot_protocol::HealthResponse;
-use crossterm::event::DisableBracketedPaste;
-use crossterm::event::EnableBracketedPaste;
-use crossterm::event::Event;
-use crossterm::event::KeyCode;
-use crossterm::event::KeyEventKind;
-use crossterm::event::KeyModifiers;
-use crossterm::event::{self};
-use crossterm::execute;
-use crossterm::terminal::EnterAlternateScreen;
-use crossterm::terminal::LeaveAlternateScreen;
-use crossterm::terminal::disable_raw_mode;
-use crossterm::terminal::enable_raw_mode;
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use ratatui::layout::Constraint;
-use ratatui::layout::Direction;
-use ratatui::layout::Layout;
-use ratatui::style::Color;
-use ratatui::style::Style;
-use ratatui::style::Stylize;
-use ratatui::text::Line;
-use ratatui::text::Span;
-use ratatui::widgets::Paragraph;
-use ratatui::widgets::Wrap;
+use qrcode::QrCode;
+use qrcode::render::unicode;
 use reqwest::StatusCode;
 use reqwest::blocking::Client;
 use reqwest::blocking::Response;
@@ -52,7 +26,6 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
-use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::fs::OpenOptions;
@@ -70,7 +43,6 @@ use std::process::Command;
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
-use std::time::Instant;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
@@ -658,16 +630,19 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
         state.config.auth_token.as_deref(),
     ) {
         return Ok(format!(
-            "daemon is already healthy at {}",
-            state.config.daemon_endpoint
+            "daemon is already healthy at {}\n\n{}",
+            state.config.daemon_endpoint,
+            format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
         ));
     }
 
     if let Some(existing) = load_daemon_process_state(&pid_path)? {
         if process_exists(existing.pid) {
             return Ok(format!(
-                "daemon is already running (pid {}) at {}",
-                existing.pid, existing.endpoint
+                "daemon is already running (pid {}) at {}\n\n{}",
+                existing.pid,
+                existing.endpoint,
+                format_daemon_websocket_qr_output(&existing.endpoint)
             ));
         }
         clear_daemon_process_state(&pid_path)?;
@@ -712,9 +687,10 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
             state.config.auth_token.as_deref(),
         ) {
             return Ok(format!(
-                "daemon started (pid {pid}) at {} (log: {})",
+                "daemon started (pid {pid}) at {} (log: {})\n\n{}",
                 state.config.daemon_endpoint,
-                log_path.display()
+                log_path.display(),
+                format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
             ));
         }
         if !process_exists(pid) {
@@ -728,9 +704,10 @@ fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
     }
 
     Ok(format!(
-        "daemon started (pid {pid}) but health check timed out for {}; log: {}",
+        "daemon started (pid {pid}) but health check timed out for {}; log: {}\n\n{}",
         state.config.daemon_endpoint,
-        log_path.display()
+        log_path.display(),
+        format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
     ))
 }
 
@@ -791,7 +768,7 @@ fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
     if let Some(process) = saved {
         let running = process_exists(process.pid);
         return Ok(format!(
-            "daemon: {}\nendpoint: {}\npid: {}\nhealth: {}",
+            "daemon: {}\nendpoint: {}\npid: {}\nhealth: {}\n\n{}",
             if running {
                 "up"
             } else {
@@ -799,7 +776,8 @@ fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
             },
             process.endpoint,
             process.pid,
-            if healthy { "ok" } else { "unhealthy" }
+            if healthy { "ok" } else { "unhealthy" },
+            format_daemon_websocket_qr_output(&process.endpoint)
         ));
     }
 
@@ -809,15 +787,44 @@ fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "n/a".to_string());
         return Ok(format!(
-            "daemon: up (unmanaged)\nendpoint: {}\npid: {}\nhealth: ok",
-            state.config.daemon_endpoint, pid_display
+            "daemon: up (unmanaged)\nendpoint: {}\npid: {}\nhealth: ok\n\n{}",
+            state.config.daemon_endpoint,
+            pid_display,
+            format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
         ));
     }
 
     Ok(format!(
-        "daemon: {}\nendpoint: {}\npid: n/a\nhealth: {}",
-        "down", state.config.daemon_endpoint, "unhealthy"
+        "daemon: {}\nendpoint: {}\npid: n/a\nhealth: {}\n\n{}",
+        "down",
+        state.config.daemon_endpoint,
+        "unhealthy",
+        format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
     ))
+}
+
+fn websocket_url_for_daemon_endpoint(endpoint: &str) -> String {
+    let trimmed = endpoint.trim();
+    if let Some(rest) = trimmed.strip_prefix("http://") {
+        return format!("ws://{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("https://") {
+        return format!("wss://{rest}");
+    }
+    trimmed.to_string()
+}
+
+fn render_qr_code(text: &str) -> String {
+    match QrCode::new(text.as_bytes()) {
+        Ok(code) => code.render::<unicode::Dense1x2>().quiet_zone(true).build(),
+        Err(error) => format!("(qr unavailable: {error})"),
+    }
+}
+
+fn format_daemon_websocket_qr_output(endpoint: &str) -> String {
+    let websocket_url = websocket_url_for_daemon_endpoint(endpoint);
+    let qr = render_qr_code(&websocket_url);
+    format!("websocket_url: {websocket_url}\nqr:\n{qr}")
 }
 
 fn daemon_logs(state_path: &Path, args: DaemonLogsArgs) -> Result<String> {
@@ -3340,6 +3347,35 @@ mod tests {
             "[session interrupted] resume with: crabbot codex resume --session-id sess_recover"
         ));
         assert!(output.contains("[session resumed] stream is active again"));
+    }
+
+    #[test]
+    fn websocket_url_for_daemon_endpoint_maps_http_schemes() {
+        assert_eq!(
+            websocket_url_for_daemon_endpoint("http://127.0.0.1:8765"),
+            "ws://127.0.0.1:8765"
+        );
+        assert_eq!(
+            websocket_url_for_daemon_endpoint("https://daemon.crabbot.local"),
+            "wss://daemon.crabbot.local"
+        );
+        assert_eq!(
+            websocket_url_for_daemon_endpoint("ws://127.0.0.1:8765"),
+            "ws://127.0.0.1:8765"
+        );
+        assert_eq!(
+            websocket_url_for_daemon_endpoint("wss://daemon.crabbot.local"),
+            "wss://daemon.crabbot.local"
+        );
+    }
+
+    #[test]
+    fn format_daemon_websocket_qr_output_includes_url_and_qr_body() {
+        let output = format_daemon_websocket_qr_output("ws://127.0.0.1:8765");
+        assert!(output.contains("websocket_url: ws://127.0.0.1:8765"));
+        assert!(output.contains("qr:"));
+        assert!(!output.contains("(qr unavailable:"));
+        assert!(output.lines().count() > 3);
     }
 
     #[test]
