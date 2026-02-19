@@ -55,8 +55,15 @@ use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
+use std::fs::OpenOptions;
 use std::io::IsTerminal;
+use std::io::Read;
+use std::io::Seek;
+use std::io::SeekFrom;
+use std::io::Write;
 use std::io::{self};
+use std::net::TcpStream;
+use std::net::ToSocketAddrs;
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
@@ -99,9 +106,39 @@ enum TopLevelCommand {
     Resume(ResumeCommand),
     /// Fork a previous interactive session (picker by default; use --last to fork the most recent).
     Fork(ForkCommand),
+    /// Manage the local Codex app-server daemon.
+    Daemon(DaemonCommand),
     /// Legacy compatibility subcommand.
     #[command(hide = true)]
     Codex(CodexCommand),
+}
+
+#[derive(Debug, Args)]
+struct DaemonCommand {
+    #[command(subcommand)]
+    command: DaemonSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum DaemonSubcommand {
+    /// Start `codex app-server` in the background.
+    Up,
+    /// Stop the background daemon.
+    Down,
+    /// Show daemon process and health status.
+    Status,
+    /// Show daemon logs (follows by default).
+    Logs(DaemonLogsArgs),
+}
+
+#[derive(Debug, Args)]
+struct DaemonLogsArgs {
+    /// Number of lines to show before following.
+    #[arg(long, default_value_t = 200)]
+    tail: usize,
+    /// Print and exit without following.
+    #[arg(long, default_value_t = false)]
+    no_follow: bool,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -558,6 +595,9 @@ fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
             should_persist = true;
             run_fork_command(command, &mut state)
         }
+        Some(TopLevelCommand::Daemon(command)) => {
+            return run_daemon(command, state_path);
+        }
         Some(TopLevelCommand::Codex(command)) => {
             return run_codex(command, state_path);
         }
@@ -590,6 +630,359 @@ fn detect_codex_version() -> Option<String> {
         return Some(stripped.to_string());
     }
     Some(line.to_string())
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonProcessState {
+    pid: u32,
+    endpoint: String,
+    started_at_unix_ms: u64,
+}
+
+fn run_daemon(command: DaemonCommand, state_path: &Path) -> Result<String> {
+    let state = load_state(state_path)?;
+    match command.command {
+        DaemonSubcommand::Up => daemon_up(state_path, &state),
+        DaemonSubcommand::Down => daemon_down(state_path, &state),
+        DaemonSubcommand::Status => daemon_status(state_path, &state),
+        DaemonSubcommand::Logs(args) => daemon_logs(state_path, args),
+    }
+}
+
+fn daemon_up(state_path: &Path, state: &CliState) -> Result<String> {
+    let pid_path = daemon_pid_path(state_path)?;
+    let log_path = daemon_log_path(state_path)?;
+
+    if daemon_is_healthy(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+    ) {
+        return Ok(format!(
+            "daemon is already healthy at {}",
+            state.config.daemon_endpoint
+        ));
+    }
+
+    if let Some(existing) = load_daemon_process_state(&pid_path)? {
+        if process_exists(existing.pid) {
+            return Ok(format!(
+                "daemon is already running (pid {}) at {}",
+                existing.pid, existing.endpoint
+            ));
+        }
+        clear_daemon_process_state(&pid_path)?;
+    }
+
+    if let Some(parent) = log_path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create daemon state dir {}", parent.display()))?;
+    }
+    let log_file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("open daemon log {}", log_path.display()))?;
+    let stderr_log = log_file
+        .try_clone()
+        .with_context(|| format!("clone daemon log handle {}", log_path.display()))?;
+
+    let child = Command::new("codex")
+        .arg("app-server")
+        .arg("--listen")
+        .arg(&state.config.daemon_endpoint)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log_file))
+        .stderr(Stdio::from(stderr_log))
+        .spawn()
+        .context("start codex app-server")?;
+    let pid = child.id();
+
+    save_daemon_process_state(
+        &pid_path,
+        &DaemonProcessState {
+            pid,
+            endpoint: state.config.daemon_endpoint.clone(),
+            started_at_unix_ms: now_unix_ms(),
+        },
+    )?;
+
+    for _ in 0..30 {
+        if daemon_is_healthy(
+            &state.config.daemon_endpoint,
+            state.config.auth_token.as_deref(),
+        ) {
+            return Ok(format!(
+                "daemon started (pid {pid}) at {} (log: {})",
+                state.config.daemon_endpoint,
+                log_path.display()
+            ));
+        }
+        if !process_exists(pid) {
+            clear_daemon_process_state(&pid_path)?;
+            bail!(
+                "daemon exited before becoming healthy; inspect {}",
+                log_path.display()
+            );
+        }
+        thread::sleep(Duration::from_millis(200));
+    }
+
+    Ok(format!(
+        "daemon started (pid {pid}) but health check timed out for {}; log: {}",
+        state.config.daemon_endpoint,
+        log_path.display()
+    ))
+}
+
+fn daemon_down(state_path: &Path, state: &CliState) -> Result<String> {
+    let pid_path = daemon_pid_path(state_path)?;
+    let saved = load_daemon_process_state(&pid_path)?;
+
+    if let Some(process) = saved {
+        if process_exists(process.pid) {
+            terminate_process(process.pid, "TERM")?;
+            for _ in 0..20 {
+                if !process_exists(process.pid) {
+                    clear_daemon_process_state(&pid_path)?;
+                    return Ok(format!("daemon stopped (pid {})", process.pid));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            terminate_process(process.pid, "KILL")?;
+            clear_daemon_process_state(&pid_path)?;
+            return Ok(format!("daemon force-stopped (pid {})", process.pid));
+        }
+        clear_daemon_process_state(&pid_path)?;
+        return Ok("daemon was not running (stale pid state removed)".to_string());
+    }
+
+    if daemon_is_healthy(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+    ) {
+        if let Some(pid) = find_unmanaged_daemon_pid(&state.config.daemon_endpoint)? {
+            terminate_process(pid, "TERM")?;
+            for _ in 0..20 {
+                if !process_exists(pid) {
+                    return Ok(format!("daemon stopped (unmanaged pid {pid})"));
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+            terminate_process(pid, "KILL")?;
+            return Ok(format!("daemon force-stopped (unmanaged pid {pid})"));
+        }
+        return Ok(format!(
+            "daemon is healthy at {} but pid auto-detection failed",
+            state.config.daemon_endpoint
+        ));
+    }
+
+    Ok("daemon is not running".to_string())
+}
+
+fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
+    let pid_path = daemon_pid_path(state_path)?;
+    let saved = load_daemon_process_state(&pid_path)?;
+    let healthy = daemon_is_healthy(
+        &state.config.daemon_endpoint,
+        state.config.auth_token.as_deref(),
+    );
+
+    if let Some(process) = saved {
+        let running = process_exists(process.pid);
+        return Ok(format!(
+            "daemon: {}\nendpoint: {}\npid: {}\nhealth: {}",
+            if running {
+                "up"
+            } else {
+                "down (stale pid state)"
+            },
+            process.endpoint,
+            process.pid,
+            if healthy { "ok" } else { "unhealthy" }
+        ));
+    }
+
+    if healthy {
+        let unmanaged_pid = find_unmanaged_daemon_pid(&state.config.daemon_endpoint)?;
+        let pid_display = unmanaged_pid
+            .map(|pid| pid.to_string())
+            .unwrap_or_else(|| "n/a".to_string());
+        return Ok(format!(
+            "daemon: up (unmanaged)\nendpoint: {}\npid: {}\nhealth: ok",
+            state.config.daemon_endpoint, pid_display
+        ));
+    }
+
+    Ok(format!(
+        "daemon: {}\nendpoint: {}\npid: n/a\nhealth: {}",
+        "down", state.config.daemon_endpoint, "unhealthy"
+    ))
+}
+
+fn daemon_logs(state_path: &Path, args: DaemonLogsArgs) -> Result<String> {
+    let log_path = daemon_log_path(state_path)?;
+    if !log_path.exists() {
+        return Ok(format!("daemon log not found at {}", log_path.display()));
+    }
+
+    let initial = read_log_tail(&log_path, args.tail)?;
+    if !args.no_follow {
+        if !initial.is_empty() {
+            print!("{initial}");
+            io::stdout().flush().context("flush daemon log output")?;
+        }
+        follow_log_file(&log_path)?;
+        return Ok(String::new());
+    }
+
+    Ok(initial)
+}
+
+fn read_log_tail(path: &Path, tail_lines: usize) -> Result<String> {
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    if tail_lines == 0 {
+        return Ok(String::new());
+    }
+    let mut lines: Vec<&str> = raw.lines().collect();
+    if lines.len() > tail_lines {
+        lines = lines.split_off(lines.len() - tail_lines);
+    }
+    let mut out = lines.join("\n");
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    Ok(out)
+}
+
+fn follow_log_file(path: &Path) -> Result<()> {
+    let mut position = fs::metadata(path)
+        .with_context(|| format!("read metadata {}", path.display()))?
+        .len();
+
+    loop {
+        thread::sleep(Duration::from_millis(250));
+        let length = fs::metadata(path)
+            .with_context(|| format!("read metadata {}", path.display()))?
+            .len();
+
+        if length < position {
+            position = 0;
+        }
+        if length == position {
+            continue;
+        }
+
+        let mut file = fs::File::open(path).with_context(|| format!("open {}", path.display()))?;
+        file.seek(SeekFrom::Start(position))
+            .with_context(|| format!("seek {}", path.display()))?;
+        let mut chunk = String::new();
+        file.read_to_string(&mut chunk)
+            .with_context(|| format!("read {}", path.display()))?;
+        position = length;
+
+        if !chunk.is_empty() {
+            print!("{chunk}");
+            io::stdout().flush().context("flush daemon log output")?;
+        }
+    }
+}
+
+fn daemon_pid_path(state_path: &Path) -> Result<PathBuf> {
+    let dir = state_path.parent().ok_or_else(|| {
+        anyhow!(
+            "cannot resolve daemon state dir from path {}",
+            state_path.display()
+        )
+    })?;
+    Ok(dir.join("daemon-process.json"))
+}
+
+fn daemon_log_path(state_path: &Path) -> Result<PathBuf> {
+    let dir = state_path.parent().ok_or_else(|| {
+        anyhow!(
+            "cannot resolve daemon state dir from path {}",
+            state_path.display()
+        )
+    })?;
+    Ok(dir.join("daemon.log"))
+}
+
+fn load_daemon_process_state(path: &Path) -> Result<Option<DaemonProcessState>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    let state: DaemonProcessState = serde_json::from_str(&raw)
+        .with_context(|| format!("parse daemon process state from {}", path.display()))?;
+    Ok(Some(state))
+}
+
+fn save_daemon_process_state(path: &Path, state: &DaemonProcessState) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("create daemon state dir {}", parent.display()))?;
+    }
+    let payload = serde_json::to_vec_pretty(state).context("serialize daemon process state")?;
+    fs::write(path, payload).with_context(|| format!("write {}", path.display()))?;
+    Ok(())
+}
+
+fn clear_daemon_process_state(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("remove {}", path.display())),
+    }
+}
+
+fn process_exists(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn terminate_process(pid: u32, signal: &str) -> Result<()> {
+    let status = Command::new("kill")
+        .arg(format!("-{signal}"))
+        .arg(pid.to_string())
+        .status()
+        .with_context(|| format!("send SIG{signal} to pid {pid}"))?;
+    if status.success() {
+        return Ok(());
+    }
+    bail!("failed to send SIG{signal} to pid {pid}")
+}
+
+fn find_unmanaged_daemon_pid(endpoint: &str) -> Result<Option<u32>> {
+    let output = Command::new("pgrep")
+        .args(["-af", "codex app-server"])
+        .output()
+        .context("run pgrep for codex app-server")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let pid_raw = parts.next().unwrap_or_default();
+        let cmdline = parts.next().unwrap_or_default();
+        if cmdline.contains("codex app-server")
+            && cmdline.contains("--listen")
+            && cmdline.contains(endpoint)
+            && let Ok(pid) = pid_raw.parse::<u32>()
+        {
+            return Ok(Some(pid));
+        }
+    }
+
+    Ok(None)
 }
 
 fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
@@ -1475,11 +1868,23 @@ fn http_client() -> Result<Client> {
 }
 
 fn endpoint_url(base: &str, path: &str) -> String {
+    let base = http_compatible_base_url(base);
     format!(
         "{}/{}",
         base.trim_end_matches('/'),
         path.trim_start_matches('/')
     )
+}
+
+fn http_compatible_base_url(base: &str) -> String {
+    let trimmed = base.trim();
+    if let Some(rest) = trimmed.strip_prefix("ws://") {
+        return format!("http://{rest}");
+    }
+    if let Some(rest) = trimmed.strip_prefix("wss://") {
+        return format!("https://{rest}");
+    }
+    trimmed.to_string()
 }
 
 fn apply_auth(
@@ -1515,6 +1920,10 @@ fn health_http_client() -> Result<Client> {
 }
 
 fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
+    if endpoint_uses_websocket_transport(daemon_endpoint) {
+        return endpoint_has_open_listener(daemon_endpoint);
+    }
+
     let client = match health_http_client() {
         Ok(client) => client,
         Err(_) => return false,
@@ -1532,6 +1941,44 @@ fn daemon_is_healthy(daemon_endpoint: &str, auth_token: Option<&str>) -> bool {
         .json::<HealthResponse>()
         .map(|health| health.status == "ok")
         .unwrap_or(false)
+}
+
+fn endpoint_uses_websocket_transport(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim().to_ascii_lowercase();
+    endpoint.starts_with("ws://") || endpoint.starts_with("wss://")
+}
+
+fn endpoint_has_open_listener(endpoint: &str) -> bool {
+    let endpoint = endpoint.trim();
+    let without_scheme = endpoint
+        .strip_prefix("ws://")
+        .or_else(|| endpoint.strip_prefix("wss://"))
+        .or_else(|| endpoint.strip_prefix("http://"))
+        .or_else(|| endpoint.strip_prefix("https://"))
+        .unwrap_or(endpoint);
+    let authority = without_scheme.split('/').next().unwrap_or_default().trim();
+    if authority.is_empty() {
+        return false;
+    }
+
+    let host_port = if authority.contains(':') {
+        authority.to_string()
+    } else if endpoint.starts_with("wss://") || endpoint.starts_with("https://") {
+        format!("{authority}:443")
+    } else {
+        format!("{authority}:80")
+    };
+
+    let mut addrs = match host_port.to_socket_addrs() {
+        Ok(addrs) => addrs,
+        Err(_) => return false,
+    };
+    let addr = match addrs.next() {
+        Some(addr) => addr,
+        None => return false,
+    };
+
+    TcpStream::connect_timeout(&addr, Duration::from_millis(250)).is_ok()
 }
 
 fn ensure_daemon_ready(state: &CliState) -> Result<()> {
