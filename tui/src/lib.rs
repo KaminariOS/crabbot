@@ -1369,13 +1369,22 @@ impl ThreadManager {
         path: std::path::PathBuf,
         auth_manager: std::sync::Arc<crate::AuthManager>,
     ) -> Result<NewThread, CodexError> {
-        let Some(thread_id) = extract_thread_id_from_picker_path(&path)
-            .and_then(|raw| ThreadId::from_string(&raw).ok())
-        else {
+        let Some(thread_id) = extract_thread_id_from_picker_path(&path) else {
+            return self.start_thread(config).await;
+        };
+        self.resume_thread(config, thread_id, auth_manager).await
+    }
+
+    pub async fn resume_thread(
+        &self,
+        config: crate::config::Config,
+        thread_id: String,
+        auth_manager: std::sync::Arc<crate::AuthManager>,
+    ) -> Result<NewThread, CodexError> {
+        let Some(thread_id) = ThreadId::from_string(&thread_id).ok() else {
             return self.start_thread(config).await;
         };
         let _ = auth_manager;
-
         let backend = get_shim_backend_config();
         let response = app_server_rpc_request_raw(
             &backend.app_server_endpoint,
@@ -1404,11 +1413,7 @@ impl ThreadManager {
             cwd: config.cwd.clone(),
             reasoning_effort: None,
         };
-        let thread = std::sync::Arc::new(CodexThread::new(
-            thread_id,
-            config_snapshot,
-            Some(path.clone()),
-        ));
+        let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
         if let Ok(mut threads) = self.threads.lock() {
             threads.insert(thread_id, thread.clone());
         }
@@ -1431,9 +1436,21 @@ impl ThreadManager {
                 history_entry_count: 0,
                 initial_messages: None,
                 network_proxy: None,
-                rollout_path: Some(path),
+                rollout_path: None,
             },
         })
+    }
+
+    pub async fn fork_thread_from_id(
+        &self,
+        config: crate::config::Config,
+        source_thread_id: String,
+    ) -> Result<NewThread, CodexError> {
+        let Some(source_thread_id) = ThreadId::from_string(&source_thread_id).ok() else {
+            return self.start_thread(config).await;
+        };
+        self.fork_thread_inner(config, source_thread_id.to_string())
+            .await
     }
 
     pub async fn fork_thread(
@@ -1446,6 +1463,14 @@ impl ThreadManager {
         let Some(source_thread_id) = extract_thread_id_from_picker_path(&path) else {
             return self.start_thread(config).await;
         };
+        self.fork_thread_inner(config, source_thread_id).await
+    }
+
+    async fn fork_thread_inner(
+        &self,
+        config: crate::config::Config,
+        source_thread_id: String,
+    ) -> Result<NewThread, CodexError> {
         let backend = get_shim_backend_config();
         let response = app_server_rpc_request_raw(
             &backend.app_server_endpoint,
@@ -1535,14 +1560,135 @@ impl RolloutRecorder {
     #[allow(clippy::too_many_arguments)]
     pub async fn list_threads(
         _config: &crate::config::Config,
-        _limit: usize,
-        _cursor: Option<&Cursor>,
-        _sort_key: crate::ThreadSortKey,
+        limit: usize,
+        cursor: Option<&Cursor>,
+        sort_key: crate::ThreadSortKey,
         _sources: &[crate::protocol::SessionSource],
         _provider_filter: Option<&[String]>,
         _default_provider: &str,
     ) -> std::io::Result<ThreadsPage> {
-        Ok(ThreadsPage::default())
+        let backend = get_shim_backend_config();
+        let sort_key = match sort_key {
+            crate::ThreadSortKey::CreatedAt => "created_at",
+            crate::ThreadSortKey::UpdatedAt => "updated_at",
+        };
+        let mut params = json!({
+            "sortKey": sort_key,
+            "limit": limit,
+            "archived": false,
+        });
+        if let Some(cursor) = cursor {
+            params["cursor"] = Value::String(cursor.clone());
+        }
+
+        let response = app_server_rpc_request_raw(
+            &backend.app_server_endpoint,
+            backend.auth_token.as_deref(),
+            "thread/list",
+            params,
+        )
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+
+        let rows = response
+            .result
+            .get("data")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        fn normalize_timestamp(value: Option<&Value>) -> Option<String> {
+            match value {
+                Some(Value::String(text)) => Some(text.to_string()),
+                Some(Value::Number(number)) => {
+                    let raw = number.as_i64()?;
+                    // Accept both seconds and milliseconds.
+                    let millis = if raw.abs() >= 1_000_000_000_000 {
+                        raw
+                    } else {
+                        raw.saturating_mul(1000)
+                    };
+                    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+                        .map(|dt| dt.to_rfc3339())
+                }
+                _ => None,
+            }
+        }
+
+        let items = rows
+            .into_iter()
+            .filter_map(|row| {
+                let id = row
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .map(std::borrow::ToOwned::to_owned)?;
+                let preview = row
+                    .get("threadName")
+                    .or_else(|| row.get("preview"))
+                    .or_else(|| row.get("firstUserMessage"))
+                    .and_then(Value::as_str)
+                    .map(std::borrow::ToOwned::to_owned);
+                let path = row
+                    .get("rolloutPath")
+                    .or_else(|| row.get("path"))
+                    .and_then(Value::as_str)
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from(id.clone()));
+                let thread_id = ThreadId::from_string(&id).ok();
+                let created_at = normalize_timestamp(
+                    row.get("createdAt")
+                        .or_else(|| row.get("created_at"))
+                        .or_else(|| row.get("created")),
+                );
+                let updated_at = normalize_timestamp(
+                    row.get("updatedAt")
+                        .or_else(|| row.get("updated_at"))
+                        .or_else(|| row.get("updated")),
+                );
+                let cwd = row.get("cwd").and_then(Value::as_str).map(PathBuf::from);
+                let git_branch = row
+                    .get("gitBranch")
+                    .or_else(|| row.get("git_branch"))
+                    .or_else(|| row.get("gitInfo").and_then(|info| info.get("branch")))
+                    .or_else(|| row.get("git_info").and_then(|info| info.get("branch")))
+                    .and_then(Value::as_str)
+                    .map(std::borrow::ToOwned::to_owned);
+                Some(ThreadItem {
+                    path,
+                    thread_id,
+                    first_user_message: preview,
+                    created_at,
+                    updated_at,
+                    cwd,
+                    git_branch,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let next_cursor = response
+            .result
+            .get("nextCursor")
+            .or_else(|| response.result.get("next_cursor"))
+            .and_then(Value::as_str)
+            .map(std::borrow::ToOwned::to_owned);
+        let num_scanned_files = response
+            .result
+            .get("numScannedFiles")
+            .or_else(|| response.result.get("num_scanned_files"))
+            .and_then(Value::as_u64)
+            .map(|value| value as usize)
+            .unwrap_or(items.len());
+        let reached_scan_cap = response
+            .result
+            .get("reachedScanCap")
+            .or_else(|| response.result.get("reached_scan_cap"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+
+        Ok(ThreadsPage {
+            items,
+            next_cursor,
+            num_scanned_files,
+            reached_scan_cap,
+        })
     }
 }
 
@@ -3014,7 +3160,7 @@ pub enum ResolveCwdOutcome {
 pub async fn resolve_cwd_for_resume_or_fork(
     _tui: &mut crate::tui::Tui,
     current: &std::path::Path,
-    _thread_path: &std::path::Path,
+    _thread_id: &str,
     _action: crate::cwd_prompt::CwdPromptAction,
     _allow_current: bool,
 ) -> std::io::Result<ResolveCwdOutcome> {
@@ -3162,11 +3308,8 @@ pub async fn run_startup_picker(
     let _ = crate::tui::restore();
 
     match selection {
-        resume_picker::SessionSelection::Resume(thread_path)
-        | resume_picker::SessionSelection::Fork(thread_path) => {
-            Ok(extract_thread_id_from_picker_path(&thread_path)
-                .or_else(|| Some(thread_path.to_string_lossy().to_string())))
-        }
+        resume_picker::SessionSelection::Resume(thread_id)
+        | resume_picker::SessionSelection::Fork(thread_id) => Ok(Some(thread_id)),
         resume_picker::SessionSelection::StartFresh | resume_picker::SessionSelection::Exit => {
             Ok(None)
         }
@@ -3229,9 +3372,7 @@ async fn resolve_session_selection_from_args(
         if trimmed.is_empty() {
             bail!("thread id cannot be empty");
         }
-        return Ok(resume_picker::SessionSelection::Resume(PathBuf::from(
-            trimmed,
-        )));
+        return Ok(resume_picker::SessionSelection::Resume(trimmed.to_string()));
     }
 
     let Some(mode) = args.startup_picker.as_ref() else {

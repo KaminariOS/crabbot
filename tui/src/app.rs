@@ -1115,14 +1115,11 @@ impl App {
                 };
                 ChatWidget::new(init, thread_manager.clone())
             }
-            SessionSelection::Resume(path) => {
+            SessionSelection::Resume(thread_id) => {
                 let resumed = thread_manager
-                    .resume_thread_from_rollout(config.clone(), path.clone(), auth_manager.clone())
+                    .resume_thread(config.clone(), thread_id.clone(), auth_manager.clone())
                     .await
-                    .wrap_err_with(|| {
-                        let path_display = path.display();
-                        format!("Failed to resume session from {path_display}")
-                    })?;
+                    .wrap_err_with(|| format!("Failed to resume session {thread_id}"))?;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -1145,15 +1142,12 @@ impl App {
                 };
                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
             }
-            SessionSelection::Fork(path) => {
+            SessionSelection::Fork(thread_id) => {
                 otel_manager.counter("codex.thread.fork", 1, &[("source", "cli_subcommand")]);
                 let forked = thread_manager
-                    .fork_thread(usize::MAX, config.clone(), path.clone(), false)
+                    .fork_thread_from_id(config.clone(), thread_id.clone())
                     .await
-                    .wrap_err_with(|| {
-                        let path_display = path.display();
-                        format!("Failed to fork session from {path_display}")
-                    })?;
+                    .wrap_err_with(|| format!("Failed to fork session {thread_id}"))?;
                 let init = crate::chatwidget::ChatWidgetInit {
                     config: config.clone(),
                     frame_requester: tui.frame_requester(),
@@ -1441,12 +1435,12 @@ impl App {
             }
             AppEvent::OpenResumePicker => {
                 match crate::resume_picker::run_resume_picker(tui, &self.config, false).await? {
-                    SessionSelection::Resume(path) => {
+                    SessionSelection::Resume(thread_id) => {
                         let current_cwd = self.config.cwd.clone();
                         let resume_cwd = match crate::resolve_cwd_for_resume_or_fork(
                             tui,
                             &current_cwd,
-                            &path,
+                            &thread_id,
                             CwdPromptAction::Resume,
                             true,
                         )
@@ -1480,9 +1474,9 @@ impl App {
                         );
                         match self
                             .server
-                            .resume_thread_from_rollout(
+                            .resume_thread(
                                 resume_config.clone(),
-                                path.clone(),
+                                thread_id.clone(),
                                 self.auth_manager.clone(),
                             )
                             .await
@@ -1516,9 +1510,8 @@ impl App {
                                 }
                             }
                             Err(err) => {
-                                let path_display = path.display();
                                 self.chat_widget.add_error_message(format!(
-                                    "Failed to resume session from {path_display}: {err}"
+                                    "Failed to resume session {thread_id}: {err}"
                                 ));
                             }
                         }
@@ -2958,14 +2951,14 @@ mod tests {
             true
         );
         assert_eq!(
-            App::should_wait_for_initial_session(&SessionSelection::Resume(PathBuf::from(
-                "/tmp/restore"
+            App::should_wait_for_initial_session(&SessionSelection::Resume(String::from(
+                "thread-restore"
             ))),
             false
         );
         assert_eq!(
-            App::should_wait_for_initial_session(&SessionSelection::Fork(PathBuf::from(
-                "/tmp/fork"
+            App::should_wait_for_initial_session(&SessionSelection::Fork(String::from(
+                "thread-fork"
             ))),
             false
         );
@@ -3002,14 +2995,14 @@ mod tests {
     #[test]
     fn startup_waiting_gate_not_applied_for_resume_or_fork_session_selection() {
         let wait_for_resume = App::should_wait_for_initial_session(&SessionSelection::Resume(
-            PathBuf::from("/tmp/restore"),
+            String::from("thread-restore"),
         ));
         assert_eq!(
             App::should_handle_active_thread_events(wait_for_resume, true),
             true
         );
         let wait_for_fork = App::should_wait_for_initial_session(&SessionSelection::Fork(
-            PathBuf::from("/tmp/fork"),
+            String::from("thread-fork"),
         ));
         assert_eq!(
             App::should_handle_active_thread_events(wait_for_fork, true),

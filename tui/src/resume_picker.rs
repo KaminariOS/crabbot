@@ -42,8 +42,8 @@ const LOAD_NEAR_THRESHOLD: usize = 5;
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
-    Resume(PathBuf),
-    Fork(PathBuf),
+    Resume(String),
+    Fork(String),
     Exit,
 }
 
@@ -68,10 +68,10 @@ impl SessionPickerAction {
         }
     }
 
-    fn selection(self, path: PathBuf) -> SessionSelection {
+    fn selection(self, thread_id: String) -> SessionSelection {
         match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(path),
-            SessionPickerAction::Fork => SessionSelection::Fork(path),
+            SessionPickerAction::Resume => SessionSelection::Resume(thread_id),
+            SessionPickerAction::Fork => SessionSelection::Fork(thread_id),
         }
     }
 }
@@ -401,7 +401,12 @@ impl PickerState {
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    return Ok(Some(self.action.selection(row.path.clone())));
+                    let thread_id = row
+                        .thread_id
+                        .map(|id| id.to_string())
+                        .or_else(|| extract_thread_id_from_path(&row.path))
+                        .unwrap_or_else(|| row.path.to_string_lossy().to_string());
+                    return Ok(Some(self.action.selection(thread_id)));
                 }
             }
             KeyCode::Up => {
@@ -622,7 +627,7 @@ impl PickerState {
             return true;
         };
         let Some(row_cwd) = row.cwd.as_ref() else {
-            return false;
+            return true;
         };
         paths_match(row_cwd, filter_cwd)
     }
@@ -837,6 +842,26 @@ fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
+}
+
+fn extract_thread_id_from_path(path: &Path) -> Option<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
+        candidates.push(stem.to_string());
+    }
+    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+        candidates.push(name.to_string());
+    }
+    for component in path.components() {
+        if let std::path::Component::Normal(value) = component
+            && let Some(text) = value.to_str()
+        {
+            candidates.push(text.to_string());
+        }
+    }
+    candidates
+        .into_iter()
+        .find(|value| ThreadId::from_string(value).is_ok())
 }
 
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
