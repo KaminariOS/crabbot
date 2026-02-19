@@ -392,7 +392,7 @@ async fn main() {
 
 async fn run() -> anyhow::Result<()> {
     let bind = env::var("CRABBOT_DAEMON_BIND").unwrap_or_else(|_| DEFAULT_DAEMON_BIND.to_string());
-    let state = AppState::from_env()?;
+    let state = AppState::from_env(&bind)?;
     let addr: SocketAddr = bind
         .parse()
         .with_context(|| format!("invalid CRABBOT_DAEMON_BIND address: {bind}"))?;
@@ -432,8 +432,8 @@ fn router_with_state(state: AppState) -> Router {
 }
 
 impl AppState {
-    fn from_env() -> anyhow::Result<Self> {
-        let ws_relay = WebSocketRelayState::from_env()?;
+    fn from_env(daemon_bind: &str) -> anyhow::Result<Self> {
+        let ws_relay = WebSocketRelayState::from_env(daemon_bind)?;
         let codex_client =
             CodexAppServerClient::new(&ws_relay.upstream_endpoint).with_context(|| {
                 format!(
@@ -473,9 +473,12 @@ impl AppState {
 }
 
 impl WebSocketRelayState {
-    fn from_env() -> anyhow::Result<Self> {
-        let upstream_endpoint = env::var("CRABBOT_CODEX_APP_SERVER_ENDPOINT")
-            .unwrap_or_else(|_| DEFAULT_CODEX_APP_SERVER_ENDPOINT.to_string());
+    fn from_env(daemon_bind: &str) -> anyhow::Result<Self> {
+        let upstream_endpoint = match env::var("CRABBOT_CODEX_APP_SERVER_ENDPOINT") {
+            Ok(value) => value,
+            Err(_) => derive_upstream_endpoint_from_daemon_bind(daemon_bind)?,
+        };
+        ensure_distinct_daemon_and_upstream(daemon_bind, &upstream_endpoint)?;
         let spawn_upstream = env_flag("CRABBOT_DAEMON_SPAWN_CODEX_APP_SERVER", true);
         let spawned_app_server = if spawn_upstream {
             let codex_bin =
@@ -503,6 +506,41 @@ impl WebSocketRelayState {
             _spawned_app_server: spawned_app_server,
         })
     }
+}
+
+fn derive_upstream_endpoint_from_daemon_bind(daemon_bind: &str) -> anyhow::Result<String> {
+    let mut daemon_addr = daemon_bind
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid CRABBOT_DAEMON_BIND address: {daemon_bind}"))?;
+    let daemon_port = daemon_addr.port();
+    let upstream_port = daemon_port.checked_add(1).with_context(|| {
+        format!("cannot derive upstream endpoint from daemon port {daemon_port}")
+    })?;
+    daemon_addr.set_port(upstream_port);
+    Ok(format!("ws://{daemon_addr}"))
+}
+
+fn ensure_distinct_daemon_and_upstream(
+    daemon_bind: &str,
+    upstream_endpoint: &str,
+) -> anyhow::Result<()> {
+    let daemon_addr = daemon_bind
+        .parse::<SocketAddr>()
+        .with_context(|| format!("invalid CRABBOT_DAEMON_BIND address: {daemon_bind}"))?;
+    if let Some(upstream_addr) = parse_ws_socket_addr(upstream_endpoint)
+        && daemon_addr == upstream_addr
+    {
+        anyhow::bail!(
+            "invalid websocket relay configuration: daemon bind `{daemon_bind}` and upstream `{upstream_endpoint}` resolve to the same socket"
+        );
+    }
+    Ok(())
+}
+
+fn parse_ws_socket_addr(endpoint: &str) -> Option<SocketAddr> {
+    endpoint
+        .strip_prefix("ws://")
+        .and_then(|rest| rest.parse::<SocketAddr>().ok())
 }
 
 fn env_flag(name: &str, default: bool) -> bool {
@@ -1801,5 +1839,28 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = read_json(response).await;
         assert_eq!(value["service"], json!("crabbot_daemon"));
+    }
+
+    #[test]
+    fn derive_upstream_endpoint_uses_daemon_port_plus_one() {
+        let endpoint =
+            derive_upstream_endpoint_from_daemon_bind("127.0.0.1:8788").expect("derive endpoint");
+        assert_eq!(endpoint, "ws://127.0.0.1:8789");
+    }
+
+    #[test]
+    fn distinct_daemon_and_upstream_rejects_same_socket() {
+        let error = ensure_distinct_daemon_and_upstream("127.0.0.1:8765", "ws://127.0.0.1:8765")
+            .expect_err("same socket should be rejected");
+        assert!(
+            error.to_string().contains("resolve to the same socket"),
+            "expected same-socket error, got: {error:#}"
+        );
+    }
+
+    #[test]
+    fn distinct_daemon_and_upstream_allows_different_socket() {
+        ensure_distinct_daemon_and_upstream("127.0.0.1:8765", "ws://127.0.0.1:8766")
+            .expect("different sockets should be allowed");
     }
 }
