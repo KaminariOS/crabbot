@@ -599,19 +599,7 @@ fn run_codex(command: CodexCommand, state_path: &Path) -> Result<String> {
 fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
     let overrides = build_runtime_overrides(&args)?;
-    let thread_id = if let Some(last_thread_id) = state.last_thread_id.clone() {
-        match resolve_thread_resume(
-            state,
-            &last_thread_id,
-            &overrides,
-            ThreadResolutionMode::DefaultResume,
-        ) {
-            Ok(thread_id) => Ok(thread_id),
-            Err(_) => start_thread_with_overrides(state, &overrides),
-        }
-    } else {
-        start_thread_with_overrides(state, &overrides)
-    }?;
+    let thread_id = start_thread_with_overrides(state, &overrides)?;
     maybe_send_initial_prompt(state, &thread_id, &args)?;
     handle_tui_with_crate(
         TuiArgs {
@@ -650,8 +638,7 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
     } else {
         resolve_source_thread_for_resume_or_fork(state, command.session_id, true, command.all)?
     };
-    let thread_id =
-        resolve_thread_resume(state, &target, &overrides, ThreadResolutionMode::Resume)?;
+    let thread_id = resolve_thread_resume(state, &target, &overrides)?;
     maybe_send_initial_prompt(state, &thread_id, &command.interactive)?;
     handle_tui_with_crate(
         TuiArgs {
@@ -742,12 +729,6 @@ struct RuntimeOverrides {
     approval_policy: Option<String>,
     sandbox: Option<String>,
     config: Value,
-}
-
-#[derive(Debug, Clone, Copy)]
-enum ThreadResolutionMode {
-    DefaultResume,
-    Resume,
 }
 
 fn build_runtime_overrides(args: &InteractiveArgs) -> Result<RuntimeOverrides> {
@@ -906,7 +887,6 @@ fn resolve_thread_resume(
     state: &mut CliState,
     thread_id: &str,
     overrides: &RuntimeOverrides,
-    mode: ThreadResolutionMode,
 ) -> Result<String> {
     let mut params = thread_params_for_overrides(overrides);
     params["threadId"] = Value::String(thread_id.to_string());
@@ -919,9 +899,6 @@ fn resolve_thread_resume(
     let resolved = extract_thread_id_from_rpc_result(&response.result)
         .unwrap_or_else(|| thread_id.to_string());
     state.last_thread_id = Some(resolved.clone());
-    if matches!(mode, ThreadResolutionMode::Resume) {
-        return Ok(resolved);
-    }
     Ok(resolved)
 }
 
