@@ -12,9 +12,10 @@ path = "src/lib.rs"
 [dependencies]
 anyhow.workspace = true
 base64 = "0.22"
-codex-utils-fuzzy-match = { git = "https://github.com/openai/codex.git", rev = "e7b6f38b5", package = "codex-utils-fuzzy-match" }
-codex-protocol = { git = "https://github.com/openai/codex.git", rev = "e7b6f38b5", package = "codex-protocol" }
-codex-shell-command = { git = "https://github.com/openai/codex.git", rev = "e7b6f38b5", package = "codex-shell-command" }
+codex-utils-fuzzy-match = { git = "https://github.com/openai/codex.git", rev = "b3202cbd5", package = "codex-utils-fuzzy-match" }
+codex-protocol = { git = "https://github.com/openai/codex.git", rev = "b3202cbd5", package = "codex-protocol" }
+codex-shell-command = { git = "https://github.com/openai/codex.git", rev = "b3202cbd5", package = "codex-shell-command" }
+codex-file-search = { git = "https://github.com/openai/codex.git", rev = "b3202cbd5", package = "codex-file-search" }
 crabbot_protocol = { path = "../crates/protocol" }
 crossterm = { workspace = true, features = ["bracketed-paste", "event-stream"] }
 dunce = "1.0.5"

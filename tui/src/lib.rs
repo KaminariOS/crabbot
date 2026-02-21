@@ -65,7 +65,6 @@ extern crate self as codex_backend_client;
 extern crate self as codex_chatgpt;
 extern crate self as codex_core;
 extern crate self as codex_feedback;
-extern crate self as codex_file_search;
 extern crate self as codex_otel;
 extern crate self as codex_utils_absolute_path;
 extern crate self as codex_utils_approval_presets;
@@ -890,6 +889,20 @@ impl CodexThread {
         }
     }
 
+    fn push_local_event(
+        &self,
+        event_id: String,
+        msg: crate::protocol::EventMsg,
+    ) -> Result<(), CodexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+        state
+            .pending_events
+            .push_back(crate::protocol::Event { id: event_id, msg });
+        Ok(())
+    }
     pub async fn submit(&self, op: crate::protocol::Op) -> Result<String, CodexError> {
         let submission_id = {
             let mut state = self
@@ -947,6 +960,152 @@ impl CodexThread {
                     }
                 })?;
             }
+            crate::protocol::Op::RunUserShellCommand { command } => {
+                let call_id = format!("user-shell-{submission_id}");
+                let standalone_turn_id = current_turn_id
+                    .is_none()
+                    .then(|| format!("user-shell-turn-{submission_id}"));
+                let turn_id = current_turn_id
+                    .clone()
+                    .unwrap_or_else(|| standalone_turn_id.clone().unwrap_or_default());
+                let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+                let shell_command = vec![shell, "-lc".to_string(), command.clone()];
+                let display_command = vec![command.clone()];
+
+                if standalone_turn_id.is_some() {
+                    self.push_local_event(
+                        format!("seq-local-turn-started-{submission_id}"),
+                        crate::protocol::EventMsg::TurnStarted(crate::protocol::TurnStartedEvent {
+                            turn_id: turn_id.clone(),
+                            model_context_window: None,
+                            collaboration_mode_kind: Default::default(),
+                        }),
+                    )?;
+                }
+                self.push_local_event(
+                    format!("seq-local-exec-begin-{submission_id}"),
+                    crate::protocol::EventMsg::ExecCommandBegin(
+                        crate::protocol::ExecCommandBeginEvent {
+                            call_id: call_id.clone(),
+                            process_id: None,
+                            turn_id: turn_id.clone(),
+                            command: display_command.clone(),
+                            cwd: snapshot.cwd.clone(),
+                            parsed_cmd: Vec::new(),
+                            source: crate::protocol::ExecCommandSource::UserShell,
+                            interaction_input: None,
+                        },
+                    ),
+                )?;
+                let endpoint_for_exec = endpoint.clone();
+                let auth_token_for_exec = auth_token.clone();
+                let shell_command_for_exec = shell_command.clone();
+                let cwd_for_exec = snapshot.cwd.clone();
+                let display_command_for_exec = display_command.clone();
+                let submission_id_for_exec = submission_id.clone();
+                let this = self.clone();
+                tokio::spawn(async move {
+                    let started_at = Instant::now();
+                    let endpoint_unused = endpoint_for_exec;
+                    let auth_unused = auth_token_for_exec;
+                    let run_result = tokio::task::spawn_blocking(move || {
+                        let _ = endpoint_unused;
+                        let _ = auth_unused;
+                        let mut cmd = std::process::Command::new(
+                            shell_command_for_exec
+                                .first()
+                                .map(String::as_str)
+                                .unwrap_or("/bin/sh"),
+                        );
+                        if shell_command_for_exec.len() > 1 {
+                            cmd.args(shell_command_for_exec[1..].iter().map(String::as_str));
+                        }
+                        cmd.current_dir(cwd_for_exec);
+                        cmd.output()
+                    })
+                    .await;
+
+                    let (stdout, stderr, exit_code) = match run_result {
+                        Ok(Ok(output)) => (
+                            String::from_utf8_lossy(&output.stdout).to_string(),
+                            String::from_utf8_lossy(&output.stderr).to_string(),
+                            output.status.code().unwrap_or(-1),
+                        ),
+                        Ok(Err(err)) => (String::new(), format!("execution error: {err}"), -1),
+                        Err(err) => (
+                            String::new(),
+                            format!("execution task join error: {err}"),
+                            -1,
+                        ),
+                    };
+
+                    if !stdout.is_empty() {
+                        let _ = this.push_local_event(
+                            format!("seq-local-exec-stdout-{submission_id_for_exec}"),
+                            crate::protocol::EventMsg::ExecCommandOutputDelta(
+                                crate::protocol::ExecCommandOutputDeltaEvent {
+                                    call_id: call_id.clone(),
+                                    stream: crate::protocol::ExecOutputStream::Stdout,
+                                    chunk: stdout.as_bytes().to_vec(),
+                                },
+                            ),
+                        );
+                    }
+                    if !stderr.is_empty() {
+                        let _ = this.push_local_event(
+                            format!("seq-local-exec-stderr-{submission_id_for_exec}"),
+                            crate::protocol::EventMsg::ExecCommandOutputDelta(
+                                crate::protocol::ExecCommandOutputDeltaEvent {
+                                    call_id: call_id.clone(),
+                                    stream: crate::protocol::ExecOutputStream::Stderr,
+                                    chunk: stderr.as_bytes().to_vec(),
+                                },
+                            ),
+                        );
+                    }
+
+                    let duration = started_at.elapsed();
+                    let status = if exit_code == 0 {
+                        crate::protocol::ExecCommandStatus::Completed
+                    } else {
+                        crate::protocol::ExecCommandStatus::Failed
+                    };
+                    let aggregated_output = format!("{stdout}{stderr}");
+                    let _ = this.push_local_event(
+                        format!("seq-local-exec-end-{submission_id_for_exec}"),
+                        crate::protocol::EventMsg::ExecCommandEnd(
+                            crate::protocol::ExecCommandEndEvent {
+                                call_id: call_id.clone(),
+                                process_id: None,
+                                turn_id: turn_id.clone(),
+                                command: display_command_for_exec.clone(),
+                                cwd: snapshot.cwd.clone(),
+                                parsed_cmd: Vec::new(),
+                                source: crate::protocol::ExecCommandSource::UserShell,
+                                interaction_input: None,
+                                stdout,
+                                stderr,
+                                aggregated_output: aggregated_output.clone(),
+                                exit_code,
+                                duration,
+                                formatted_output: aggregated_output,
+                                status,
+                            },
+                        ),
+                    );
+                    if standalone_turn_id.is_some() {
+                        let _ = this.push_local_event(
+                            format!("seq-local-turn-complete-{submission_id_for_exec}"),
+                            crate::protocol::EventMsg::TurnComplete(
+                                crate::protocol::TurnCompleteEvent {
+                                    turn_id,
+                                    last_agent_message: None,
+                                },
+                            ),
+                        );
+                    }
+                });
+            }
             crate::protocol::Op::Interrupt => {
                 if let Some(turn_id) = current_turn_id {
                     app_server_rpc_request_raw(
@@ -962,6 +1121,306 @@ impl CodexThread {
                         CodexError::new(format!("submit turn/interrupt failed: {err}"))
                     })?;
                 }
+            }
+            crate::protocol::Op::CleanBackgroundTerminals => {
+                app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "thread/backgroundTerminals/clean",
+                    json!({
+                        "threadId": thread_id.to_string(),
+                    }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!(
+                        "submit thread/backgroundTerminals/clean failed: {err}"
+                    ))
+                })?;
+            }
+            crate::protocol::Op::ListSkills { cwds, force_reload } => {
+                let response = app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "skills/list",
+                    json!({
+                        "cwds": cwds,
+                        "forceReload": force_reload,
+                    }),
+                )
+                .map_err(|err| CodexError::new(format!("submit skills/list failed: {err}")))?;
+                let skills = response
+                    .result
+                    .get("data")
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<crate::protocol::SkillsListEntry>>(value).ok()
+                    })
+                    .unwrap_or_default();
+                self.push_local_event(
+                    format!("seq-local-list-skills-{submission_id}"),
+                    crate::protocol::EventMsg::ListSkillsResponse(
+                        crate::protocol::ListSkillsResponseEvent { skills },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::ListRemoteSkills {
+                hazelnut_scope,
+                product_surface,
+                enabled,
+            } => {
+                let mut params = serde_json::Map::new();
+                params.insert(
+                    "hazelnutScope".to_string(),
+                    serde_json::to_value(hazelnut_scope).unwrap_or(Value::Null),
+                );
+                params.insert(
+                    "productSurface".to_string(),
+                    serde_json::to_value(product_surface).unwrap_or(Value::Null),
+                );
+                if let Some(value) = enabled {
+                    params.insert("enabled".to_string(), Value::Bool(value));
+                }
+                let response = app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "skills/remote/list",
+                    Value::Object(params),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit skills/remote/list failed: {err}"))
+                })?;
+                let skills = response
+                    .result
+                    .get("data")
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<Vec<crate::protocol::RemoteSkillSummary>>(value)
+                            .ok()
+                    })
+                    .unwrap_or_default();
+                self.push_local_event(
+                    format!("seq-local-list-remote-skills-{submission_id}"),
+                    crate::protocol::EventMsg::ListRemoteSkillsResponse(
+                        crate::protocol::ListRemoteSkillsResponseEvent { skills },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::DownloadRemoteSkill { hazelnut_id } => {
+                let response = app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "skills/remote/export",
+                    json!({
+                        "hazelnutId": hazelnut_id,
+                    }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit skills/remote/export failed: {err}"))
+                })?;
+                let id = response
+                    .result
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let name = response
+                    .result
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| id.clone());
+                let path = response
+                    .result
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_default();
+                self.push_local_event(
+                    format!("seq-local-download-remote-skill-{submission_id}"),
+                    crate::protocol::EventMsg::RemoteSkillDownloaded(
+                        crate::protocol::RemoteSkillDownloadedEvent { id, name, path },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::ListMcpTools => {
+                let response = app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "mcpServerStatus/list",
+                    json!({
+                        "limit": 256,
+                    }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit mcpServerStatus/list failed: {err}"))
+                })?;
+
+                let mut tools: HashMap<String, crate::mcp::Tool> = HashMap::new();
+                let mut resources: HashMap<String, Vec<crate::mcp::Resource>> = HashMap::new();
+                let mut resource_templates: HashMap<String, Vec<crate::mcp::ResourceTemplate>> =
+                    HashMap::new();
+                let mut auth_statuses: HashMap<String, crate::protocol::McpAuthStatus> =
+                    HashMap::new();
+
+                for entry in response
+                    .result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default()
+                {
+                    let server_name = entry
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    if server_name.is_empty() {
+                        continue;
+                    }
+
+                    let server_tools = entry
+                        .get("tools")
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<HashMap<String, crate::mcp::Tool>>(value).ok()
+                        })
+                        .unwrap_or_default();
+                    tools.extend(server_tools);
+
+                    let server_resources = entry
+                        .get("resources")
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<Vec<crate::mcp::Resource>>(value).ok()
+                        })
+                        .unwrap_or_default();
+                    resources.insert(server_name.clone(), server_resources);
+
+                    let server_templates = entry
+                        .get("resourceTemplates")
+                        .or_else(|| entry.get("resource_templates"))
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<Vec<crate::mcp::ResourceTemplate>>(value).ok()
+                        })
+                        .unwrap_or_default();
+                    resource_templates.insert(server_name.clone(), server_templates);
+
+                    let auth_status = entry
+                        .get("authStatus")
+                        .or_else(|| entry.get("auth_status"))
+                        .cloned()
+                        .and_then(|value| {
+                            serde_json::from_value::<crate::protocol::McpAuthStatus>(value).ok()
+                        })
+                        .unwrap_or(crate::protocol::McpAuthStatus::Unsupported);
+                    auth_statuses.insert(server_name, auth_status);
+                }
+
+                self.push_local_event(
+                    format!("seq-local-list-mcp-tools-{submission_id}"),
+                    crate::protocol::EventMsg::McpListToolsResponse(
+                        crate::protocol::McpListToolsResponseEvent {
+                            tools,
+                            resources,
+                            resource_templates,
+                            auth_statuses,
+                        },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::ListCustomPrompts => {
+                self.push_local_event(
+                    format!("seq-local-list-custom-prompts-{submission_id}"),
+                    crate::protocol::EventMsg::ListCustomPromptsResponse(
+                        crate::protocol::ListCustomPromptsResponseEvent {
+                            custom_prompts: Vec::new(),
+                        },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::ListModels => {
+                let _ = app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "model/list",
+                    json!({
+                        "includeHidden": true,
+                        "limit": 256,
+                    }),
+                )
+                .map_err(|err| CodexError::new(format!("submit model/list failed: {err}")))?;
+            }
+            crate::protocol::Op::Compact => {
+                app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "thread/compact/start",
+                    json!({
+                        "threadId": thread_id.to_string(),
+                    }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit thread/compact/start failed: {err}"))
+                })?;
+            }
+            crate::protocol::Op::ThreadRollback { num_turns } => {
+                app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "thread/rollback",
+                    json!({
+                        "threadId": thread_id.to_string(),
+                        "numTurns": num_turns,
+                    }),
+                )
+                .map_err(|err| CodexError::new(format!("submit thread/rollback failed: {err}")))?;
+                self.push_local_event(
+                    format!("seq-local-thread-rollback-{submission_id}"),
+                    crate::protocol::EventMsg::ThreadRolledBack(
+                        crate::protocol::ThreadRolledBackEvent { num_turns },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::Review { review_request } => {
+                app_server_rpc_request_raw(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    "review/start",
+                    json!({
+                        "threadId": thread_id.to_string(),
+                        "target": review_request.target,
+                    }),
+                )
+                .map_err(|err| CodexError::new(format!("submit review/start failed: {err}")))?;
+            }
+            crate::protocol::Op::GetHistoryEntryRequest { offset, log_id } => {
+                self.push_local_event(
+                    format!("seq-local-history-entry-{submission_id}"),
+                    crate::protocol::EventMsg::GetHistoryEntryResponse(
+                        crate::protocol::GetHistoryEntryResponseEvent {
+                            offset,
+                            log_id,
+                            entry: None,
+                        },
+                    ),
+                )?;
+            }
+            crate::protocol::Op::ExecApproval { .. }
+            | crate::protocol::Op::PatchApproval { .. }
+            | crate::protocol::Op::ResolveElicitation { .. }
+            | crate::protocol::Op::UserInputAnswer { .. }
+            | crate::protocol::Op::DynamicToolResponse { .. }
+            | crate::protocol::Op::Undo
+            | crate::protocol::Op::DropMemories
+            | crate::protocol::Op::UpdateMemories
+            | crate::protocol::Op::AddToHistory { .. }
+            | crate::protocol::Op::RefreshMcpServers { .. }
+            | crate::protocol::Op::ReloadUserConfig => {
+                return Err(CodexError::new(format!(
+                    "op not supported by app-server shim yet: {}",
+                    serde_json::to_string(&op).unwrap_or_else(|_| "<serialize op>".to_string())
+                )));
             }
             crate::protocol::Op::SetThreadName { name } => {
                 app_server_rpc_request_raw(
@@ -989,7 +1448,12 @@ impl CodexThread {
                     msg: crate::protocol::EventMsg::ShutdownComplete,
                 });
             }
-            _ => {}
+            _ => {
+                return Err(CodexError::new(format!(
+                    "op not handled by app-server shim: {}",
+                    serde_json::to_string(&op).unwrap_or_else(|_| "<serialize op>".to_string())
+                )));
+            }
         }
 
         Ok(submission_id)
@@ -2257,157 +2721,6 @@ pub mod connectors {
         connectors
     }
 }
-
-/// Stub backing `codex_file_search`.
-mod codex_file_search_stub {
-    use serde::Deserialize;
-    use serde::Serialize;
-    use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::sync::mpsc;
-    use std::thread;
-
-    /// File match result.
-    #[derive(Debug, Clone, Serialize, Deserialize)]
-    pub struct FileMatch {
-        pub score: u32,
-        pub path: PathBuf,
-        pub root: PathBuf,
-        #[serde(skip_serializing_if = "Option::is_none")]
-        pub indices: Option<Vec<u32>>,
-    }
-
-    impl FileMatch {
-        pub fn full_path(&self) -> PathBuf {
-            self.root.join(&self.path)
-        }
-    }
-
-    /// Options for creating a file search session.
-    #[derive(Debug, Clone, Default)]
-    pub struct FileSearchOptions {
-        pub compute_indices: bool,
-    }
-
-    /// File search snapshot.
-    #[derive(Debug, Clone)]
-    pub struct FileSearchSnapshot {
-        pub query: String,
-        pub matches: Vec<FileMatch>,
-    }
-
-    /// Trait for receiving search updates.
-    pub trait SessionReporter: Send + Sync + 'static {
-        fn on_update(&self, snapshot: &FileSearchSnapshot);
-        fn on_complete(&self);
-    }
-
-    /// Active file search session handle.
-    pub struct FileSearchSession {
-        query_tx: mpsc::Sender<String>,
-    }
-
-    impl FileSearchSession {
-        pub fn update_query(&self, query: &str) {
-            let _ = self.query_tx.send(query.to_string());
-        }
-    }
-
-    /// Create a file search session.
-    pub fn create_session(
-        roots: Vec<PathBuf>,
-        _options: FileSearchOptions,
-        reporter: std::sync::Arc<dyn SessionReporter>,
-        _cancel: Option<()>,
-    ) -> Result<FileSearchSession, String> {
-        if roots.is_empty() {
-            return Err("no search roots configured".to_string());
-        }
-        let (query_tx, query_rx) = mpsc::channel::<String>();
-        thread::spawn(move || {
-            while let Ok(mut query) = query_rx.recv() {
-                while let Ok(next) = query_rx.try_recv() {
-                    query = next;
-                }
-
-                let query = query.trim().to_ascii_lowercase();
-                if query.is_empty() {
-                    reporter.on_update(&FileSearchSnapshot {
-                        query: String::new(),
-                        matches: Vec::new(),
-                    });
-                    continue;
-                }
-
-                let mut matches = Vec::new();
-                for root in &roots {
-                    collect_matches(root, root, &query, &mut matches);
-                    if matches.len() >= 200 {
-                        break;
-                    }
-                }
-                matches.sort_by_key(|m| m.path.clone());
-                reporter.on_update(&FileSearchSnapshot { query, matches });
-            }
-            reporter.on_complete();
-        });
-        Ok(FileSearchSession { query_tx })
-    }
-
-    fn collect_matches(root: &PathBuf, dir: &PathBuf, query: &str, out: &mut Vec<FileMatch>) {
-        if out.len() >= 200 {
-            return;
-        }
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            if out.len() >= 200 {
-                break;
-            }
-            let path = entry.path();
-            let file_name = entry.file_name();
-            let file_name = file_name.to_string_lossy();
-            if file_name.starts_with(".git") || file_name == "target" {
-                continue;
-            }
-
-            if path.is_dir() {
-                collect_matches(root, &path, query, out);
-                continue;
-            }
-            if !path.is_file() {
-                continue;
-            }
-
-            let Ok(rel) = path.strip_prefix(root) else {
-                continue;
-            };
-            let rel_str = rel.to_string_lossy().to_ascii_lowercase();
-            if rel_str.contains(query) {
-                let score = if rel_str.ends_with(query) {
-                    100
-                } else if rel_str.contains(&format!("/{query}")) {
-                    80
-                } else {
-                    60
-                };
-                out.push(FileMatch {
-                    score,
-                    path: rel.to_path_buf(),
-                    root: root.clone(),
-                    indices: None,
-                });
-            }
-        }
-    }
-}
-pub use codex_file_search_stub::FileMatch;
-pub use codex_file_search_stub::FileSearchOptions;
-pub use codex_file_search_stub::FileSearchSession;
-pub use codex_file_search_stub::FileSearchSnapshot;
-pub use codex_file_search_stub::SessionReporter;
-pub use codex_file_search_stub::create_session;
 
 pub fn ansi_escape_line(input: &str) -> ratatui::text::Line<'static> {
     ratatui::text::Line::from(input.to_string())
