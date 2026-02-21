@@ -119,6 +119,7 @@ struct SessionRuntime {
     codex_session_id: String,
     codex_thread_id: String,
     active_turn_id: Option<String>,
+    rpc_cursor: u64,
     next_sequence: u64,
     events: Vec<DaemonStreamEnvelope>,
 }
@@ -918,8 +919,6 @@ fn runtime_event_to_daemon_event(event: RuntimeEvent) -> Option<DaemonStreamEven
 struct RealCodexTurnOutcome {
     thread_id: String,
     turn_id: String,
-    events: Vec<DaemonStreamEvent>,
-    status: String,
 }
 
 fn daemon_should_use_real_codex() -> bool {
@@ -941,94 +940,31 @@ fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> anyhow::Result<()> 
     stdin.flush().context("flush json-rpc line")
 }
 
-fn read_json_line(reader: &mut BufReader<ChildStdout>) -> anyhow::Result<Value> {
-    loop {
-        let mut line = String::new();
-        let read = reader
-            .read_line(&mut line)
-            .context("read codex app-server stdout")?;
-        if read == 0 {
-            anyhow::bail!("codex app-server closed stdout");
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        return serde_json::from_str(trimmed).context("parse codex app-server json line");
-    }
-}
-
-fn read_response_for_request(
-    reader: &mut BufReader<ChildStdout>,
-    request_id: i64,
-) -> anyhow::Result<Value> {
-    loop {
-        let message = read_json_line(reader)?;
-        let Some(message_id) = message.get("id").and_then(Value::as_i64) else {
-            continue;
-        };
-        if message_id != request_id {
-            continue;
-        }
-        if let Some(error) = message.get("error") {
-            let detail = error
-                .get("message")
-                .and_then(Value::as_str)
-                .unwrap_or("unknown error");
-            anyhow::bail!("codex app-server request {request_id} failed: {detail}");
-        }
-        let result = message
-            .get("result")
-            .cloned()
-            .ok_or_else(|| anyhow::anyhow!("missing result for request id {request_id}"))?;
-        return Ok(result);
-    }
-}
-
 fn try_resume_or_start_thread(
-    reader: &mut BufReader<ChildStdout>,
-    stdin: &mut ChildStdin,
-    next_request_id: &mut i64,
+    rpc_runtime: &CodexRpcRuntime,
     existing_thread_id: Option<&str>,
 ) -> anyhow::Result<String> {
-    if let Some(thread_id) = existing_thread_id {
-        *next_request_id += 1;
-        let resume_request_id = *next_request_id;
-        write_json_line(
-            stdin,
-            &json!({
-                "id": resume_request_id,
-                "method": "thread/resume",
-                "params": {
+    if let Some(existing) = existing_thread_id {
+        let thread_id = existing.trim();
+        if !thread_id.is_empty() {
+            let resumed = rpc_runtime.request(
+                "thread/resume",
+                json!({
                     "threadId": thread_id,
-                }
-            }),
-        )?;
-        let resumed = read_response_for_request(reader, resume_request_id);
-        if let Ok(result) = resumed {
-            if let Some(resumed_id) = result
-                .get("thread")
-                .and_then(|thread| thread.get("id"))
-                .and_then(Value::as_str)
+                }),
+            );
+            if let Ok((_, result)) = resumed
+                && let Some(resumed_id) = result
+                    .get("thread")
+                    .and_then(|thread| thread.get("id"))
+                    .and_then(Value::as_str)
             {
                 return Ok(resumed_id.to_string());
             }
         }
     }
 
-    *next_request_id += 1;
-    let start_request_id = *next_request_id;
-    write_json_line(
-        stdin,
-        &json!({
-            "id": start_request_id,
-            "method": "thread/start",
-            "params": {
-                "approvalPolicy": "never"
-            }
-        }),
-    )?;
-    let started = read_response_for_request(reader, start_request_id)?;
+    let (_, started) = rpc_runtime.request("thread/start", json!({}))?;
     started
         .get("thread")
         .and_then(|thread| thread.get("id"))
@@ -1054,224 +990,161 @@ fn approval_prompt_from_request(method: &str, params: &Value) -> String {
     }
 }
 
+fn stream_event_thread_id(event: &DaemonRpcStreamEvent) -> Option<&str> {
+    let params = match event {
+        DaemonRpcStreamEvent::Notification(payload) => &payload.params,
+        DaemonRpcStreamEvent::ServerRequest(payload) => &payload.params,
+        DaemonRpcStreamEvent::DecodeError(_) => return None,
+    };
+    params.get("threadId").and_then(Value::as_str).or_else(|| {
+        params
+            .get("turn")
+            .and_then(|turn| turn.get("threadId"))
+            .and_then(Value::as_str)
+    })
+}
+
+fn ingest_rpc_events_for_session(rpc_runtime: &CodexRpcRuntime, runtime: &mut SessionRuntime) {
+    let events = rpc_runtime.events_since(runtime.rpc_cursor);
+    if events.is_empty() {
+        return;
+    }
+
+    for envelope in events {
+        runtime.rpc_cursor = runtime.rpc_cursor.max(envelope.sequence);
+        let event = envelope.event;
+        let Some(thread_id) = stream_event_thread_id(&event) else {
+            continue;
+        };
+        if thread_id != runtime.codex_thread_id {
+            continue;
+        }
+
+        match event {
+            DaemonRpcStreamEvent::Notification(payload) => match payload.method.as_str() {
+                "item/agentMessage/delta" => {
+                    if let Some(delta) = payload.params.get("delta").and_then(Value::as_str) {
+                        let turn_id = payload
+                            .params
+                            .get("turnId")
+                            .and_then(Value::as_str)
+                            .or(runtime.active_turn_id.as_deref())
+                            .unwrap_or("turn_unknown")
+                            .to_string();
+                        push_event(
+                            runtime,
+                            DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
+                                turn_id,
+                                delta: delta.to_string(),
+                            }),
+                        );
+                    }
+                }
+                "turn/completed" => {
+                    let completed_turn_id = payload
+                        .params
+                        .get("turn")
+                        .and_then(|turn| turn.get("id"))
+                        .and_then(Value::as_str)
+                        .or(runtime.active_turn_id.as_deref())
+                        .unwrap_or("turn_unknown")
+                        .to_string();
+                    let status = payload
+                        .params
+                        .get("turn")
+                        .and_then(|turn| turn.get("status"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("completed")
+                        .to_string();
+                    push_event(
+                        runtime,
+                        DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
+                            turn_id: completed_turn_id,
+                            output_summary: format!("status: {status}"),
+                        }),
+                    );
+                    runtime.active_turn_id = None;
+                    runtime.status.last_event = format!("turn_{status}");
+                    runtime.status.updated_at_unix_ms = now_unix_ms();
+                }
+                _ => {}
+            },
+            DaemonRpcStreamEvent::ServerRequest(payload) => {
+                if matches!(
+                    payload.method.as_str(),
+                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
+                ) {
+                    let approval_turn_id = payload
+                        .params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .or(runtime.active_turn_id.as_deref())
+                        .unwrap_or("turn_unknown")
+                        .to_string();
+                    let approval_id = payload
+                        .params
+                        .get("approvalId")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .or_else(|| {
+                            payload
+                                .params
+                                .get("itemId")
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string)
+                        })
+                        .or_else(|| request_id_key(&payload.request_id))
+                        .unwrap_or_else(|| "approval_request".to_string());
+                    push_event(
+                        runtime,
+                        DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                            turn_id: approval_turn_id,
+                            approval_id,
+                            action_kind: if payload.method == "item/fileChange/requestApproval" {
+                                "file_change".to_string()
+                            } else {
+                                "command_execution".to_string()
+                            },
+                            prompt: approval_prompt_from_request(&payload.method, &payload.params),
+                        }),
+                    );
+                    runtime.status.last_event = "approval_required".to_string();
+                    runtime.status.updated_at_unix_ms = now_unix_ms();
+                }
+            }
+            DaemonRpcStreamEvent::DecodeError(_) => {}
+        }
+    }
+}
+
 fn run_real_codex_turn(
+    rpc_runtime: &CodexRpcRuntime,
     existing_thread_id: Option<&str>,
     prompt: &str,
 ) -> anyhow::Result<RealCodexTurnOutcome> {
-    let codex_bin = env::var("CRABBOT_CODEX_BIN").unwrap_or_else(|_| DEFAULT_CODEX_BIN.to_string());
-    let mut child = Command::new(&codex_bin)
-        .arg("app-server")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("spawn `{codex_bin} app-server`"))?;
-
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("codex app-server stdin unavailable"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("codex app-server stdout unavailable"))?;
-    let mut reader = BufReader::new(stdout);
-
-    let mut next_request_id = 1_i64;
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "id": next_request_id,
-            "method": "initialize",
-            "params": {
-                "clientInfo": {
-                    "name": "crabbot_daemon",
-                    "title": "Crabbot Daemon",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "experimentalApi": true
-                }
-            }
-        }),
-    )?;
-    let _ = read_response_for_request(&mut reader, next_request_id)?;
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "method": "initialized",
-            "params": {}
-        }),
-    )?;
-
-    let thread_id = try_resume_or_start_thread(
-        &mut reader,
-        &mut stdin,
-        &mut next_request_id,
-        existing_thread_id,
-    )?;
-
-    next_request_id += 1;
-    let turn_start_request_id = next_request_id;
-    write_json_line(
-        &mut stdin,
-        &json!({
-            "id": turn_start_request_id,
-            "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [
-                    {
-                        "type": "text",
-                        "text": prompt,
-                        "textElements": []
-                    }
-                ]
-            }
-        }),
-    )?;
-
-    let mut turn_id: Option<String> = None;
-    let mut turn_status: Option<String> = None;
-    let mut turn_start_response_seen = false;
-    let mut mapped_events: Vec<DaemonStreamEvent> = Vec::new();
-
-    while turn_status.is_none() || !turn_start_response_seen {
-        let message = read_json_line(&mut reader)?;
-        let method = message.get("method").and_then(Value::as_str);
-        let is_request = message.get("id").is_some() && method.is_some();
-        let is_response = method.is_none() && message.get("id").is_some();
-
-        if is_response {
-            if message
-                .get("id")
-                .and_then(Value::as_i64)
-                .is_some_and(|id| id == turn_start_request_id)
-            {
-                turn_start_response_seen = true;
-                if let Some(error) = message.get("error") {
-                    let detail = error
-                        .get("message")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown error");
-                    anyhow::bail!("turn/start failed: {detail}");
-                }
-                if let Some(turn_id_value) = message
-                    .get("result")
-                    .and_then(|result| result.get("turn"))
-                    .and_then(|turn| turn.get("id"))
-                    .and_then(Value::as_str)
+    let thread_id = try_resume_or_start_thread(rpc_runtime, existing_thread_id)?;
+    let (_, turn_start_result) = rpc_runtime.request(
+        "turn/start",
+        json!({
+            "threadId": thread_id,
+            "input": [
                 {
-                    turn_id = Some(turn_id_value.to_string());
+                    "type": "text",
+                    "text": prompt,
+                    "textElements": []
                 }
-            }
-            continue;
-        }
+            ]
+        }),
+    )?;
 
-        let Some(method_name) = method else {
-            continue;
-        };
-        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
+    let turn_id = turn_start_result
+        .get("turn")
+        .and_then(|turn| turn.get("id"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow::anyhow!("turn/start response missing turn.id"))?
+        .to_string();
 
-        if is_request {
-            if matches!(
-                method_name,
-                "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-            ) {
-                let approval_turn_id = params
-                    .get("turnId")
-                    .and_then(Value::as_str)
-                    .or(turn_id.as_deref())
-                    .unwrap_or("turn_unknown")
-                    .to_string();
-                let approval_id = params
-                    .get("itemId")
-                    .and_then(Value::as_str)
-                    .map(|value| value.to_string())
-                    .or_else(|| {
-                        message
-                            .get("id")
-                            .and_then(Value::as_i64)
-                            .map(|id| format!("approval_request_{id}"))
-                    })
-                    .unwrap_or_else(|| "approval_request".to_string());
-                mapped_events.push(DaemonStreamEvent::ApprovalRequired(
-                    DaemonApprovalRequired {
-                        turn_id: approval_turn_id,
-                        approval_id,
-                        action_kind: if method_name == "item/fileChange/requestApproval" {
-                            "file_change".to_string()
-                        } else {
-                            "command_execution".to_string()
-                        },
-                        prompt: approval_prompt_from_request(method_name, &params),
-                    },
-                ));
-
-                if let Some(request_id) = message.get("id") {
-                    write_json_line(
-                        &mut stdin,
-                        &json!({
-                            "id": request_id,
-                            "result": {
-                                "decision": "decline"
-                            }
-                        }),
-                    )?;
-                }
-            }
-            continue;
-        }
-
-        match method_name {
-            "item/agentMessage/delta" => {
-                if let Some(delta) = params.get("delta").and_then(Value::as_str) {
-                    let delta_turn_id = params
-                        .get("turnId")
-                        .and_then(Value::as_str)
-                        .or(turn_id.as_deref())
-                        .unwrap_or("turn_unknown")
-                        .to_string();
-                    mapped_events.push(DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
-                        turn_id: delta_turn_id,
-                        delta: delta.to_string(),
-                    }));
-                }
-            }
-            "turn/completed" => {
-                let completed_turn_id = params
-                    .get("turn")
-                    .and_then(|turn| turn.get("id"))
-                    .and_then(Value::as_str)
-                    .or(turn_id.as_deref())
-                    .unwrap_or("turn_unknown")
-                    .to_string();
-                let status = params
-                    .get("turn")
-                    .and_then(|turn| turn.get("status"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("completed")
-                    .to_string();
-                turn_status = Some(status.clone());
-                turn_id = Some(completed_turn_id.clone());
-                mapped_events.push(DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
-                    turn_id: completed_turn_id,
-                    output_summary: format!("status: {status}"),
-                }));
-            }
-            _ => {}
-        }
-    }
-
-    let _ = child.kill();
-    let _ = child.wait();
-
-    Ok(RealCodexTurnOutcome {
-        thread_id,
-        turn_id: turn_id.unwrap_or_else(|| "turn_unknown".to_string()),
-        events: mapped_events,
-        status: turn_status.unwrap_or_else(|| "completed".to_string()),
-    })
+    Ok(RealCodexTurnOutcome { thread_id, turn_id })
 }
 
 fn synthesize_assistant_output(prompt: &str) -> String {
@@ -1326,6 +1199,7 @@ async fn start_session(
         codex_session_id: codex_session.session_id,
         codex_thread_id: codex_thread.thread_id,
         active_turn_id: None,
+        rpc_cursor: 0,
         next_sequence: 0,
         events: Vec::new(),
     };
@@ -1424,12 +1298,14 @@ async fn session_status(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<DaemonSessionStatusResponse>, StatusCode> {
-    let sessions = state.sessions.read().await;
-    let runtime = sessions
-        .get(&session_id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
-    Ok(Json(runtime.status))
+    let mut sessions = state.sessions.write().await;
+    let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+    if daemon_should_use_real_codex()
+        && let Some(rpc_runtime) = state.rpc_runtime.as_ref()
+    {
+        ingest_rpc_events_for_session(rpc_runtime, runtime);
+    }
+    Ok(Json(runtime.status.clone()))
 }
 
 async fn session_stream(
@@ -1437,11 +1313,13 @@ async fn session_stream(
     Path(session_id): Path<String>,
     Query(query): Query<StreamQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let sessions = state.sessions.read().await;
-    let runtime = sessions
-        .get(&session_id)
-        .cloned()
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut sessions = state.sessions.write().await;
+    let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+    if daemon_should_use_real_codex()
+        && let Some(rpc_runtime) = state.rpc_runtime.as_ref()
+    {
+        ingest_rpc_events_for_session(rpc_runtime, runtime);
+    }
     let since = query.since_sequence.unwrap_or(0);
     let lines = runtime
         .events
@@ -1554,6 +1432,7 @@ async fn prompt_session(
     }
 
     if daemon_should_use_real_codex() {
+        let rpc_runtime = rpc_runtime_or_503(&state)?;
         let existing_thread_id = if codex_thread_id.trim().is_empty() {
             None
         } else {
@@ -1561,7 +1440,7 @@ async fn prompt_session(
         };
         let prompt_text = payload.prompt.clone();
         let real_outcome = tokio::task::spawn_blocking(move || {
-            run_real_codex_turn(existing_thread_id.as_deref(), &prompt_text)
+            run_real_codex_turn(&rpc_runtime, existing_thread_id.as_deref(), &prompt_text)
         })
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
@@ -1570,17 +1449,22 @@ async fn prompt_session(
             Ok(Ok(real)) => {
                 let mut sessions = state.sessions.write().await;
                 let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
+                if let Some(rpc_runtime) = state.rpc_runtime.as_ref() {
+                    ingest_rpc_events_for_session(rpc_runtime, runtime);
+                }
                 if runtime.status.state != "active" {
+                    return Err(StatusCode::CONFLICT);
+                }
+                if runtime.active_turn_id.is_some() {
                     return Err(StatusCode::CONFLICT);
                 }
                 runtime.codex_thread_id = real.thread_id;
                 runtime.active_turn_id = Some(real.turn_id.clone());
-                for mapped in real.events {
-                    push_event(runtime, mapped);
-                }
-                runtime.active_turn_id = None;
-                runtime.status.last_event = format!("turn_{}", real.status);
+                runtime.status.last_event = "turn_started".to_string();
                 runtime.status.updated_at_unix_ms = now_unix_ms();
+                if let Some(rpc_runtime) = state.rpc_runtime.as_ref() {
+                    ingest_rpc_events_for_session(rpc_runtime, runtime);
+                }
 
                 let response = DaemonPromptResponse {
                     session_id,
