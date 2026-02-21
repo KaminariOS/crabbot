@@ -1236,10 +1236,20 @@ impl CodexThread {
                                         }
                                         payload.delta = normalized;
                                     }
+                                    crate::protocol::EventMsg::AgentMessage(payload) => {
+                                        if !state.current_turn_streamed_text.is_empty() {
+                                            let streamed = state.current_turn_streamed_text.trim();
+                                            let final_msg = payload.message.trim();
+                                            if final_msg == streamed
+                                                || final_msg.ends_with(streamed)
+                                            {
+                                                continue;
+                                            }
+                                        }
+                                    }
                                     crate::protocol::EventMsg::TurnComplete(_)
                                     | crate::protocol::EventMsg::TurnAborted(_) => {
                                         state.current_turn_id = None;
-                                        state.current_turn_streamed_text.clear();
                                     }
                                     _ => {}
                                 }
