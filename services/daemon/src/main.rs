@@ -53,6 +53,7 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::Child;
 use std::process::ChildStdin;
 use std::process::ChildStdout;
@@ -723,6 +724,8 @@ fn build_session_status(
 }
 
 fn push_event(runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
+    maybe_notify_user_for_approval(&event);
+
     runtime.next_sequence += 1;
     let sequence = runtime.next_sequence;
     let envelope = DaemonStreamEnvelope {
@@ -739,6 +742,35 @@ fn push_event(runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
     }
 
     sequence
+}
+
+fn maybe_notify_user_for_approval(event: &DaemonStreamEvent) {
+    if !should_trigger_approval_notification(event) {
+        return;
+    }
+
+    let Some(home) = env::var_os("HOME") else {
+        eprintln!("warning: HOME is not set; skipping approval notification");
+        return;
+    };
+
+    let script_path = PathBuf::from(home).join(".codex/notify.py");
+    let spawn_result = Command::new(&script_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Err(error) = spawn_result {
+        eprintln!(
+            "warning: failed to run approval notification script `{}`: {error}",
+            script_path.display()
+        );
+    }
+}
+
+fn should_trigger_approval_notification(event: &DaemonStreamEvent) -> bool {
+    matches!(event, DaemonStreamEvent::ApprovalRequired(_))
 }
 
 fn split_for_stream(text: &str, chunk_size: usize) -> Vec<String> {
@@ -1862,5 +1894,24 @@ mod tests {
     fn distinct_daemon_and_upstream_allows_different_socket() {
         ensure_distinct_daemon_and_upstream("127.0.0.1:8765", "ws://127.0.0.1:8766")
             .expect("different sockets should be allowed");
+    }
+
+    #[test]
+    fn approval_notification_only_for_approval_events() {
+        assert!(should_trigger_approval_notification(
+            &DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+                turn_id: "turn_1".to_string(),
+                approval_id: "approval_1".to_string(),
+                action_kind: "shell_command".to_string(),
+                prompt: "approve?".to_string(),
+            })
+        ));
+
+        assert!(!should_trigger_approval_notification(
+            &DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
+                turn_id: "turn_1".to_string(),
+                output_summary: "done".to_string(),
+            })
+        ));
     }
 }
