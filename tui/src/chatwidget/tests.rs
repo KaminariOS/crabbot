@@ -1652,6 +1652,7 @@ async fn make_chatwidget_manual(
         had_work_activity: false,
         saw_plan_update_this_turn: false,
         saw_plan_item_this_turn: false,
+        last_agent_message_in_turn: None,
         plan_delta_buffer: String::new(),
         plan_item_active: false,
         last_separator_elapsed_secs: None,
@@ -7492,6 +7493,54 @@ async fn multiple_agent_messages_in_single_turn_emit_multiple_headers() {
     let first_idx = combined.find("First message").unwrap();
     let second_idx = combined.find("Second message").unwrap();
     assert!(first_idx < second_idx, "messages out of order: {combined}");
+}
+
+#[tokio::test]
+async fn duplicate_final_agent_message_in_same_turn_is_rendered_once() {
+    let (mut chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "s1".into(),
+        msg: EventMsg::TurnStarted(TurnStartedEvent {
+            turn_id: "turn-dup".to_string(),
+            model_context_window: None,
+            collaboration_mode_kind: ModeKind::Default,
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "seq-1".into(),
+        msg: EventMsg::AgentMessage(AgentMessageEvent {
+            message: "Same final message".into(),
+            phase: None,
+        }),
+    });
+    chat.handle_codex_event(Event {
+        id: "uuid-1".into(),
+        msg: EventMsg::AgentMessage(AgentMessageEvent {
+            message: "Same final message".into(),
+            phase: None,
+        }),
+    });
+
+    chat.handle_codex_event(Event {
+        id: "done".into(),
+        msg: EventMsg::TurnComplete(TurnCompleteEvent {
+            turn_id: "turn-dup".to_string(),
+            last_agent_message: None,
+        }),
+    });
+
+    let cells = drain_insert_history(&mut rx);
+    let combined: String = cells
+        .iter()
+        .map(|lines| lines_to_single_string(lines))
+        .collect();
+    assert_eq!(
+        combined.matches("Same final message").count(),
+        1,
+        "expected exactly one rendered final message: {combined}"
+    );
 }
 
 #[tokio::test]

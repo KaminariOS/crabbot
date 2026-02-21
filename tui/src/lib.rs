@@ -110,8 +110,114 @@ impl Client {
     pub async fn get_rate_limits_many(
         &self,
     ) -> anyhow::Result<Vec<crate::protocol::RateLimitSnapshot>> {
-        Ok(Vec::new())
+        let backend = get_shim_backend_config();
+        let response = app_server_rpc_request(
+            &backend.app_server_endpoint,
+            backend.auth_token.as_deref(),
+            "account/rateLimits/read",
+            json!({}),
+        )?;
+        Ok(parse_rate_limit_snapshots_from_result(&response.result))
     }
+}
+
+fn parse_rate_limit_snapshots_from_result(
+    value: &serde_json::Value,
+) -> Vec<crate::protocol::RateLimitSnapshot> {
+    let mut snapshots = Vec::new();
+
+    if let Some(map) = value
+        .get("rateLimitsByLimitId")
+        .or_else(|| value.get("rate_limits_by_limit_id"))
+        .and_then(serde_json::Value::as_object)
+    {
+        for snapshot in map.values() {
+            if let Some(parsed) = parse_rate_limit_snapshot_value(snapshot) {
+                snapshots.push(parsed);
+            }
+        }
+        return snapshots;
+    }
+
+    if let Some(array) = value
+        .get("rateLimits")
+        .or_else(|| value.get("rate_limits"))
+        .and_then(serde_json::Value::as_array)
+    {
+        for snapshot in array {
+            if let Some(parsed) = parse_rate_limit_snapshot_value(snapshot) {
+                snapshots.push(parsed);
+            }
+        }
+    }
+
+    snapshots
+}
+
+fn parse_rate_limit_snapshot_value(
+    value: &serde_json::Value,
+) -> Option<crate::protocol::RateLimitSnapshot> {
+    let primary = parse_rate_limit_window_value(value.get("primary"));
+    let secondary = parse_rate_limit_window_value(value.get("secondary"));
+    let credits = value
+        .get("credits")
+        .map(|credits| crate::protocol::CreditsSnapshot {
+            has_credits: credits
+                .get("hasCredits")
+                .or_else(|| credits.get("has_credits"))
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            unlimited: credits
+                .get("unlimited")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false),
+            balance: credits
+                .get("balance")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+        });
+
+    Some(crate::protocol::RateLimitSnapshot {
+        limit_id: value
+            .get("limitId")
+            .or_else(|| value.get("limit_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        limit_name: value
+            .get("limitName")
+            .or_else(|| value.get("limit_name"))
+            .and_then(serde_json::Value::as_str)
+            .map(ToString::to_string),
+        primary,
+        secondary,
+        credits,
+        plan_type: value
+            .get("planType")
+            .or_else(|| value.get("plan_type"))
+            .cloned()
+            .and_then(|raw| serde_json::from_value(raw).ok()),
+    })
+}
+
+fn parse_rate_limit_window_value(
+    value: Option<&serde_json::Value>,
+) -> Option<crate::protocol::RateLimitWindow> {
+    let window = value?;
+    Some(crate::protocol::RateLimitWindow {
+        used_percent: window
+            .get("usedPercent")
+            .or_else(|| window.get("used_percent"))
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or_default(),
+        resets_at: window
+            .get("resetsAt")
+            .or_else(|| window.get("resets_at"))
+            .and_then(serde_json::Value::as_i64),
+        window_minutes: window
+            .get("windowMinutes")
+            .or_else(|| window.get("window_minutes"))
+            .and_then(serde_json::Value::as_i64),
+    })
 }
 
 pub mod config {
@@ -683,6 +789,20 @@ impl AuthManager {
                 account_id: None,
                 email,
                 plan_type: None,
+            }),
+        }
+    }
+
+    pub fn from_chatgpt_account(
+        email: Option<String>,
+        plan_type: Option<codex_protocol::account::PlanType>,
+    ) -> Self {
+        Self {
+            auth: Some(CachedAuth {
+                mode: auth::AuthMode::Chatgpt,
+                account_id: None,
+                email,
+                plan_type,
             }),
         }
     }
@@ -2342,60 +2462,32 @@ pub mod features {
     }
 
     impl Feature {
-        pub const fn key(self) -> &'static str {
-            match self {
-                Feature::CollaborationModes => "collaboration_modes",
-                Feature::Personality => "personality",
-                Feature::Apps => "apps",
-                Feature::PreventIdleSleep => "prevent_idle_sleep",
-                Feature::RuntimeMetrics => "runtime_metrics",
-                Feature::GhostCommit => "ghost_commit",
-                Feature::ShellTool => "shell_tool",
-                Feature::JsRepl => "js_repl",
-                Feature::UnifiedExec => "unified_exec",
-                Feature::ApplyPatchFreeform => "apply_patch_freeform",
-                Feature::WebSearchRequest => "web_search_request",
-                Feature::WebSearchCached => "web_search_cached",
-                Feature::SearchTool => "search_tool",
-                Feature::UseLinuxSandboxBwrap => "use_linux_sandbox_bwrap",
-                Feature::RequestRule => "request_rule",
-                Feature::WindowsSandbox => "windows_sandbox",
-                Feature::WindowsSandboxElevated => "windows_sandbox_elevated",
-                Feature::Steer => "steer",
-            }
-        }
-        pub fn from_key(key: &str) -> Option<Self> {
-            match key {
-                "collaboration_modes" => Some(Self::CollaborationModes),
-                "personality" => Some(Self::Personality),
-                "apps" => Some(Self::Apps),
-                "prevent_idle_sleep" => Some(Self::PreventIdleSleep),
-                "runtime_metrics" => Some(Self::RuntimeMetrics),
-                "ghost_commit" => Some(Self::GhostCommit),
-                "shell_tool" => Some(Self::ShellTool),
-                "js_repl" => Some(Self::JsRepl),
-                "unified_exec" => Some(Self::UnifiedExec),
-                "apply_patch_freeform" => Some(Self::ApplyPatchFreeform),
-                "web_search_request" => Some(Self::WebSearchRequest),
-                "web_search_cached" => Some(Self::WebSearchCached),
-                "search_tool" => Some(Self::SearchTool),
-                "use_linux_sandbox_bwrap" => Some(Self::UseLinuxSandboxBwrap),
-                "request_rule" => Some(Self::RequestRule),
-                "windows_sandbox" => Some(Self::WindowsSandbox),
-                "windows_sandbox_elevated" => Some(Self::WindowsSandboxElevated),
-                "steer" => Some(Self::Steer),
-                _ => None,
-            }
+        fn info(self) -> &'static FeatureSpec {
+            FEATURES
+                .iter()
+                .find(|spec| spec.id == self)
+                .unwrap_or_else(|| unreachable!("missing FeatureSpec for {:?}", self))
         }
 
-        pub const fn default_enabled(self) -> bool {
-            let _ = self;
-            false
+        pub fn key(self) -> &'static str {
+            self.info().key
+        }
+        pub fn from_key(key: &str) -> Option<Self> {
+            FEATURES
+                .iter()
+                .find(|spec| spec.key == key)
+                .map(|spec| spec.id)
+        }
+
+        pub fn default_enabled(self) -> bool {
+            self.info().default_enabled
         }
     }
 
     pub struct FeatureSpec {
         pub id: Feature,
+        pub key: &'static str,
+        pub default_enabled: bool,
         pub stage: FeatureStage,
     }
 
@@ -2430,7 +2522,13 @@ pub mod features {
 
     impl Features {
         pub fn with_defaults() -> Self {
-            Self::default()
+            let mut enabled = HashSet::new();
+            for spec in FEATURES {
+                if spec.default_enabled {
+                    enabled.insert(spec.id);
+                }
+            }
+            Self { enabled }
         }
         pub fn enabled(&self, feature: Feature) -> bool {
             self.enabled.contains(&feature)
@@ -2446,7 +2544,116 @@ pub mod features {
         }
     }
 
-    pub static FEATURES: &[FeatureSpec] = &[];
+    pub static FEATURES: &[FeatureSpec] = &[
+        FeatureSpec {
+            id: Feature::CollaborationModes,
+            key: "collaboration_modes",
+            default_enabled: true,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::Personality,
+            key: "personality",
+            default_enabled: true,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::Apps,
+            key: "apps",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::PreventIdleSleep,
+            key: "prevent_idle_sleep",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::RuntimeMetrics,
+            key: "runtime_metrics",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::GhostCommit,
+            key: "ghost_commit",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::ShellTool,
+            key: "shell_tool",
+            default_enabled: true,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::JsRepl,
+            key: "js_repl",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::UnifiedExec,
+            key: "unified_exec",
+            default_enabled: !cfg!(windows),
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::ApplyPatchFreeform,
+            key: "apply_patch_freeform",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::WebSearchRequest,
+            key: "web_search_request",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::WebSearchCached,
+            key: "web_search_cached",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::SearchTool,
+            key: "search_tool",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::UseLinuxSandboxBwrap,
+            key: "use_linux_sandbox_bwrap",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::RequestRule,
+            key: "request_rule",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::WindowsSandbox,
+            key: "windows_sandbox",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::WindowsSandboxElevated,
+            key: "windows_sandbox_elevated",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
+            id: Feature::Steer,
+            key: "steer",
+            default_enabled: true,
+            stage: FeatureStage::Stable,
+        },
+    ];
 }
 
 pub mod skills {
@@ -3907,8 +4114,54 @@ pub async fn run_main(
     } else {
         None
     };
-    let thread_id = cli.resume_session_id.or(cli.fork_session_id);
     let startup_picker_show_all = cli.resume_show_all || cli.fork_show_all;
+    let mut config = crate::config::Config::default();
+    if let Ok(cwd) = std::env::current_dir() {
+        config.cwd = cwd.clone();
+        config.codex_home = cwd;
+    }
+    let thread_id = if let Some(id_or_name) = cli.fork_session_id.as_deref() {
+        match resolve_named_or_id_thread_id_for_cli(&config, id_or_name)
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+        {
+            Some(thread_id) => Some(thread_id),
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "No saved session found with ID {id_or_name}. Run `crabbot fork` without an ID to choose from existing sessions."
+                )));
+            }
+        }
+    } else if let Some(id_or_name) = cli.resume_session_id.as_deref() {
+        match resolve_named_or_id_thread_id_for_cli(&config, id_or_name)
+            .await
+            .map_err(|err| std::io::Error::other(err.to_string()))?
+        {
+            Some(thread_id) => Some(thread_id),
+            None => {
+                return Err(std::io::Error::other(format!(
+                    "No saved session found with ID {id_or_name}. Run `crabbot resume` without an ID to choose from existing sessions."
+                )));
+            }
+        }
+    } else if cli.fork_last {
+        resolve_last_thread_id_for_cli(&config, LastThreadLookup::Fork)
+            .await
+            .ok()
+            .flatten()
+    } else if cli.resume_last {
+        resolve_last_thread_id_for_cli(
+            &config,
+            LastThreadLookup::Resume {
+                show_all: cli.resume_show_all,
+            },
+        )
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
 
     let exit_info = handle_tui(
         TuiArgs {
@@ -3923,6 +4176,105 @@ pub async fn run_main(
     .map_err(|err| std::io::Error::other(err.to_string()))?;
 
     Ok(exit_info)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum LastThreadLookup {
+    Resume { show_all: bool },
+    Fork,
+}
+
+async fn resolve_last_thread_id_for_cli(
+    config: &crate::config::Config,
+    mode: LastThreadLookup,
+) -> Result<Option<String>> {
+    let default_provider = config.model_provider_id.to_string();
+    let provider_filter = vec![default_provider.clone()];
+    let page = RolloutRecorder::list_threads(
+        config,
+        50,
+        None,
+        crate::ThreadSortKey::UpdatedAt,
+        INTERACTIVE_SESSION_SOURCES,
+        Some(provider_filter.as_slice()),
+        default_provider.as_str(),
+    )
+    .await
+    .map_err(|err| anyhow!(err.to_string()))?;
+
+    let cwd = match mode {
+        LastThreadLookup::Fork => None,
+        LastThreadLookup::Resume { show_all: true } => None,
+        LastThreadLookup::Resume { show_all: false } => std::env::current_dir().ok(),
+    };
+
+    let pick = page.items.iter().find(|item| {
+        if let Some(filter) = cwd.as_ref() {
+            return item.cwd.as_ref() == Some(filter);
+        }
+        true
+    });
+
+    Ok(pick.and_then(thread_item_to_thread_id_string))
+}
+
+async fn resolve_named_or_id_thread_id_for_cli(
+    config: &crate::config::Config,
+    id_or_name: &str,
+) -> Result<Option<String>> {
+    let trimmed = id_or_name.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    let is_thread_id = ThreadId::from_string(trimmed).is_ok();
+    let default_provider = config.model_provider_id.to_string();
+    let provider_filter = vec![default_provider.clone()];
+    let mut cursor: Option<Cursor> = None;
+
+    loop {
+        let page = RolloutRecorder::list_threads(
+            config,
+            200,
+            cursor.as_ref(),
+            crate::ThreadSortKey::UpdatedAt,
+            INTERACTIVE_SESSION_SOURCES,
+            Some(provider_filter.as_slice()),
+            default_provider.as_str(),
+        )
+        .await
+        .map_err(|err| anyhow!(err.to_string()))?;
+
+        if let Some(item) = page.items.iter().find(|item| {
+            let item_thread_id = thread_item_to_thread_id_string(item);
+            if is_thread_id {
+                return item_thread_id.as_deref() == Some(trimmed);
+            }
+            let file_stem = item.path.file_stem().and_then(|name| name.to_str());
+            let file_name = item.path.file_name().and_then(|name| name.to_str());
+            let title = item.first_user_message.as_deref();
+            file_stem == Some(trimmed) || file_name == Some(trimmed) || title == Some(trimmed)
+        }) {
+            return Ok(thread_item_to_thread_id_string(item));
+        }
+
+        cursor = page.next_cursor;
+        if cursor.is_none() {
+            return Ok(None);
+        }
+    }
+}
+
+fn thread_item_to_thread_id_string(item: &ThreadItem) -> Option<String> {
+    item.thread_id
+        .map(|id| id.to_string())
+        .or_else(|| extract_thread_id_from_picker_path(&item.path))
+        .or_else(|| {
+            item.path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
 }
 
 async fn resolve_session_selection_from_args(
@@ -3982,12 +4334,16 @@ pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<app::AppE
         config.cwd = cwd.clone();
         config.codex_home = cwd;
     }
+    if let Ok(Some(config_snapshot)) = crate::read_config_snapshot(state) {
+        apply_tui_config_snapshot(&mut config, &config_snapshot);
+    }
     let use_alt_screen = determine_alt_screen_mode(args.no_alt_screen, config.tui_alternate_screen);
     tui.set_alt_screen_enabled(use_alt_screen);
+    let auth_manager = resolve_auth_manager_for_tui(state);
 
     let run_result = app::App::run(
         &mut tui,
-        std::sync::Arc::new(AuthManager::default()),
+        auth_manager,
         config,
         Vec::new(),
         crate::config::ConfigOverrides::default(),
@@ -4009,6 +4365,122 @@ pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<app::AppE
     }
 
     Ok(exit_info)
+}
+
+fn apply_tui_config_snapshot(config: &mut crate::config::Config, snapshot: &serde_json::Value) {
+    let snapshot_model = snapshot
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string);
+    if snapshot_model.is_some() {
+        config.model = snapshot_model;
+    }
+
+    if let Some(model_provider_id) = snapshot
+        .get("model_provider")
+        .or_else(|| snapshot.get("modelProvider"))
+        .and_then(serde_json::Value::as_str)
+    {
+        config.model_provider_id = model_provider_id.to_string();
+    }
+
+    if let Some(chatgpt_base_url) = snapshot
+        .get("chatgpt_base_url")
+        .or_else(|| snapshot.get("chatgptBaseUrl"))
+        .and_then(serde_json::Value::as_str)
+    {
+        config.chatgpt_base_url = chatgpt_base_url.to_string();
+    }
+
+    if let Some(model_context_window) = snapshot
+        .get("model_context_window")
+        .or_else(|| snapshot.get("modelContextWindow"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        config.model_context_window = Some(model_context_window);
+    }
+
+    if let Some(reasoning_summary) = snapshot
+        .get("model_reasoning_summary")
+        .or_else(|| snapshot.get("modelReasoningSummary"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::config::ReasoningSummary>(value).ok())
+    {
+        config.model_reasoning_summary = reasoning_summary;
+    }
+
+    if let Some(reasoning_effort) = snapshot
+        .get("model_reasoning_effort")
+        .or_else(|| snapshot.get("modelReasoningEffort"))
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<crate::openai_models::ReasoningEffort>(value).ok()
+        })
+    {
+        config.model_reasoning_effort = Some(reasoning_effort);
+    }
+
+    if let Some(plan_mode_reasoning_effort) = snapshot
+        .get("plan_mode_reasoning_effort")
+        .or_else(|| snapshot.get("planModeReasoningEffort"))
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<crate::openai_models::ReasoningEffort>(value).ok()
+        })
+    {
+        config.plan_mode_reasoning_effort = Some(plan_mode_reasoning_effort);
+    }
+
+    if let Some(features) = snapshot
+        .get("features")
+        .and_then(serde_json::Value::as_object)
+    {
+        for (key, enabled) in features {
+            let Some(feature) = crate::features::Feature::from_key(key) else {
+                continue;
+            };
+            if enabled.as_bool().unwrap_or(false) {
+                config.features.enable(feature);
+            } else {
+                config.features.disable(feature);
+            }
+        }
+    }
+}
+
+fn resolve_auth_manager_for_tui(state: &CliState) -> std::sync::Arc<AuthManager> {
+    match crate::read_account(state, true) {
+        Ok(Some(account)) => {
+            let account_type = account
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            if account_type == "chatgpt" {
+                let email = account
+                    .get("email")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string);
+                let plan_type = account
+                    .get("planType")
+                    .or_else(|| account.get("plan_type"))
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<codex_protocol::account::PlanType>(value).ok()
+                    });
+                std::sync::Arc::new(AuthManager::from_chatgpt_account(email, plan_type))
+            } else if account_type == "apikey" || account_type == "api_key" {
+                std::sync::Arc::new(AuthManager::from_api_key())
+            } else {
+                std::sync::Arc::new(AuthManager::default())
+            }
+        }
+        Ok(None) => std::sync::Arc::new(AuthManager::default()),
+        Err(err) => {
+            tracing::debug!("failed to read account info for tui startup: {err:#}");
+            std::sync::Arc::new(AuthManager::default())
+        }
+    }
 }
 
 fn determine_alt_screen_mode(

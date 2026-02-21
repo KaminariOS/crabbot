@@ -224,7 +224,7 @@ struct ResumeCommand {
 
 #[derive(Debug, Args, Clone)]
 struct ForkCommand {
-    /// Conversation/session id (UUID) to fork.
+    /// Conversation/session id (UUID) or thread name to fork.
     #[arg(value_name = "SESSION_ID")]
     session_id: Option<String>,
     /// Fork the most recent session without showing the picker.

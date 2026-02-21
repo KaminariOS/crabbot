@@ -120,16 +120,19 @@ fn daemon_down(state_path: &Path, state: &CliState) -> Result<String> {
             for _ in 0..20 {
                 if !process_exists(process.pid) {
                     clear_daemon_process_state(&pid_path)?;
-                    return Ok(format!("daemon stopped (pid {})", process.pid));
+                    let output = format!("daemon stopped (pid {})", process.pid);
+                    return append_app_server_stop_output(output, &process.endpoint);
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             terminate_process(process.pid, "KILL")?;
             clear_daemon_process_state(&pid_path)?;
-            return Ok(format!("daemon force-stopped (pid {})", process.pid));
+            let output = format!("daemon force-stopped (pid {})", process.pid);
+            return append_app_server_stop_output(output, &process.endpoint);
         }
         clear_daemon_process_state(&pid_path)?;
-        return Ok("daemon was not running (stale pid state removed)".to_string());
+        let output = "daemon was not running (stale pid state removed)".to_string();
+        return append_app_server_stop_output(output, &process.endpoint);
     }
 
     if daemon_is_healthy(
@@ -140,20 +143,26 @@ fn daemon_down(state_path: &Path, state: &CliState) -> Result<String> {
             terminate_process(pid, "TERM")?;
             for _ in 0..20 {
                 if !process_exists(pid) {
-                    return Ok(format!("daemon stopped (unmanaged pid {pid})"));
+                    let output = format!("daemon stopped (unmanaged pid {pid})");
+                    return append_app_server_stop_output(output, &state.config.daemon_endpoint);
                 }
                 thread::sleep(Duration::from_millis(100));
             }
             terminate_process(pid, "KILL")?;
-            return Ok(format!("daemon force-stopped (unmanaged pid {pid})"));
+            let output = format!("daemon force-stopped (unmanaged pid {pid})");
+            return append_app_server_stop_output(output, &state.config.daemon_endpoint);
         }
-        return Ok(format!(
+        let output = format!(
             "daemon is healthy at {} but pid auto-detection failed",
             state.config.daemon_endpoint
-        ));
+        );
+        return append_app_server_stop_output(output, &state.config.daemon_endpoint);
     }
 
-    Ok("daemon is not running".to_string())
+    append_app_server_stop_output(
+        "daemon is not running".to_string(),
+        &state.config.daemon_endpoint,
+    )
 }
 
 fn daemon_restart(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -> Result<String> {
@@ -593,6 +602,60 @@ fn terminate_process(pid: u32, signal: &str) -> Result<()> {
     bail!("failed to send SIG{signal} to pid {pid}")
 }
 
+fn append_app_server_stop_output(mut output: String, daemon_endpoint: &str) -> Result<String> {
+    if let Some(pid) = stop_app_server_for_daemon_endpoint(daemon_endpoint)? {
+        output.push_str(&format!("\napp-server stopped (pid {pid})"));
+    }
+    Ok(output)
+}
+
+fn stop_app_server_for_daemon_endpoint(daemon_endpoint: &str) -> Result<Option<u32>> {
+    let app_server_endpoint = derive_internal_app_server_endpoint(daemon_endpoint);
+    stop_app_server_for_listen_endpoint(&app_server_endpoint)
+}
+
+fn stop_app_server_for_listen_endpoint(listen_endpoint: &str) -> Result<Option<u32>> {
+    let Some(pid) = find_app_server_pid_for_listen_endpoint(listen_endpoint)? else {
+        return Ok(None);
+    };
+
+    terminate_process(pid, "TERM")?;
+    for _ in 0..20 {
+        if !process_exists(pid) {
+            return Ok(Some(pid));
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    terminate_process(pid, "KILL")?;
+    Ok(Some(pid))
+}
+
+fn find_app_server_pid_for_listen_endpoint(listen_endpoint: &str) -> Result<Option<u32>> {
+    let output = Command::new("pgrep")
+        .args(["-af", "codex app-server"])
+        .output()
+        .context("run pgrep for codex app-server")?;
+    if !output.status.success() {
+        return Ok(None);
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    for line in stdout.lines() {
+        let mut parts = line.trim().splitn(2, char::is_whitespace);
+        let pid_raw = parts.next().unwrap_or_default();
+        let cmdline = parts.next().unwrap_or_default();
+        if cmdline.contains("codex app-server")
+            && cmdline.contains("--listen")
+            && cmdline.contains(listen_endpoint)
+            && let Ok(pid) = pid_raw.parse::<u32>()
+        {
+            return Ok(Some(pid));
+        }
+    }
+
+    Ok(None)
+}
+
 fn find_unmanaged_daemon_pid(endpoint: &str) -> Result<Option<u32>> {
     let daemon_output = Command::new("pgrep")
         .args(["-af", "crabbot_daemon"])
@@ -613,29 +676,7 @@ fn find_unmanaged_daemon_pid(endpoint: &str) -> Result<Option<u32>> {
         }
     }
 
-    let output = Command::new("pgrep")
-        .args(["-af", "codex app-server"])
-        .output()
-        .context("run pgrep for codex app-server")?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let mut parts = line.trim().splitn(2, char::is_whitespace);
-        let pid_raw = parts.next().unwrap_or_default();
-        let cmdline = parts.next().unwrap_or_default();
-        if cmdline.contains("codex app-server")
-            && cmdline.contains("--listen")
-            && cmdline.contains(endpoint)
-            && let Ok(pid) = pid_raw.parse::<u32>()
-        {
-            return Ok(Some(pid));
-        }
-    }
-
-    Ok(None)
+    find_app_server_pid_for_listen_endpoint(endpoint)
 }
 
 #[cfg(test)]

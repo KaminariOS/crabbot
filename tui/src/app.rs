@@ -736,10 +736,31 @@ impl App {
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
         let channel = self.thread_event_channels.get_mut(&thread_id)?;
-        let receiver = channel.receiver.take()?;
+        let mut receiver = channel.receiver.take()?;
+        // While this thread was inactive, we buffered events in `ThreadEventStore` but may still
+        // have stale queued items left in the per-thread receiver from when it was last active.
+        // Drop those queued items before taking the replay snapshot to avoid double-applying them
+        // (snapshot replay + immediate receiver drain).
+        let mut dropped_stale_events = 0usize;
+        loop {
+            match receiver.try_recv() {
+                Ok(_) => {
+                    dropped_stale_events = dropped_stale_events.saturating_add(1);
+                }
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
         let mut store = channel.store.lock().await;
         store.active = true;
         let snapshot = store.snapshot();
+        if dropped_stale_events > 0 {
+            tracing::debug!(
+                thread_id = %thread_id,
+                dropped_stale_events,
+                replay_events = snapshot.events.len(),
+                "dropped stale queued thread events before replay"
+            );
+        }
         Some((receiver, snapshot))
     }
 

@@ -632,6 +632,9 @@ pub(crate) struct ChatWidget {
     saw_plan_update_this_turn: bool,
     // Whether the current turn emitted a proposed plan item.
     saw_plan_item_this_turn: bool,
+    // Last finalized agent message observed in the current turn.
+    // Used to suppress duplicated final AgentMessage events.
+    last_agent_message_in_turn: Option<String>,
     // Incremental buffer for streamed plan content.
     plan_delta_buffer: String,
     // True while a plan item is streaming.
@@ -1215,6 +1218,10 @@ impl ChatWidget {
     }
 
     fn on_agent_message(&mut self, message: String) {
+        if self.last_agent_message_in_turn.as_deref() == Some(message.as_str()) {
+            return;
+        }
+        self.last_agent_message_in_turn = Some(message.clone());
         // If we have a stream_controller, then the final agent message is redundant and will be a
         // duplicate of what has already been streamed.
         if self.stream_controller.is_none() && !message.is_empty() {
@@ -1336,6 +1343,7 @@ impl ChatWidget {
         self.turn_sleep_inhibitor.set_turn_running(true);
         self.saw_plan_update_this_turn = false;
         self.saw_plan_item_this_turn = false;
+        self.last_agent_message_in_turn = None;
         self.plan_delta_buffer.clear();
         self.plan_item_active = false;
         self.adaptive_chunking.reset();
@@ -2719,6 +2727,7 @@ impl ChatWidget {
             had_work_activity: false,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
+            last_agent_message_in_turn: None,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             last_separator_elapsed_secs: None,
@@ -2878,6 +2887,7 @@ impl ChatWidget {
             forked_from: None,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
+            last_agent_message_in_turn: None,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             queued_user_messages: VecDeque::new(),
@@ -3050,6 +3060,7 @@ impl ChatWidget {
             had_work_activity: false,
             saw_plan_update_this_turn: false,
             saw_plan_item_this_turn: false,
+            last_agent_message_in_turn: None,
             plan_delta_buffer: String::new(),
             plan_item_active: false,
             last_separator_elapsed_secs: None,
