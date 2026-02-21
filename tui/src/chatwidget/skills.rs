@@ -10,17 +10,17 @@ use crate::bottom_pane::SelectionViewParams;
 use crate::bottom_pane::SkillsToggleItem;
 use crate::bottom_pane::SkillsToggleView;
 use crate::bottom_pane::popup_consts::standard_popup_hint_line;
-use crate::connectors::AppInfo;
-use crate::connectors::connector_mention_slug;
 use crate::skills_helpers::skill_description;
 use crate::skills_helpers::skill_display_name;
-use codex_core::protocol::ListSkillsResponseEvent;
-use codex_core::protocol::SkillMetadata as ProtocolSkillMetadata;
-use codex_core::protocol::SkillsListEntry;
+use codex_chatgpt::connectors::AppInfo;
+use codex_core::connectors::connector_mention_slug;
 use codex_core::skills::model::SkillDependencies;
 use codex_core::skills::model::SkillInterface;
 use codex_core::skills::model::SkillMetadata;
 use codex_core::skills::model::SkillToolDependency;
+use codex_protocol::protocol::ListSkillsResponseEvent;
+use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
+use codex_protocol::protocol::SkillsListEntry;
 
 impl ChatWidget {
     pub(crate) fn open_skills_list(&mut self) {
@@ -189,9 +189,10 @@ fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> SkillMetadata {
                     })
                     .collect(),
             }),
+        policy: None,
+        permissions: None,
         path: skill.path.clone(),
         scope: skill.scope,
-        enabled: true,
     }
 }
 

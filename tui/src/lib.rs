@@ -61,6 +61,8 @@ use url::Url;
 
 extern crate self as codex_ansi_escape;
 extern crate self as codex_app_server_protocol;
+extern crate self as codex_backend_client;
+extern crate self as codex_chatgpt;
 extern crate self as codex_core;
 extern crate self as codex_feedback;
 extern crate self as codex_file_search;
@@ -72,6 +74,24 @@ extern crate self as codex_utils_elapsed;
 extern crate self as codex_utils_sandbox_summary;
 extern crate self as codex_utils_sleep_inhibitor;
 extern crate self as rmcp;
+
+#[derive(Debug, Clone, Default)]
+pub struct Client;
+
+impl Client {
+    pub fn from_auth(
+        _base_url: impl Into<String>,
+        _auth: &crate::CodexAuth,
+    ) -> anyhow::Result<Self> {
+        Ok(Self)
+    }
+
+    pub async fn get_rate_limits_many(
+        &self,
+    ) -> anyhow::Result<Vec<crate::protocol::RateLimitSnapshot>> {
+        Ok(Vec::new())
+    }
+}
 
 pub mod config {
     use crate::WireApi;
@@ -269,11 +289,13 @@ pub mod config {
         pub codex_home: std::path::PathBuf,
         pub cwd: PathBuf,
         pub model: Option<String>,
+        pub model_catalog: Option<serde_json::Value>,
         pub model_provider_id: String,
         pub model_provider: ConfigModelProvider,
         pub permissions: Permissions,
         pub model_reasoning_summary: ReasoningSummary,
         pub model_reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
+        pub plan_mode_reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
         pub model_context_window: Option<i64>,
         pub review_model: Option<String>,
         pub model_auto_compact_token_limit: Option<i64>,
@@ -339,6 +361,7 @@ pub mod config {
                 codex_home: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
                 cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
                 model: None,
+                model_catalog: None,
                 model_provider_id: "openai".to_string(),
                 model_provider: ConfigModelProvider::default(),
                 permissions: Permissions {
@@ -351,6 +374,7 @@ pub mod config {
                 },
                 model_reasoning_summary: ReasoningSummary::None,
                 model_reasoning_effort: None,
+                plan_mode_reasoning_effort: None,
                 model_context_window: None,
                 review_model: None,
                 model_auto_compact_token_limit: None,
@@ -801,6 +825,7 @@ pub struct ThreadConfigSnapshot {
     pub sandbox_policy: crate::protocol::SandboxPolicy,
     pub cwd: std::path::PathBuf,
     pub reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
+    pub session_source: crate::protocol::SessionSource,
 }
 
 impl CodexThread {
@@ -1121,7 +1146,10 @@ impl CodexThread {
                 Some(crate::protocol::Event {
                     id: format!("seq-{sequence}"),
                     msg: crate::protocol::EventMsg::AgentMessage(
-                        crate::protocol::AgentMessageEvent { message: text },
+                        crate::protocol::AgentMessageEvent {
+                            message: text,
+                            phase: None,
+                        },
                     ),
                 })
             }
@@ -1164,7 +1192,9 @@ impl CodexThread {
                     state.last_sequence = state.last_sequence.max(envelope.sequence);
                     match envelope.event {
                         crabbot_protocol::DaemonRpcStreamEvent::Notification(notification) => {
-                            let mapped = if notification.method == "codex/event" {
+                            let mapped = if notification.method == "codex/event"
+                                || notification.method.starts_with("codex/event/")
+                            {
                                 Self::event_from_codex_notification(
                                     envelope.sequence,
                                     &notification.params,
@@ -1213,6 +1243,7 @@ impl CodexThread {
                 sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
                 cwd: std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
                 reasoning_effort: None,
+                session_source: crate::protocol::SessionSource::Cli,
             })
     }
 
@@ -1244,6 +1275,7 @@ impl Default for ThreadManager {
             std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()),
             std::sync::Arc::new(crate::AuthManager::default()),
             crate::protocol::SessionSource::Cli,
+            None,
         )
     }
 }
@@ -1253,6 +1285,7 @@ impl ThreadManager {
         _codex_home: std::path::PathBuf,
         _auth_manager: std::sync::Arc<crate::AuthManager>,
         _session_source: crate::protocol::SessionSource,
+        _model_catalog: Option<serde_json::Value>,
     ) -> Self {
         let (thread_created_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
@@ -1334,6 +1367,7 @@ impl ThreadManager {
             sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
             cwd: config.cwd.clone(),
             reasoning_effort: None,
+            session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
         if let Ok(mut threads) = self.threads.lock() {
@@ -1395,7 +1429,6 @@ impl ThreadManager {
             }),
         )
         .map_err(|err| CodexError::new(format!("thread/resume failed: {err}")))?;
-
         let model = response
             .result
             .get("thread")
@@ -1405,6 +1438,7 @@ impl ThreadManager {
             .or(config.model.as_deref())
             .unwrap_or("unknown")
             .to_string();
+        let initial_messages = parse_initial_messages_from_thread_rpc_result(&response.result);
         let config_snapshot = ThreadConfigSnapshot {
             model: model.clone(),
             model_provider_id: config.model_provider_id.clone(),
@@ -1412,6 +1446,7 @@ impl ThreadManager {
             sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
             cwd: config.cwd.clone(),
             reasoning_effort: None,
+            session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
         if let Ok(mut threads) = self.threads.lock() {
@@ -1434,7 +1469,7 @@ impl ThreadManager {
                 reasoning_effort: None,
                 history_log_id: 0,
                 history_entry_count: 0,
-                initial_messages: None,
+                initial_messages,
                 network_proxy: None,
                 rollout_path: None,
             },
@@ -1494,6 +1529,7 @@ impl ThreadManager {
             .or(config.model.as_deref())
             .unwrap_or("unknown")
             .to_string();
+        let initial_messages = parse_initial_messages_from_thread_rpc_result(&response.result);
         let config_snapshot = ThreadConfigSnapshot {
             model: model.clone(),
             model_provider_id: config.model_provider_id.clone(),
@@ -1501,6 +1537,7 @@ impl ThreadManager {
             sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
             cwd: config.cwd.clone(),
             reasoning_effort: None,
+            session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
         if let Ok(mut threads) = self.threads.lock() {
@@ -1523,7 +1560,7 @@ impl ThreadManager {
                 reasoning_effort: None,
                 history_log_id: 0,
                 history_entry_count: 0,
-                initial_messages: None,
+                initial_messages,
                 network_proxy: None,
                 rollout_path: None,
             },
@@ -1631,6 +1668,7 @@ impl RolloutRecorder {
                     .or_else(|| row.get("path"))
                     .and_then(Value::as_str)
                     .map(PathBuf::from)
+                    .filter(|candidate| extract_thread_id_from_picker_path(candidate).is_some())
                     .unwrap_or_else(|| PathBuf::from(id.clone()));
                 let thread_id = ThreadId::from_string(&id).ok();
                 let created_at = normalize_timestamp(
@@ -1972,8 +2010,20 @@ pub mod skills {
     pub mod model {
         pub use codex_protocol::protocol::SkillDependencies;
         pub use codex_protocol::protocol::SkillInterface;
-        pub use codex_protocol::protocol::SkillMetadata;
         pub use codex_protocol::protocol::SkillToolDependency;
+
+        #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+        pub struct SkillMetadata {
+            pub name: String,
+            pub description: String,
+            pub short_description: Option<String>,
+            pub interface: Option<SkillInterface>,
+            pub dependencies: Option<SkillDependencies>,
+            pub policy: Option<serde_json::Value>,
+            pub permissions: Option<serde_json::Value>,
+            pub path: std::path::PathBuf,
+            pub scope: codex_protocol::protocol::SkillScope,
+        }
     }
 }
 
@@ -2037,8 +2087,29 @@ pub mod test_support {
         &ALL_MODEL_PRESETS
     }
 }
+
 pub mod connectors {
-    pub use codex_chatgpt::connectors::AppInfo;
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+    pub struct AppInfo {
+        pub id: String,
+        pub name: String,
+        pub description: Option<String>,
+        pub logo_url: Option<String>,
+        pub logo_url_dark: Option<String>,
+        pub distribution_channel: Option<String>,
+        pub branding: Option<serde_json::Value>,
+        pub app_metadata: Option<serde_json::Value>,
+        pub labels: Option<serde_json::Value>,
+        pub install_url: Option<String>,
+        pub is_accessible: bool,
+        pub is_enabled: bool,
+    }
+
+    #[derive(Debug, Clone, Default, PartialEq, Eq)]
+    pub struct AccessibleConnectorsStatus {
+        pub connectors: Vec<AppInfo>,
+        pub codex_apps_ready: bool,
+    }
 
     pub fn connector_display_label(connector: &AppInfo) -> String {
         connector.name.clone()
@@ -2076,6 +2147,18 @@ pub mod connectors {
             .collect())
     }
 
+    pub async fn list_accessible_connectors_from_mcp_tools_with_options_and_status(
+        config: &crate::config::Config,
+        force_refetch: bool,
+    ) -> anyhow::Result<AccessibleConnectorsStatus> {
+        let connectors =
+            list_accessible_connectors_from_mcp_tools_with_options(config, force_refetch).await?;
+        Ok(AccessibleConnectorsStatus {
+            connectors,
+            codex_apps_ready: true,
+        })
+    }
+
     pub async fn list_all_connectors(
         _config: &crate::config::Config,
     ) -> anyhow::Result<Vec<AppInfo>> {
@@ -2084,6 +2167,13 @@ pub mod connectors {
         state.config.app_server_endpoint = backend.app_server_endpoint;
         state.config.auth_token = backend.auth_token;
         crate::core_compat::list_connectors(&state)
+    }
+
+    pub async fn list_all_connectors_with_options(
+        config: &crate::config::Config,
+        _force_refetch: bool,
+    ) -> anyhow::Result<Vec<AppInfo>> {
+        list_all_connectors(config).await
     }
 
     pub fn merge_connectors_with_accessible(
@@ -2554,6 +2644,7 @@ pub mod config_loader {
         pub allow_upstream_proxy: Option<bool>,
         pub dangerously_allow_non_loopback_proxy: Option<bool>,
         pub dangerously_allow_non_loopback_admin: Option<bool>,
+        pub dangerously_allow_all_unix_sockets: Option<bool>,
         pub allowed_domains: Option<Vec<String>>,
         pub denied_domains: Option<Vec<String>>,
         pub allow_unix_sockets: Option<Vec<String>>,
@@ -2852,6 +2943,30 @@ pub mod app_server_protocol {
 pub use app_server_protocol::ConfigLayerSource;
 
 pub mod terminal {
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum TerminalName {
+        AppleTerminal,
+        Ghostty,
+        Iterm2,
+        WarpTerminal,
+        VsCode,
+        WezTerm,
+        Kitty,
+        Alacritty,
+        Konsole,
+        GnomeTerminal,
+        Vte,
+        WindowsTerminal,
+        Dumb,
+        Unknown,
+    }
+
+    impl Default for TerminalName {
+        fn default() -> Self {
+            Self::Unknown
+        }
+    }
+
     #[derive(Debug, Clone)]
     pub enum Multiplexer {
         Zellij { pane_id: Option<String> },
@@ -2859,6 +2974,7 @@ pub mod terminal {
 
     #[derive(Debug, Clone, Default)]
     pub struct TerminalInfo {
+        pub name: TerminalName,
         pub multiplexer: Option<Multiplexer>,
     }
 
@@ -2873,7 +2989,10 @@ pub mod terminal {
         } else {
             None
         };
-        TerminalInfo { multiplexer }
+        TerminalInfo {
+            name: TerminalName::Unknown,
+            multiplexer,
+        }
     }
 
     pub fn user_agent() -> String {
@@ -2985,7 +3104,7 @@ impl CodexLogSnapshot {
         _classification: &str,
         _reason: Option<&str>,
         _include_logs: bool,
-        _rollout_path: Option<&std::path::Path>,
+        _log_file_paths: &[std::path::PathBuf],
         _source: Option<crate::protocol::SessionSource>,
     ) -> Result<(), String> {
         Ok(())
@@ -3026,8 +3145,11 @@ pub use codex_utils_approval_presets_stub::builtin_approval_presets;
 
 /// Stub backing `codex_utils_cli`.
 mod codex_utils_cli_stub {
+    use clap::ArgAction;
     use serde::Deserialize;
     use serde::Serialize;
+    use serde::de::Error as SerdeError;
+    use toml::Value;
 
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
     #[serde(rename_all = "kebab-case")]
@@ -3046,9 +3168,115 @@ mod codex_utils_cli_stub {
         WorkspaceWrite,
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(clap::Parser, Debug, Default, Clone)]
     pub struct CliConfigOverrides {
-        pub model_provider: Option<String>,
+        #[arg(
+            short = 'c',
+            long = "config",
+            value_name = "key=value",
+            action = ArgAction::Append,
+            global = true,
+        )]
+        pub raw_overrides: Vec<String>,
+    }
+
+    impl CliConfigOverrides {
+        pub fn parse_overrides(&self) -> Result<Vec<(String, Value)>, String> {
+            self.raw_overrides
+                .iter()
+                .map(|s| {
+                    let mut parts = s.splitn(2, '=');
+                    let key = match parts.next() {
+                        Some(k) => k.trim(),
+                        None => return Err("Override missing key".to_string()),
+                    };
+                    let value_str = parts
+                        .next()
+                        .ok_or_else(|| format!("Invalid override (missing '='): {s}"))?
+                        .trim();
+
+                    if key.is_empty() {
+                        return Err(format!("Empty key in override: {s}"));
+                    }
+
+                    let value: Value = match parse_toml_value(value_str) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            let trimmed = value_str.trim().trim_matches(|c| c == '"' || c == '\'');
+                            Value::String(trimmed.to_string())
+                        }
+                    };
+
+                    Ok((canonicalize_override_key(key), value))
+                })
+                .collect()
+        }
+
+        pub fn apply_on_value(&self, target: &mut Value) -> Result<(), String> {
+            let overrides = self.parse_overrides()?;
+            for (path, value) in overrides {
+                apply_single_override(target, &path, value);
+            }
+            Ok(())
+        }
+    }
+
+    fn canonicalize_override_key(key: &str) -> String {
+        if key == "use_linux_sandbox_bwrap" {
+            "features.use_linux_sandbox_bwrap".to_string()
+        } else {
+            key.to_string()
+        }
+    }
+
+    fn apply_single_override(root: &mut Value, path: &str, value: Value) {
+        use toml::value::Table;
+
+        let parts: Vec<&str> = path.split('.').collect();
+        let mut current = root;
+
+        for (i, part) in parts.iter().enumerate() {
+            let is_last = i == parts.len() - 1;
+
+            if is_last {
+                match current {
+                    Value::Table(tbl) => {
+                        tbl.insert((*part).to_string(), value);
+                    }
+                    _ => {
+                        let mut tbl = Table::new();
+                        tbl.insert((*part).to_string(), value);
+                        *current = Value::Table(tbl);
+                    }
+                }
+                return;
+            }
+
+            match current {
+                Value::Table(tbl) => {
+                    current = tbl
+                        .entry((*part).to_string())
+                        .or_insert_with(|| Value::Table(Table::new()));
+                }
+                _ => {
+                    *current = Value::Table(Table::new());
+                    if let Value::Table(tbl) = current {
+                        current = tbl
+                            .entry((*part).to_string())
+                            .or_insert_with(|| Value::Table(Table::new()));
+                    }
+                }
+            }
+        }
+    }
+
+    fn parse_toml_value(raw: &str) -> Result<Value, toml::de::Error> {
+        let wrapped = format!("_x_ = {raw}");
+        let table: toml::Table = toml::from_str(&wrapped)?;
+        table
+            .get("_x_")
+            .cloned()
+            .ok_or_else(|| SerdeError::custom("missing sentinel key"))
     }
 
     pub mod format_env_display {
@@ -3160,7 +3388,7 @@ pub enum ResolveCwdOutcome {
 pub async fn resolve_cwd_for_resume_or_fork(
     _tui: &mut crate::tui::Tui,
     current: &std::path::Path,
-    _thread_id: &str,
+    _path: &std::path::Path,
     _action: crate::cwd_prompt::CwdPromptAction,
     _allow_current: bool,
 ) -> std::io::Result<ResolveCwdOutcome> {
@@ -3308,8 +3536,14 @@ pub async fn run_startup_picker(
     let _ = crate::tui::restore();
 
     match selection {
-        resume_picker::SessionSelection::Resume(thread_id)
-        | resume_picker::SessionSelection::Fork(thread_id) => Ok(Some(thread_id)),
+        resume_picker::SessionSelection::Resume(path)
+        | resume_picker::SessionSelection::Fork(path) => {
+            Ok(extract_thread_id_from_picker_path(&path).or_else(|| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_string)
+            }))
+        }
         resume_picker::SessionSelection::StartFresh | resume_picker::SessionSelection::Exit => {
             Ok(None)
         }
@@ -3376,7 +3610,12 @@ async fn resolve_session_selection_from_args(
         if trimmed.is_empty() {
             bail!("thread id cannot be empty");
         }
-        return Ok(resume_picker::SessionSelection::Resume(trimmed.to_string()));
+        return Ok(match args.startup_picker {
+            Some(StartupPicker::Fork) => {
+                resume_picker::SessionSelection::Fork(std::path::PathBuf::from(trimmed))
+            }
+            _ => resume_picker::SessionSelection::Resume(std::path::PathBuf::from(trimmed)),
+        });
     }
 
     let Some(mode) = args.startup_picker.as_ref() else {
@@ -3403,13 +3642,16 @@ async fn resolve_session_selection_from_args(
 }
 
 pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+    tooltips::announcement::prewarm();
+
     set_shim_backend_config(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
     );
     let session_selection = resolve_session_selection_from_args(&args, state).await?;
 
-    let terminal = crate::tui::init().context("initialize tui terminal")?;
+    let mut terminal = crate::tui::init().context("initialize tui terminal")?;
+    terminal.clear()?;
     let mut tui = crate::tui::Tui::new(terminal);
     let mut config = crate::config::Config::default();
     if let Ok(cwd) = std::env::current_dir() {
@@ -3499,9 +3741,197 @@ fn extract_thread_id_from_picker_path(path: &std::path::Path) -> Option<String> 
         }
     }
 
-    candidates
+    let matched = candidates
         .into_iter()
-        .find(|value| ThreadId::from_string(value).is_ok())
+        .find(|value| ThreadId::from_string(value).is_ok());
+    matched
+}
+
+fn parse_initial_messages_from_thread_rpc_result(
+    result: &serde_json::Value,
+) -> Option<Vec<crate::protocol::EventMsg>> {
+    let raw_messages = result
+        .get("initialMessages")
+        .or_else(|| result.get("initial_messages"))
+        .or_else(|| {
+            result
+                .get("thread")
+                .and_then(|thread| thread.get("initialMessages"))
+        })
+        .or_else(|| {
+            result
+                .get("thread")
+                .and_then(|thread| thread.get("initial_messages"))
+        });
+
+    if let Some(raw_messages) = raw_messages.and_then(serde_json::Value::as_array) {
+        let parsed = raw_messages
+            .iter()
+            .filter_map(|message| {
+                serde_json::from_value::<crate::protocol::EventMsg>(message.clone()).ok()
+            })
+            .collect::<Vec<_>>();
+        return if parsed.is_empty() {
+            None
+        } else {
+            Some(parsed)
+        };
+    }
+
+    let parsed = parse_initial_messages_from_thread_turns(
+        result.get("thread").and_then(|thread| thread.get("turns")),
+    );
+    parsed
+}
+
+fn parse_initial_messages_from_thread_turns(
+    turns: Option<&serde_json::Value>,
+) -> Option<Vec<crate::protocol::EventMsg>> {
+    let turns = turns.and_then(serde_json::Value::as_array)?;
+    let mut events = Vec::new();
+
+    for turn in turns {
+        let turn_id = turn
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        events.push(crate::protocol::EventMsg::TurnStarted(
+            crate::protocol::TurnStartedEvent {
+                turn_id: turn_id.clone(),
+                model_context_window: None,
+                collaboration_mode_kind: crate::config_types::ModeKind::default(),
+            },
+        ));
+
+        let mut last_agent_message: Option<String> = None;
+        if let Some(items) = turn.get("items").and_then(serde_json::Value::as_array) {
+            for item in items {
+                if let Some((message, text_elements)) = parse_user_message_item_from_turn(item) {
+                    events.push(crate::protocol::EventMsg::UserMessage(
+                        crate::protocol::UserMessageEvent {
+                            message,
+                            images: None,
+                            local_images: Vec::new(),
+                            text_elements,
+                        },
+                    ));
+                } else if let Some(message) = parse_agent_message_text_from_turn(item) {
+                    last_agent_message = Some(message.clone());
+                    events.push(crate::protocol::EventMsg::AgentMessage(
+                        crate::protocol::AgentMessageEvent {
+                            message,
+                            phase: None,
+                        },
+                    ));
+                }
+            }
+        }
+
+        events.push(crate::protocol::EventMsg::TurnComplete(
+            crate::protocol::TurnCompleteEvent {
+                turn_id,
+                last_agent_message,
+            },
+        ));
+    }
+
+    if events.is_empty() {
+        None
+    } else {
+        Some(events)
+    }
+}
+
+fn parse_user_message_item_from_turn(
+    value: &serde_json::Value,
+) -> Option<(String, Vec<crate::user_input::TextElement>)> {
+    let item_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_user_item = matches!(
+        item_type.as_str(),
+        "usermessage" | "user_message" | "user-message"
+    ) || (item_type == "message" && role == "user");
+    if !is_user_item {
+        return None;
+    }
+
+    let message = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|content| {
+                    content
+                        .iter()
+                        .find_map(|entry| entry.get("text").and_then(serde_json::Value::as_str))
+                })
+        })?
+        .to_string();
+
+    let text_elements = value
+        .get("text_elements")
+        .or_else(|| value.get("textElements"))
+        .cloned()
+        .and_then(|raw| serde_json::from_value(raw).ok())
+        .unwrap_or_default();
+
+    Some((message, text_elements))
+}
+
+fn parse_agent_message_text_from_turn(value: &serde_json::Value) -> Option<String> {
+    let item_type = value
+        .get("type")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let role = value
+        .get("role")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let is_agent_item = matches!(
+        item_type.as_str(),
+        "agentmessage" | "agent_message" | "agent-message"
+    ) || (item_type == "message" && role == "assistant");
+    if !is_agent_item {
+        return None;
+    }
+
+    let message = value
+        .get("text")
+        .or_else(|| value.get("message"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            value
+                .get("content")
+                .and_then(serde_json::Value::as_array)
+                .map(|content| {
+                    content
+                        .iter()
+                        .filter_map(|entry| entry.get("text").and_then(serde_json::Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("")
+                })
+        })?;
+
+    if message.is_empty() {
+        None
+    } else {
+        Some(message)
+    }
 }
 fn truncate_for_width(text: &str, width: usize) -> String {
     if width == 0 {

@@ -42,8 +42,8 @@ const LOAD_NEAR_THRESHOLD: usize = 5;
 #[derive(Debug, Clone)]
 pub enum SessionSelection {
     StartFresh,
-    Resume(String),
-    Fork(String),
+    Resume(PathBuf),
+    Fork(PathBuf),
     Exit,
 }
 
@@ -68,10 +68,10 @@ impl SessionPickerAction {
         }
     }
 
-    fn selection(self, thread_id: String) -> SessionSelection {
+    fn selection(self, path: PathBuf) -> SessionSelection {
         match self {
-            SessionPickerAction::Resume => SessionSelection::Resume(thread_id),
-            SessionPickerAction::Fork => SessionSelection::Fork(thread_id),
+            SessionPickerAction::Resume => SessionSelection::Resume(path),
+            SessionPickerAction::Fork => SessionSelection::Fork(path),
         }
     }
 }
@@ -401,12 +401,7 @@ impl PickerState {
             }
             KeyCode::Enter => {
                 if let Some(row) = self.filtered_rows.get(self.selected) {
-                    let thread_id = row
-                        .thread_id
-                        .map(|id| id.to_string())
-                        .or_else(|| extract_thread_id_from_path(&row.path))
-                        .unwrap_or_else(|| row.path.to_string_lossy().to_string());
-                    return Ok(Some(self.action.selection(thread_id)));
+                    return Ok(Some(self.action.selection(row.path.clone())));
                 }
             }
             KeyCode::Up => {
@@ -627,7 +622,7 @@ impl PickerState {
             return true;
         };
         let Some(row_cwd) = row.cwd.as_ref() else {
-            return true;
+            return false;
         };
         paths_match(row_cwd, filter_cwd)
     }
@@ -842,26 +837,6 @@ fn parse_timestamp_str(ts: &str) -> Option<DateTime<Utc>> {
     chrono::DateTime::parse_from_rfc3339(ts)
         .map(|dt| dt.with_timezone(&Utc))
         .ok()
-}
-
-fn extract_thread_id_from_path(path: &Path) -> Option<String> {
-    let mut candidates: Vec<String> = Vec::new();
-    if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-        candidates.push(stem.to_string());
-    }
-    if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-        candidates.push(name.to_string());
-    }
-    for component in path.components() {
-        if let std::path::Component::Normal(value) = component
-            && let Some(text) = value.to_str()
-        {
-            candidates.push(text.to_string());
-        }
-    }
-    candidates
-        .into_iter()
-        .find(|value| ThreadId::from_string(value).is_ok())
 }
 
 fn draw_picker(tui: &mut Tui, state: &PickerState) -> std::io::Result<()> {
@@ -1352,17 +1327,10 @@ mod tests {
     fn make_item(path: &str, ts: &str, preview: &str) -> ThreadItem {
         ThreadItem {
             path: PathBuf::from(path),
-            thread_id: None,
             first_user_message: Some(preview.to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
             created_at: Some(ts.to_string()),
             updated_at: Some(ts.to_string()),
+            ..Default::default()
         }
     }
 
@@ -1487,17 +1455,10 @@ mod tests {
     fn head_to_row_uses_first_user_message() {
         let item = ThreadItem {
             path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
             first_user_message: Some("real question".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
             created_at: Some("2025-01-01T00:00:00Z".into()),
             updated_at: Some("2025-01-01T00:00:00Z".into()),
+            ..Default::default()
         };
         let row = head_to_row(&item);
         assert_eq!(row.preview, "real question");
@@ -1508,31 +1469,17 @@ mod tests {
         // Construct two items with different timestamps and real user text.
         let a = ThreadItem {
             path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
             first_user_message: Some("A".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
             created_at: Some("2025-01-01T00:00:00Z".into()),
             updated_at: Some("2025-01-01T00:00:00Z".into()),
+            ..Default::default()
         };
         let b = ThreadItem {
             path: PathBuf::from("/tmp/b.jsonl"),
-            thread_id: None,
             first_user_message: Some("B".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
             created_at: Some("2025-01-02T00:00:00Z".into()),
             updated_at: Some("2025-01-02T00:00:00Z".into()),
+            ..Default::default()
         };
         let rows = rows_from_items(vec![a, b]);
         assert_eq!(rows.len(), 2);
@@ -1545,17 +1492,10 @@ mod tests {
     fn row_uses_tail_timestamp_for_updated_at() {
         let item = ThreadItem {
             path: PathBuf::from("/tmp/a.jsonl"),
-            thread_id: None,
             first_user_message: Some("Hello".to_string()),
-            cwd: None,
-            git_branch: None,
-            git_sha: None,
-            git_origin_url: None,
-            source: None,
-            model_provider: None,
-            cli_version: None,
             created_at: Some("2025-01-01T00:00:00Z".into()),
             updated_at: Some("2025-01-01T01:00:00Z".into()),
+            ..Default::default()
         };
 
         let row = head_to_row(&item);

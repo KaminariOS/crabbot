@@ -190,10 +190,10 @@ use crate::bottom_pane::textarea::TextArea;
 use crate::bottom_pane::textarea::TextAreaState;
 use crate::clipboard_paste::normalize_pasted_path;
 use crate::clipboard_paste::pasted_image_format;
-use crate::connectors;
-use crate::connectors::AppInfo;
 use crate::history_cell;
 use crate::ui_consts::LIVE_PREFIX_COLS;
+use codex_chatgpt::connectors;
+use codex_chatgpt::connectors::AppInfo;
 use codex_core::skills::model::SkillMetadata;
 use codex_file_search::FileMatch;
 use std::cell::RefCell;
@@ -3252,7 +3252,7 @@ impl ChatComposer {
                     insert_text: format!("${skill_name}"),
                     search_terms,
                     path: Some(skill.path.to_string_lossy().into_owned()),
-                    category_tag: (skill.scope == codex_core::protocol::SkillScope::Repo)
+                    category_tag: (skill.scope == codex_protocol::protocol::SkillScope::Repo)
                         .then(|| "[Repo]".to_string()),
                 });
             }
@@ -3267,7 +3267,7 @@ impl ChatComposer {
                 }
                 let display_name = connectors::connector_display_label(connector);
                 let description = Some(Self::connector_brief_description(connector));
-                let slug = connectors::connector_mention_slug(connector);
+                let slug = codex_core::connectors::connector_mention_slug(connector);
                 let search_terms = vec![display_name.clone(), connector.id.clone(), slug.clone()];
                 let connector_id = connector.id.as_str();
                 mentions.push(MentionItem {

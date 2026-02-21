@@ -34,6 +34,7 @@ use std::process::Command;
 use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
+use supports_color::Stream;
 
 const DAEMON_PROMPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(300);
 
@@ -416,6 +417,30 @@ fn handle_tui_with_crate(
     interactive: Option<&InteractiveArgs>,
     state: &mut CliState,
 ) -> Result<CommandOutput> {
+    if env::var("TERM")
+        .map(|term| term.eq_ignore_ascii_case("dumb"))
+        .unwrap_or(false)
+    {
+        if !(io::stdin().is_terminal() && io::stderr().is_terminal()) {
+            bail!(
+                "TERM is set to \"dumb\". Refusing to start the interactive TUI because no terminal is available for a confirmation prompt (stdin/stderr is not a TTY). Run in a supported terminal or unset TERM."
+            );
+        }
+        eprintln!(
+            "WARNING: TERM is set to \"dumb\". Crabbot's interactive TUI may not work in this terminal."
+        );
+        eprintln!("Continue anyway? [y/N]: ");
+        let mut input = String::new();
+        io::stdin().read_line(&mut input)?;
+        let answer = input.trim();
+        let accepted = answer.eq_ignore_ascii_case("y") || answer.eq_ignore_ascii_case("yes");
+        if !accepted {
+            bail!(
+                "Refusing to start the interactive TUI because TERM is set to \"dumb\". Run in a supported terminal or unset TERM."
+            );
+        }
+    }
+
     crabbot_tui::set_daemon_connection_raw(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
@@ -437,9 +462,13 @@ fn handle_tui_with_crate(
             cwd,
             web_search,
             add_dir,
+            config_overrides,
         ) = if let Some(interactive) = interactive {
             (
-                interactive.prompt.clone(),
+                interactive
+                    .prompt
+                    .clone()
+                    .map(|value| value.replace("\r\n", "\n").replace('\r', "\n")),
                 interactive.images.clone(),
                 interactive.model.clone(),
                 interactive.profile.clone(),
@@ -450,6 +479,7 @@ fn handle_tui_with_crate(
                 interactive.cwd.clone(),
                 interactive.search,
                 interactive.add_dir.clone(),
+                tui_config_overrides_from_interactive(Some(interactive)),
             )
         } else {
             (
@@ -464,6 +494,7 @@ fn handle_tui_with_crate(
                 None,
                 false,
                 Vec::new(),
+                crabbot_tui::CliConfigOverrides::default(),
             )
         };
         crabbot_tui::run_main(
@@ -506,14 +537,30 @@ fn handle_tui_with_crate(
                 web_search,
                 add_dir,
                 no_alt_screen: args.no_alt_screen,
-                config_overrides: crabbot_tui::CliConfigOverrides::default(),
+                config_overrides,
             },
             None,
         )
         .await
     })?;
-    state.last_thread_id = exit_info.thread_id.map(|id| id.to_string());
-    Ok(CommandOutput::Text(String::new()))
+    let token_usage = exit_info.token_usage;
+    let thread_id = exit_info.thread_id;
+    let thread_name = exit_info.thread_name;
+    state.last_thread_id = thread_id.map(|id| id.to_string());
+    let mut lines = Vec::new();
+    if !token_usage.is_zero() {
+        lines.push(crabbot_tui::protocol::FinalOutput::from(token_usage).to_string());
+        if let Some(command) = crabbot_tui::util::resume_command(thread_name.as_deref(), thread_id)
+        {
+            let command = if supports_color::on(Stream::Stdout).is_some() {
+                format!("\u{1b}[36m{command}\u{1b}[39m")
+            } else {
+                command
+            };
+            lines.push(format!("To continue this session, run {command}"));
+        }
+    }
+    Ok(CommandOutput::Text(lines.join("\n")))
 }
 
 fn handle_attach_tui_interactive_with_crate(
@@ -548,15 +595,25 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
-    if cli.version {
+    let Cli {
+        version,
+        interactive,
+        command,
+    } = cli;
+
+    if version {
         return Ok(version_output());
     }
 
     let mut state = load_state(state_path)?;
-    let (output, should_persist) = match cli.command {
-        None => (run_interactive_default(cli.interactive, &mut state), true),
-        Some(TopLevelCommand::Resume(command)) => (run_resume_command(command, &mut state), true),
-        Some(TopLevelCommand::Fork(command)) => (run_fork_command(command, &mut state), true),
+    let (output, should_persist) = match command {
+        None => (run_interactive_default(interactive, &mut state), true),
+        Some(TopLevelCommand::Resume(command)) => {
+            (run_resume_command(command, interactive, &mut state), true)
+        }
+        Some(TopLevelCommand::Fork(command)) => {
+            (run_fork_command(command, interactive, &mut state), true)
+        }
         Some(TopLevelCommand::Daemon(command)) => {
             return run_daemon(command, state_path);
         }
@@ -665,16 +722,80 @@ fn run_interactive_default(args: InteractiveArgs, state: &mut CliState) -> Resul
     )
 }
 
-fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<CommandOutput> {
+fn merge_interactive_args(mut root: InteractiveArgs, sub: InteractiveArgs) -> InteractiveArgs {
+    if let Some(prompt) = sub.prompt {
+        root.prompt = Some(prompt);
+    }
+    if !sub.images.is_empty() {
+        root.images = sub.images;
+    }
+    root.config.extend(sub.config);
+    root.enable.extend(sub.enable);
+    root.disable.extend(sub.disable);
+    if let Some(model) = sub.model {
+        root.model = Some(model);
+    }
+    if let Some(profile) = sub.profile {
+        root.profile = Some(profile);
+    }
+    if let Some(mode) = sub.sandbox_mode {
+        root.sandbox_mode = Some(mode);
+    }
+    if let Some(policy) = sub.approval_policy {
+        root.approval_policy = Some(policy);
+    }
+    root.full_auto = root.full_auto || sub.full_auto;
+    root.dangerously_bypass_approvals_and_sandbox = root.dangerously_bypass_approvals_and_sandbox
+        || sub.dangerously_bypass_approvals_and_sandbox;
+    if let Some(cwd) = sub.cwd {
+        root.cwd = Some(cwd);
+    }
+    root.search = root.search || sub.search;
+    if !sub.add_dir.is_empty() {
+        root.add_dir.extend(sub.add_dir);
+    }
+    root.no_alt_screen = root.no_alt_screen || sub.no_alt_screen;
+    root
+}
+
+fn tui_config_overrides_from_interactive(
+    interactive: Option<&InteractiveArgs>,
+) -> crabbot_tui::CliConfigOverrides {
+    let mut overrides = crabbot_tui::CliConfigOverrides::default();
+    let Some(interactive) = interactive else {
+        return overrides;
+    };
+    overrides.raw_overrides.extend(interactive.config.clone());
+    overrides.raw_overrides.extend(
+        interactive
+            .enable
+            .iter()
+            .map(|feature| format!("features.{feature}=true")),
+    );
+    overrides.raw_overrides.extend(
+        interactive
+            .disable
+            .iter()
+            .map(|feature| format!("features.{feature}=false")),
+    );
+    overrides
+}
+
+fn run_resume_command(
+    command: ResumeCommand,
+    root_interactive: InteractiveArgs,
+    state: &mut CliState,
+) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
     let has_session_id = command.session_id.is_some();
+    let interactive = merge_interactive_args(root_interactive, command.interactive);
     handle_tui_with_crate(
         TuiArgs {
             thread_id: command.session_id,
             fork_mode: false,
             resume_last: command.last,
             fork_last: false,
-            no_alt_screen: command.interactive.no_alt_screen,
+            no_alt_screen: interactive.no_alt_screen,
             startup_picker: if command.last || has_session_id {
                 None
             } else {
@@ -682,21 +803,26 @@ fn run_resume_command(command: ResumeCommand, state: &mut CliState) -> Result<Co
             },
             startup_picker_show_all: command.all,
         },
-        Some(&command.interactive),
+        Some(&interactive),
         state,
     )
 }
 
-fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<CommandOutput> {
+fn run_fork_command(
+    command: ForkCommand,
+    root_interactive: InteractiveArgs,
+    state: &mut CliState,
+) -> Result<CommandOutput> {
     ensure_daemon_ready(state)?;
     let has_session_id = command.session_id.is_some();
+    let interactive = merge_interactive_args(root_interactive, command.interactive);
     handle_tui_with_crate(
         TuiArgs {
             thread_id: command.session_id,
             fork_mode: true,
             resume_last: false,
             fork_last: command.last,
-            no_alt_screen: command.interactive.no_alt_screen,
+            no_alt_screen: interactive.no_alt_screen,
             startup_picker: if command.last || has_session_id {
                 None
             } else {
@@ -704,7 +830,7 @@ fn run_fork_command(command: ForkCommand, state: &mut CliState) -> Result<Comman
             },
             startup_picker_show_all: command.all,
         },
-        Some(&command.interactive),
+        Some(&interactive),
         state,
     )
 }
