@@ -812,6 +812,7 @@ struct CodexThreadState {
     last_sequence: u64,
     next_submission_id: u64,
     current_turn_id: Option<String>,
+    current_turn_streamed_text: String,
     pending_events: VecDeque<crate::protocol::Event>,
     config_snapshot: ThreadConfigSnapshot,
     rollout_path: Option<std::path::PathBuf>,
@@ -843,6 +844,7 @@ impl CodexThread {
                 last_sequence: 0,
                 next_submission_id: 1,
                 current_turn_id: None,
+                current_turn_streamed_text: String::new(),
                 pending_events: VecDeque::new(),
                 config_snapshot,
                 rollout_path,
@@ -1205,7 +1207,49 @@ impl CodexThread {
                                     &notification,
                                 )
                             };
-                            if let Some(event) = mapped {
+                            if let Some(mut event) = mapped {
+                                match &mut event.msg {
+                                    crate::protocol::EventMsg::TurnStarted(payload) => {
+                                        state.current_turn_id = Some(payload.turn_id.clone());
+                                        state.current_turn_streamed_text.clear();
+                                    }
+                                    crate::protocol::EventMsg::AgentMessageDelta(payload) => {
+                                        let raw_delta = payload.delta.clone();
+                                        let normalized = if raw_delta
+                                            .starts_with(&state.current_turn_streamed_text)
+                                        {
+                                            raw_delta[state.current_turn_streamed_text.len()..]
+                                                .to_string()
+                                        } else if state
+                                            .current_turn_streamed_text
+                                            .ends_with(&raw_delta)
+                                        {
+                                            String::new()
+                                        } else {
+                                            raw_delta.clone()
+                                        };
+                                        if raw_delta.starts_with(&state.current_turn_streamed_text)
+                                        {
+                                            state.current_turn_streamed_text = raw_delta;
+                                        } else if !normalized.is_empty() {
+                                            state.current_turn_streamed_text.push_str(&normalized);
+                                        }
+                                        payload.delta = normalized;
+                                    }
+                                    crate::protocol::EventMsg::TurnComplete(_)
+                                    | crate::protocol::EventMsg::TurnAborted(_) => {
+                                        state.current_turn_id = None;
+                                        state.current_turn_streamed_text.clear();
+                                    }
+                                    _ => {}
+                                }
+                                if matches!(
+                                    &event.msg,
+                                    crate::protocol::EventMsg::AgentMessageDelta(payload)
+                                        if payload.delta.is_empty()
+                                ) {
+                                    continue;
+                                }
                                 if let crate::protocol::EventMsg::TurnStarted(payload) = &event.msg
                                 {
                                     state.current_turn_id = Some(payload.turn_id.clone());
@@ -3577,7 +3621,7 @@ pub async fn run_main(
     let thread_id = cli.resume_session_id.or(cli.fork_session_id);
     let startup_picker_show_all = cli.resume_show_all || cli.fork_show_all;
 
-    handle_tui(
+    let exit_info = handle_tui(
         TuiArgs {
             thread_id,
             no_alt_screen: cli.no_alt_screen,
@@ -3589,16 +3633,7 @@ pub async fn run_main(
     .await
     .map_err(|err| std::io::Error::other(err.to_string()))?;
 
-    Ok(app::AppExitInfo {
-        token_usage: crate::protocol::TokenUsage::default(),
-        thread_id: state
-            .last_thread_id
-            .as_deref()
-            .and_then(|value| ThreadId::from_string(value).ok()),
-        thread_name: None,
-        update_action: None,
-        exit_reason: app::ExitReason::UserRequested,
-    })
+    Ok(exit_info)
 }
 
 async fn resolve_session_selection_from_args(
@@ -3641,7 +3676,7 @@ async fn resolve_session_selection_from_args(
     Ok(selection)
 }
 
-pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOutput> {
+pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<app::AppExitInfo> {
     tooltips::announcement::prewarm();
 
     set_shim_backend_config(
@@ -3684,7 +3719,7 @@ pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<CommandOu
         state.last_thread_id = Some(thread_id.to_string());
     }
 
-    Ok(CommandOutput::Text(String::new()))
+    Ok(exit_info)
 }
 
 fn determine_alt_screen_mode(
@@ -3713,7 +3748,7 @@ pub async fn handle_attach_tui_interactive(
     _initial_events: Vec<DaemonStreamEnvelope>,
     state: &mut CliState,
 ) -> Result<CommandOutput> {
-    handle_tui(
+    let _ = handle_tui(
         TuiArgs {
             thread_id: Some(session_id),
             no_alt_screen: false,
@@ -3722,7 +3757,8 @@ pub async fn handle_attach_tui_interactive(
         },
         state,
     )
-    .await
+    .await?;
+    Ok(CommandOutput::Text(String::new()))
 }
 
 fn extract_thread_id_from_picker_path(path: &std::path::Path) -> Option<String> {
