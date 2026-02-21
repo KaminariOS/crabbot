@@ -1820,8 +1820,8 @@ pub mod util {
         thread_id: Option<crate::ThreadId>,
     ) -> Option<String> {
         match (thread_name, thread_id) {
-            (Some(name), _) => Some(format!("crabbot resume {name}")),
-            (None, Some(id)) => Some(format!("crabbot resume {id}")),
+            (Some(name), _) => Some(format!("crab resume {name}")),
+            (None, Some(id)) => Some(format!("crab resume {id}")),
             _ => None,
         }
     }
