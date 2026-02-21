@@ -74,6 +74,28 @@ extern crate self as codex_utils_sandbox_summary;
 extern crate self as codex_utils_sleep_inhibitor;
 extern crate self as rmcp;
 
+const LEGACY_NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
+    "codex/event",
+    "codex/event/session_configured",
+    "codex/event/task_started",
+    "codex/event/task_complete",
+    "codex/event/turn_started",
+    "codex/event/turn_complete",
+    "codex/event/raw_response_item",
+    "codex/event/agent_message_content_delta",
+    "codex/event/agent_message_delta",
+    "codex/event/agent_reasoning_delta",
+    "codex/event/reasoning_content_delta",
+    "codex/event/reasoning_raw_content_delta",
+    "codex/event/exec_command_output_delta",
+    "codex/event/exec_approval_request",
+    "codex/event/exec_command_begin",
+    "codex/event/exec_command_end",
+    "codex/event/exec_output",
+    "codex/event/item_started",
+    "codex/event/item_completed",
+];
+
 #[derive(Debug, Clone, Default)]
 pub struct Client;
 
@@ -811,7 +833,6 @@ struct CodexThreadState {
     last_sequence: u64,
     next_submission_id: u64,
     current_turn_id: Option<String>,
-    current_turn_streamed_text: String,
     pending_events: VecDeque<crate::protocol::Event>,
     config_snapshot: ThreadConfigSnapshot,
     rollout_path: Option<std::path::PathBuf>,
@@ -843,7 +864,6 @@ impl CodexThread {
                 last_sequence: 0,
                 next_submission_id: 1,
                 current_turn_id: None,
-                current_turn_streamed_text: String::new(),
                 pending_events: VecDeque::new(),
                 config_snapshot,
                 rollout_path,
@@ -1459,33 +1479,6 @@ impl CodexThread {
         Ok(submission_id)
     }
 
-    fn event_from_codex_notification(
-        sequence: u64,
-        params: &Value,
-    ) -> Option<crate::protocol::Event> {
-        let event_value = params
-            .get("event")
-            .cloned()
-            .unwrap_or_else(|| params.clone());
-        if let Ok(event) = serde_json::from_value::<crate::protocol::Event>(event_value.clone()) {
-            return Some(event);
-        }
-        if let Ok(msg) = serde_json::from_value::<crate::protocol::EventMsg>(event_value.clone()) {
-            return Some(crate::protocol::Event {
-                id: format!("seq-{sequence}"),
-                msg,
-            });
-        }
-        event_value
-            .get("msg")
-            .cloned()
-            .and_then(|msg| serde_json::from_value::<crate::protocol::EventMsg>(msg).ok())
-            .map(|msg| crate::protocol::Event {
-                id: format!("seq-{sequence}"),
-                msg,
-            })
-    }
-
     fn fallback_event_from_notification(
         sequence: u64,
         notification: &crabbot_protocol::DaemonRpcNotification,
@@ -1579,24 +1572,23 @@ impl CodexThread {
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_ascii_lowercase();
-                if item_type != "agent_message" && item_type != "agentmessage" {
-                    return None;
+                if item_type == "agent_message" || item_type == "agentmessage" {
+                    let message = item
+                        .get("text")
+                        .or_else(|| item.get("message"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)?;
+                    return Some(crate::protocol::Event {
+                        id: format!("seq-{sequence}"),
+                        msg: crate::protocol::EventMsg::AgentMessage(
+                            crate::protocol::AgentMessageEvent {
+                                message,
+                                phase: None,
+                            },
+                        ),
+                    });
                 }
-                let text = item
-                    .get("text")
-                    .or_else(|| item.get("message"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                Some(crate::protocol::Event {
-                    id: format!("seq-{sequence}"),
-                    msg: crate::protocol::EventMsg::AgentMessage(
-                        crate::protocol::AgentMessageEvent {
-                            message: text,
-                            phase: None,
-                        },
-                    ),
-                })
+                None
             }
             _ => None,
         }
@@ -1634,74 +1626,28 @@ impl CodexThread {
                     .lock()
                     .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
                 for envelope in envelopes {
-                    state.last_sequence = state.last_sequence.max(envelope.sequence);
+                    // Some stream backends can replay the latest envelope for the same cursor.
+                    // Skip already-processed sequence numbers so intermediate UI lines stay idempotent.
+                    if envelope.sequence <= state.last_sequence {
+                        continue;
+                    }
+                    state.last_sequence = envelope.sequence;
                     match envelope.event {
                         crabbot_protocol::DaemonRpcStreamEvent::Notification(notification) => {
-                            let mapped = if notification.method == "codex/event"
-                                || notification.method.starts_with("codex/event/")
-                            {
-                                Self::event_from_codex_notification(
-                                    envelope.sequence,
-                                    &notification.params,
-                                )
-                            } else {
-                                Self::fallback_event_from_notification(
-                                    envelope.sequence,
-                                    &notification,
-                                )
-                            };
+                            let mapped = Self::fallback_event_from_notification(
+                                envelope.sequence,
+                                &notification,
+                            );
                             if let Some(mut event) = mapped {
                                 match &mut event.msg {
                                     crate::protocol::EventMsg::TurnStarted(payload) => {
                                         state.current_turn_id = Some(payload.turn_id.clone());
-                                        state.current_turn_streamed_text.clear();
-                                    }
-                                    crate::protocol::EventMsg::AgentMessageDelta(payload) => {
-                                        let raw_delta = payload.delta.clone();
-                                        let normalized = if raw_delta
-                                            .starts_with(&state.current_turn_streamed_text)
-                                        {
-                                            raw_delta[state.current_turn_streamed_text.len()..]
-                                                .to_string()
-                                        } else if state
-                                            .current_turn_streamed_text
-                                            .ends_with(&raw_delta)
-                                        {
-                                            String::new()
-                                        } else {
-                                            raw_delta.clone()
-                                        };
-                                        if raw_delta.starts_with(&state.current_turn_streamed_text)
-                                        {
-                                            state.current_turn_streamed_text = raw_delta;
-                                        } else if !normalized.is_empty() {
-                                            state.current_turn_streamed_text.push_str(&normalized);
-                                        }
-                                        payload.delta = normalized;
-                                    }
-                                    crate::protocol::EventMsg::AgentMessage(payload) => {
-                                        if !state.current_turn_streamed_text.is_empty() {
-                                            let streamed = state.current_turn_streamed_text.trim();
-                                            let final_msg = payload.message.trim();
-                                            if final_msg == streamed
-                                                || final_msg.ends_with(streamed)
-                                            {
-                                                continue;
-                                            }
-                                        }
                                     }
                                     crate::protocol::EventMsg::TurnComplete(_)
                                     | crate::protocol::EventMsg::TurnAborted(_) => {
                                         state.current_turn_id = None;
                                     }
                                     _ => {}
-                                }
-                                if matches!(
-                                    &event.msg,
-                                    crate::protocol::EventMsg::AgentMessageDelta(payload)
-                                        if payload.delta.is_empty()
-                                ) {
-                                    continue;
                                 }
                                 if let crate::protocol::EventMsg::TurnStarted(payload) = &event.msg
                                 {
@@ -4534,7 +4480,11 @@ impl AppServerWsClient {
                     "name": "crabbot_tui",
                     "title": "Crabbot TUI",
                     "version": "0.1.0",
-                }
+                },
+                "capabilities": {
+                    "experimentalApi": true,
+                    "optOutNotificationMethods": LEGACY_NOTIFICATIONS_TO_OPT_OUT,
+                },
             }),
         )?;
         self.send_json(&json!({ "method": "initialized" }))

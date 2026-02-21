@@ -85,6 +85,27 @@ const DEFAULT_CODEX_BIN: &str = "codex";
 const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const RPC_EVENT_BUFFER_CAPACITY: usize = 16384;
 static APPROVAL_NOTIFY_ARGV: OnceLock<Option<Vec<String>>> = OnceLock::new();
+const LEGACY_NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
+    "codex/event",
+    "codex/event/session_configured",
+    "codex/event/task_started",
+    "codex/event/task_complete",
+    "codex/event/turn_started",
+    "codex/event/turn_complete",
+    "codex/event/raw_response_item",
+    "codex/event/agent_message_content_delta",
+    "codex/event/agent_message_delta",
+    "codex/event/agent_reasoning_delta",
+    "codex/event/reasoning_content_delta",
+    "codex/event/reasoning_raw_content_delta",
+    "codex/event/exec_command_output_delta",
+    "codex/event/exec_approval_request",
+    "codex/event/exec_command_begin",
+    "codex/event/exec_command_end",
+    "codex/event/exec_output",
+    "codex/event/item_started",
+    "codex/event/item_completed",
+];
 
 #[derive(Clone)]
 struct AppState {
@@ -198,7 +219,8 @@ impl CodexRpcRuntime {
                     "version": env!("CARGO_PKG_VERSION"),
                 },
                 "capabilities": {
-                    "experimentalApi": true
+                    "experimentalApi": true,
+                    "optOutNotificationMethods": LEGACY_NOTIFICATIONS_TO_OPT_OUT,
                 }
             }),
         )?;
