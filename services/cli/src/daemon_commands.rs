@@ -328,7 +328,7 @@ fn resolve_daemon_listen_endpoint(
 fn resolve_bind_host(args: &DaemonUpArgs) -> Result<String> {
     if args.tailscale {
         return detect_tailscale_ipv4()
-            .ok_or_else(|| anyhow!("cannot detect tailscale IPv4; try --wifi, --local, or --all"));
+            .ok_or_else(|| anyhow!("cannot detect tailscale IPv4; try --lan, --local, or --all"));
     }
     if args.local {
         return Ok("127.0.0.1".to_string());
@@ -336,13 +336,13 @@ fn resolve_bind_host(args: &DaemonUpArgs) -> Result<String> {
     if args.bind_all {
         return Ok("0.0.0.0".to_string());
     }
-    if args.wifi {
-        return detect_wifi_ipv4()
-            .ok_or_else(|| anyhow!("cannot detect Wi-Fi/LAN IPv4; try --local or --all"));
+    if args.lan {
+        return detect_lan_ipv4()
+            .ok_or_else(|| anyhow!("cannot detect LAN IPv4; try --local or --all"));
     }
 
-    // Default mode is Wi-Fi/LAN. If detection fails, fall back to localhost.
-    Ok(detect_wifi_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()))
+    // Default mode is LAN. If detection fails, fall back to localhost.
+    Ok(detect_lan_ipv4().unwrap_or_else(|| "127.0.0.1".to_string()))
 }
 
 fn detect_tailscale_ipv4() -> Option<String> {
@@ -358,7 +358,7 @@ fn detect_tailscale_ipv4() -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn detect_wifi_ipv4() -> Option<String> {
+fn detect_lan_ipv4() -> Option<String> {
     let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
     socket.connect("1.1.1.1:80").ok()?;
     let addr = socket.local_addr().ok()?;

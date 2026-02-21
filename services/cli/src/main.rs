@@ -102,16 +102,16 @@ enum DaemonSubcommand {
 #[derive(Debug, Args, Clone)]
 struct DaemonUpArgs {
     /// Bind daemon to Tailscale IPv4.
-    #[arg(long, default_value_t = false, conflicts_with_all = ["wifi", "local", "bind_all"])]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["lan", "local", "bind_all"])]
     tailscale: bool,
-    /// Bind daemon to Wi-Fi/LAN IPv4 (default).
+    /// Bind daemon to LAN IPv4 (default).
     #[arg(long, default_value_t = false, conflicts_with_all = ["tailscale", "local", "bind_all"])]
-    wifi: bool,
+    lan: bool,
     /// Bind daemon to localhost.
-    #[arg(long, default_value_t = false, conflicts_with_all = ["tailscale", "wifi", "bind_all"])]
+    #[arg(long, default_value_t = false, conflicts_with_all = ["tailscale", "lan", "bind_all"])]
     local: bool,
     /// Bind daemon to all interfaces (0.0.0.0).
-    #[arg(long = "all", default_value_t = false, conflicts_with_all = ["tailscale", "wifi", "local"])]
+    #[arg(long = "all", default_value_t = false, conflicts_with_all = ["tailscale", "lan", "local"])]
     bind_all: bool,
     /// Override daemon listen port.
     #[arg(long)]
