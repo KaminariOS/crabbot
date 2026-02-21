@@ -53,7 +53,6 @@ use std::io::BufRead;
 use std::io::BufReader;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::process::Child;
 use std::process::ChildStdin;
 use std::process::ChildStdout;
@@ -62,6 +61,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Condvar;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
 use std::thread;
@@ -84,6 +84,7 @@ const DAEMON_RUNTIME_USER_ID: &str = "daemon_local_user";
 const DEFAULT_CODEX_BIN: &str = "codex";
 const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
 const RPC_EVENT_BUFFER_CAPACITY: usize = 16384;
+static APPROVAL_NOTIFY_ARGV: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
 #[derive(Clone)]
 struct AppState {
@@ -745,32 +746,112 @@ fn push_event(runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
 }
 
 fn maybe_notify_user_for_approval(event: &DaemonStreamEvent) {
-    if !should_trigger_approval_notification(event) {
-        return;
-    }
-
-    let Some(home) = env::var_os("HOME") else {
-        eprintln!("warning: HOME is not set; skipping approval notification");
+    let Some(payload) = legacy_approval_notify_json(event) else {
         return;
     };
-
-    let script_path = PathBuf::from(home).join(".codex/notify.py");
-    let spawn_result = Command::new(&script_path)
+    let Some(argv) = approval_notify_argv() else {
+        return;
+    };
+    let Some(mut command) = command_from_argv(argv) else {
+        return;
+    };
+    let spawn_result = command
+        .arg(payload)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn();
 
     if let Err(error) = spawn_result {
-        eprintln!(
-            "warning: failed to run approval notification script `{}`: {error}",
-            script_path.display()
-        );
+        eprintln!("warning: failed to run approval notification command: {error}");
     }
 }
 
-fn should_trigger_approval_notification(event: &DaemonStreamEvent) -> bool {
-    matches!(event, DaemonStreamEvent::ApprovalRequired(_))
+#[derive(serde::Serialize)]
+#[serde(tag = "type", rename_all = "kebab-case")]
+enum ApprovalNotification {
+    #[serde(rename_all = "kebab-case")]
+    ApprovalRequired {
+        turn_id: String,
+        approval_id: String,
+        action_kind: String,
+        prompt: String,
+    },
+}
+
+fn legacy_approval_notify_json(event: &DaemonStreamEvent) -> Option<String> {
+    match event {
+        DaemonStreamEvent::ApprovalRequired(payload) => {
+            serde_json::to_string(&ApprovalNotification::ApprovalRequired {
+                turn_id: payload.turn_id.clone(),
+                approval_id: payload.approval_id.clone(),
+                action_kind: payload.action_kind.clone(),
+                prompt: payload.prompt.clone(),
+            })
+            .ok()
+        }
+        _ => None,
+    }
+}
+
+fn command_from_argv(argv: &[String]) -> Option<Command> {
+    let (program, args) = argv.split_first()?;
+    if program.is_empty() {
+        return None;
+    }
+    let mut command = Command::new(program);
+    command.args(args);
+    Some(command)
+}
+
+fn approval_notify_argv() -> Option<&'static [String]> {
+    APPROVAL_NOTIFY_ARGV
+        .get_or_init(load_notify_argv_from_codex_config)
+        .as_deref()
+}
+
+fn load_notify_argv_from_codex_config() -> Option<Vec<String>> {
+    let config_path = codex_config_path()?;
+    let raw = match std::fs::read_to_string(&config_path) {
+        Ok(raw) => raw,
+        Err(error) => {
+            eprintln!(
+                "warning: failed to read codex config `{}` for notify command: {error}",
+                config_path.display()
+            );
+            return None;
+        }
+    };
+    parse_notify_argv_from_toml(&raw)
+}
+
+fn codex_config_path() -> Option<std::path::PathBuf> {
+    if let Some(codex_home) = env::var_os("CODEX_HOME") {
+        return Some(std::path::PathBuf::from(codex_home).join("config.toml"));
+    }
+    env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .map(|home| home.join(".codex/config.toml"))
+}
+
+fn parse_notify_argv_from_toml(raw: &str) -> Option<Vec<String>> {
+    let parsed: toml::Value = match toml::from_str(raw) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("warning: failed to parse codex config TOML for notify command: {error}");
+            return None;
+        }
+    };
+    let notify = parsed.get("notify")?.as_array()?;
+    let argv = notify
+        .iter()
+        .map(|value| value.as_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()?;
+    let (program, _) = argv.split_first()?;
+    if program.is_empty() {
+        return None;
+    }
+    Some(argv)
 }
 
 fn split_for_stream(text: &str, chunk_size: usize) -> Vec<String> {
@@ -1898,20 +1979,47 @@ mod tests {
 
     #[test]
     fn approval_notification_only_for_approval_events() {
-        assert!(should_trigger_approval_notification(
-            &DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
+        let payload = legacy_approval_notify_json(&DaemonStreamEvent::ApprovalRequired(
+            DaemonApprovalRequired {
                 turn_id: "turn_1".to_string(),
                 approval_id: "approval_1".to_string(),
                 action_kind: "shell_command".to_string(),
                 prompt: "approve?".to_string(),
-            })
-        ));
+            },
+        ))
+        .expect("approval event should generate payload");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
+        assert_eq!(parsed["type"], "approval-required");
+        assert_eq!(parsed["approval-id"], "approval_1");
 
-        assert!(!should_trigger_approval_notification(
-            &DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
+        assert!(
+            legacy_approval_notify_json(&DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
                 turn_id: "turn_1".to_string(),
                 output_summary: "done".to_string(),
-            })
-        ));
+            }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn parse_notify_argv_from_toml_parses_notify_array() {
+        let argv = parse_notify_argv_from_toml(r#"notify = ["uv", "run", "/tmp/notify.py"]"#)
+            .expect("notify argv should parse");
+        assert_eq!(
+            argv,
+            vec![
+                "uv".to_string(),
+                "run".to_string(),
+                "/tmp/notify.py".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_notify_argv_from_toml_rejects_invalid_values() {
+        assert!(parse_notify_argv_from_toml("").is_none());
+        assert!(parse_notify_argv_from_toml("notify = []").is_none());
+        assert!(parse_notify_argv_from_toml(r#"notify = [""]"#).is_none());
+        assert!(parse_notify_argv_from_toml("notify = [1]").is_none());
     }
 }

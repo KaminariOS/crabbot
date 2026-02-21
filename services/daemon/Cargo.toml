@@ -14,6 +14,7 @@ serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tokio-tungstenite = "0.28"
+toml = "0.8"
 
 [dev-dependencies]
 http-body-util = "0.1"
