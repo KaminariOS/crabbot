@@ -1525,6 +1525,12 @@ impl CodexThread {
                                 .params
                                 .get("lastAgentMessage")
                                 .or_else(|| notification.params.get("last_agent_message"))
+                                .or_else(|| {
+                                    notification.params.get("turn").and_then(|turn| {
+                                        turn.get("lastAgentMessage")
+                                            .or_else(|| turn.get("last_agent_message"))
+                                    })
+                                })
                                 .and_then(Value::as_str)
                                 .map(ToString::to_string),
                         },
@@ -1546,33 +1552,6 @@ impl CodexThread {
                         },
                     ),
                 }),
-            "turn/completed" => {
-                let turn_id = notification
-                    .params
-                    .get("turn")
-                    .and_then(|turn| turn.get("id"))
-                    .or_else(|| notification.params.get("turnId"))
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                Some(crate::protocol::Event {
-                    id: format!("seq-{sequence}"),
-                    msg: crate::protocol::EventMsg::TurnComplete(
-                        crate::protocol::TurnCompleteEvent {
-                            turn_id,
-                            last_agent_message: notification
-                                .params
-                                .get("turn")
-                                .and_then(|turn| {
-                                    turn.get("lastAgentMessage")
-                                        .or_else(|| turn.get("last_agent_message"))
-                                })
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string),
-                        },
-                    ),
-                })
-            }
             "turn/aborted" => Some(crate::protocol::Event {
                 id: format!("seq-{sequence}"),
                 msg: crate::protocol::EventMsg::TurnAborted(crate::protocol::TurnAbortedEvent {
@@ -3482,8 +3461,8 @@ pub fn summarize_sandbox_policy(policy: &protocol::SandboxPolicy) -> String {
     policy.to_string()
 }
 
-/// Stub backing `codex_utils_approval_presets`.
-mod codex_utils_approval_presets_stub {
+/// Upstream-compatible backing for `codex_utils_approval_presets`.
+mod codex_utils_approval_presets_compat {
     use crate::protocol::AskForApproval;
     use crate::protocol::SandboxPolicy;
 
@@ -3498,41 +3477,83 @@ mod codex_utils_approval_presets_stub {
     }
 
     pub fn builtin_approval_presets() -> Vec<ApprovalPreset> {
-        vec![ApprovalPreset {
-            id: "default",
-            label: "Default",
-            description: "Default approvals",
-            approval: AskForApproval::OnRequest,
-            sandbox: SandboxPolicy::new_workspace_write_policy(),
-        }]
+        vec![
+            ApprovalPreset {
+                id: "read-only",
+                label: "Read Only",
+                description: "Codex can read files in the current workspace. Approval is required to edit files or access the internet.",
+                approval: AskForApproval::OnRequest,
+                sandbox: SandboxPolicy::new_read_only_policy(),
+            },
+            ApprovalPreset {
+                id: "auto",
+                label: "Default",
+                description: "Codex can read and edit files in the current workspace, and run commands. Approval is required to access the internet or edit other files. (Identical to Agent mode)",
+                approval: AskForApproval::OnRequest,
+                sandbox: SandboxPolicy::new_workspace_write_policy(),
+            },
+            ApprovalPreset {
+                id: "full-access",
+                label: "Full Access",
+                description: "Codex can edit files outside this workspace and access the internet without asking for approval. Exercise caution when using.",
+                approval: AskForApproval::Never,
+                sandbox: SandboxPolicy::DangerFullAccess,
+            },
+        ]
     }
 }
-pub use codex_utils_approval_presets_stub::ApprovalPreset;
-pub use codex_utils_approval_presets_stub::builtin_approval_presets;
+pub use codex_utils_approval_presets_compat::ApprovalPreset;
+pub use codex_utils_approval_presets_compat::builtin_approval_presets;
 
-/// Stub backing `codex_utils_cli`.
-mod codex_utils_cli_stub {
+/// Upstream-compatible backing for `codex_utils_cli`.
+mod codex_utils_cli_compat {
     use clap::ArgAction;
+    use clap::ValueEnum;
     use serde::Deserialize;
     use serde::Serialize;
     use serde::de::Error as SerdeError;
     use toml::Value;
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-    #[serde(rename_all = "kebab-case")]
+    #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
+    #[value(rename_all = "kebab-case")]
     pub enum ApprovalModeCliArg {
         OnFailure,
+        /// Only run trusted commands without asking the user.
+        ///
+        /// Serialized as `untrusted` for wire-compat with existing callers.
+        #[value(alias = "untrusted")]
         UnlessTrusted,
         OnRequest,
         Never,
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
-    #[serde(rename_all = "kebab-case")]
+    impl From<ApprovalModeCliArg> for crate::protocol::AskForApproval {
+        fn from(value: ApprovalModeCliArg) -> Self {
+            match value {
+                ApprovalModeCliArg::UnlessTrusted => Self::UnlessTrusted,
+                ApprovalModeCliArg::OnFailure => Self::OnFailure,
+                ApprovalModeCliArg::OnRequest => Self::OnRequest,
+                ApprovalModeCliArg::Never => Self::Never,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, ValueEnum, Serialize, Deserialize)]
+    #[value(rename_all = "kebab-case")]
     pub enum SandboxModeCliArg {
         DangerFullAccess,
         ReadOnly,
         WorkspaceWrite,
+    }
+
+    impl From<SandboxModeCliArg> for crate::config_types::SandboxMode {
+        fn from(value: SandboxModeCliArg) -> Self {
+            match value {
+                SandboxModeCliArg::ReadOnly => Self::ReadOnly,
+                SandboxModeCliArg::WorkspaceWrite => Self::WorkspaceWrite,
+                SandboxModeCliArg::DangerFullAccess => Self::DangerFullAccess,
+            }
+        }
     }
 
     #[derive(clap::Parser, Debug, Default, Clone)]
@@ -3655,16 +3676,15 @@ mod codex_utils_cli_stub {
         ) -> String {
             let mut entries: Vec<String> = Vec::new();
             if let Some(env) = env {
-                for (k, _v) in env {
-                    entries.push(format!("{k}=*****"));
-                }
+                let mut pairs: Vec<_> = env.iter().collect();
+                pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
+                entries.extend(pairs.into_iter().map(|(k, _)| format!("{k}=*****")));
             }
             if let Some(env_vars) = env_vars {
-                for (k, v) in env_vars {
-                    entries.push(format!("{k}={v}"));
-                }
+                let mut keys: Vec<_> = env_vars.keys().collect();
+                keys.sort();
+                entries.extend(keys.into_iter().map(|k| format!("{k}=*****")));
             }
-            entries.sort();
             if entries.is_empty() {
                 "-".to_string()
             } else {
@@ -3673,10 +3693,10 @@ mod codex_utils_cli_stub {
         }
     }
 }
-pub use codex_utils_cli_stub::ApprovalModeCliArg;
-pub use codex_utils_cli_stub::CliConfigOverrides;
-pub use codex_utils_cli_stub::SandboxModeCliArg;
-pub use codex_utils_cli_stub::format_env_display;
+pub use codex_utils_cli_compat::ApprovalModeCliArg;
+pub use codex_utils_cli_compat::CliConfigOverrides;
+pub use codex_utils_cli_compat::SandboxModeCliArg;
+pub use codex_utils_cli_compat::format_env_display;
 
 const TUI_STREAM_POLL_INTERVAL: Duration = Duration::from_millis(250);
 const TUI_EVENT_WAIT_STEP: Duration = Duration::from_millis(50);
@@ -4592,6 +4612,8 @@ impl AppServerWsClient {
             // Approvals are handled by the TUI and explicitly responded later.
             "item/commandExecution/requestApproval"
             | "item/fileChange/requestApproval"
+            | "item/mcpToolCall/requestApproval"
+            | "item/tool/elicit"
             | "execCommandApproval"
             | "applyPatchApproval" => Ok(()),
             // We don't support dynamic tool execution yet; decline gracefully.
