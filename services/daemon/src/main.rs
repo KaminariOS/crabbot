@@ -19,20 +19,10 @@ use crabbot_codex_app_server::CodexServerEvent;
 use crabbot_codex_app_server::InitializeRequest;
 use crabbot_codex_app_server::RuntimeEvent;
 use crabbot_codex_app_server::SessionLifecycleState;
-use crabbot_protocol::DAEMON_RPC_STREAM_SCHEMA_VERSION;
 use crabbot_protocol::DAEMON_STREAM_SCHEMA_VERSION;
 use crabbot_protocol::DaemonApprovalRequired;
 use crabbot_protocol::DaemonPromptRequest;
 use crabbot_protocol::DaemonPromptResponse;
-use crabbot_protocol::DaemonRpcDecodeError;
-use crabbot_protocol::DaemonRpcNotification;
-use crabbot_protocol::DaemonRpcRequest;
-use crabbot_protocol::DaemonRpcRequestResponse;
-use crabbot_protocol::DaemonRpcRespondRequest;
-use crabbot_protocol::DaemonRpcRespondResponse;
-use crabbot_protocol::DaemonRpcServerRequest;
-use crabbot_protocol::DaemonRpcStreamEnvelope;
-use crabbot_protocol::DaemonRpcStreamEvent;
 use crabbot_protocol::DaemonSessionState;
 use crabbot_protocol::DaemonSessionStatusResponse;
 use crabbot_protocol::DaemonStartSessionRequest;
@@ -44,33 +34,18 @@ use crabbot_protocol::HealthResponse;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::Value;
-use serde_json::json;
 use std::collections::HashMap;
-use std::collections::VecDeque;
 use std::env;
-use std::io::BufRead;
-use std::io::BufReader;
-use std::io::Write;
 use std::net::SocketAddr;
 use std::process::Child;
-use std::process::ChildStdin;
-use std::process::ChildStdout;
 use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::Condvar;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::AtomicI64;
-use std::sync::atomic::Ordering;
-use std::thread;
-use std::time::Duration;
-use std::time::Instant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 use tokio::sync::RwLock;
-use tokio::task::JoinError;
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Message as UpstreamWsMessage;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
@@ -82,36 +57,12 @@ const DEFAULT_CODEX_APP_SERVER_ENDPOINT: &str = "ws://127.0.0.1:8789";
 const CODEX_PROTOCOL_VERSION: &str = "2026-02-14";
 const DAEMON_RUNTIME_USER_ID: &str = "daemon_local_user";
 const DEFAULT_CODEX_BIN: &str = "codex";
-const RPC_RESPONSE_TIMEOUT: Duration = Duration::from_secs(300);
-const RPC_EVENT_BUFFER_CAPACITY: usize = 16384;
 static APPROVAL_NOTIFY_ARGV: OnceLock<Option<Vec<String>>> = OnceLock::new();
-const LEGACY_NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
-    "codex/event",
-    "codex/event/session_configured",
-    "codex/event/task_started",
-    "codex/event/task_complete",
-    "codex/event/turn_started",
-    "codex/event/turn_complete",
-    "codex/event/raw_response_item",
-    "codex/event/agent_message_content_delta",
-    "codex/event/agent_message_delta",
-    "codex/event/agent_reasoning_delta",
-    "codex/event/reasoning_content_delta",
-    "codex/event/reasoning_raw_content_delta",
-    "codex/event/exec_command_output_delta",
-    "codex/event/exec_approval_request",
-    "codex/event/exec_command_begin",
-    "codex/event/exec_command_end",
-    "codex/event/exec_output",
-    "codex/event/item_started",
-    "codex/event/item_completed",
-];
 
 #[derive(Clone)]
 struct AppState {
     sessions: Arc<RwLock<HashMap<String, SessionRuntime>>>,
     codex_client: CodexAppServerClient,
-    rpc_runtime: Option<CodexRpcRuntime>,
     ws_relay: Arc<WebSocketRelayState>,
 }
 
@@ -140,7 +91,6 @@ struct SessionRuntime {
     codex_session_id: String,
     codex_thread_id: String,
     active_turn_id: Option<String>,
-    rpc_cursor: u64,
     next_sequence: u64,
     events: Vec<DaemonStreamEnvelope>,
 }
@@ -148,263 +98,6 @@ struct SessionRuntime {
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     since_sequence: Option<u64>,
-}
-
-#[derive(Clone)]
-struct CodexRpcRuntime {
-    inner: Arc<CodexRpcRuntimeInner>,
-}
-
-struct CodexRpcRuntimeInner {
-    stdin: Mutex<ChildStdin>,
-    shared: Arc<(Mutex<CodexRpcShared>, Condvar)>,
-    next_request_id: AtomicI64,
-    _child: Mutex<Child>,
-    _reader_thread: Mutex<Option<thread::JoinHandle<()>>>,
-}
-
-#[derive(Default)]
-struct CodexRpcShared {
-    next_sequence: u64,
-    events: VecDeque<DaemonRpcStreamEnvelope>,
-    responses: HashMap<String, Result<Value, String>>,
-}
-
-impl CodexRpcRuntime {
-    fn from_env() -> anyhow::Result<Self> {
-        let codex_bin =
-            env::var("CRABBOT_CODEX_BIN").unwrap_or_else(|_| DEFAULT_CODEX_BIN.to_string());
-        Self::new(&codex_bin)
-    }
-
-    fn new(codex_bin: &str) -> anyhow::Result<Self> {
-        let mut child = Command::new(codex_bin)
-            .arg("app-server")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .with_context(|| format!("spawn `{codex_bin} app-server`"))?;
-
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("codex app-server stdin unavailable"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| anyhow::anyhow!("codex app-server stdout unavailable"))?;
-        let shared = Arc::new((Mutex::new(CodexRpcShared::default()), Condvar::new()));
-        let reader_shared = Arc::clone(&shared);
-        let reader_thread = thread::spawn(move || {
-            codex_rpc_reader_loop(BufReader::new(stdout), reader_shared);
-        });
-
-        let runtime = Self {
-            inner: Arc::new(CodexRpcRuntimeInner {
-                stdin: Mutex::new(stdin),
-                shared,
-                next_request_id: AtomicI64::new(1),
-                _child: Mutex::new(child),
-                _reader_thread: Mutex::new(Some(reader_thread)),
-            }),
-        };
-
-        let _ = runtime.request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "crabbot-daemon",
-                    "title": "Crabbot Daemon",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": {
-                    "experimentalApi": true,
-                    "optOutNotificationMethods": LEGACY_NOTIFICATIONS_TO_OPT_OUT,
-                }
-            }),
-        )?;
-        runtime.notify("initialized", json!({}))?;
-        Ok(runtime)
-    }
-
-    fn request(&self, method: &str, params: Value) -> anyhow::Result<(Value, Value)> {
-        let request_id = Value::from(self.inner.next_request_id.fetch_add(1, Ordering::SeqCst));
-        self.write_message(&json!({
-            "id": request_id,
-            "method": method,
-            "params": params,
-        }))?;
-
-        let key = request_id_key(&request_id)
-            .ok_or_else(|| anyhow::anyhow!("failed to encode request id"))?;
-        let deadline = Instant::now() + RPC_RESPONSE_TIMEOUT;
-        loop {
-            let (lock, condvar) = &*self.inner.shared;
-            let mut shared = lock.lock().expect("rpc shared mutex poisoned");
-            if let Some(result) = shared.responses.remove(&key) {
-                return result
-                    .map(|value| (request_id.clone(), value))
-                    .map_err(anyhow::Error::msg);
-            }
-
-            let now = Instant::now();
-            if now >= deadline {
-                anyhow::bail!("timed out waiting for app-server response to {method}");
-            }
-            let wait_for = deadline - now;
-            let (next_shared, _) = condvar
-                .wait_timeout(shared, wait_for)
-                .expect("rpc condvar poisoned");
-            drop(next_shared);
-        }
-    }
-
-    fn respond(&self, request_id: Value, result: Value) -> anyhow::Result<()> {
-        self.write_message(&json!({
-            "id": request_id,
-            "result": result,
-        }))
-    }
-
-    fn notify(&self, method: &str, params: Value) -> anyhow::Result<()> {
-        self.write_message(&json!({
-            "method": method,
-            "params": params,
-        }))
-    }
-
-    fn events_since(&self, since_sequence: u64) -> Vec<DaemonRpcStreamEnvelope> {
-        let (lock, _) = &*self.inner.shared;
-        let shared = lock.lock().expect("rpc shared mutex poisoned");
-        shared
-            .events
-            .iter()
-            .filter(|event| event.sequence > since_sequence)
-            .cloned()
-            .collect()
-    }
-
-    fn write_message(&self, value: &Value) -> anyhow::Result<()> {
-        let mut stdin = self.inner.stdin.lock().expect("rpc stdin mutex poisoned");
-        write_json_line(&mut stdin, value)
-    }
-}
-
-fn codex_rpc_reader_loop(
-    mut reader: BufReader<ChildStdout>,
-    shared: Arc<(Mutex<CodexRpcShared>, Condvar)>,
-) {
-    loop {
-        let mut raw = String::new();
-        let read = match reader.read_line(&mut raw) {
-            Ok(value) => value,
-            Err(error) => {
-                push_rpc_event(
-                    &shared,
-                    DaemonRpcStreamEvent::DecodeError(DaemonRpcDecodeError {
-                        raw: String::new(),
-                        message: format!("read error: {error}"),
-                    }),
-                );
-                break;
-            }
-        };
-        if read == 0 {
-            break;
-        }
-
-        let trimmed = raw.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-
-        let message = match serde_json::from_str::<Value>(trimmed) {
-            Ok(message) => message,
-            Err(error) => {
-                push_rpc_event(
-                    &shared,
-                    DaemonRpcStreamEvent::DecodeError(DaemonRpcDecodeError {
-                        raw: trimmed.to_string(),
-                        message: error.to_string(),
-                    }),
-                );
-                continue;
-            }
-        };
-
-        let method = message.get("method").and_then(Value::as_str);
-        let request_id = message.get("id").cloned();
-        if method.is_none() && request_id.is_some() {
-            let request_id = request_id.expect("request id checked");
-            let Some(key) = request_id_key(&request_id) else {
-                continue;
-            };
-            let response = if let Some(error_value) = message.get("error") {
-                Err(extract_jsonrpc_error(error_value))
-            } else if let Some(result) = message.get("result") {
-                Ok(result.clone())
-            } else {
-                Err("missing result field in JSON-RPC response".to_string())
-            };
-
-            let (lock, condvar) = &*shared;
-            let mut state = lock.lock().expect("rpc shared mutex poisoned");
-            state.responses.insert(key, response);
-            condvar.notify_all();
-            continue;
-        }
-
-        let Some(method_name) = method else {
-            continue;
-        };
-        let params = message.get("params").cloned().unwrap_or_else(|| json!({}));
-        if let Some(request_id) = request_id {
-            push_rpc_event(
-                &shared,
-                DaemonRpcStreamEvent::ServerRequest(DaemonRpcServerRequest {
-                    request_id,
-                    method: method_name.to_string(),
-                    params,
-                }),
-            );
-        } else {
-            push_rpc_event(
-                &shared,
-                DaemonRpcStreamEvent::Notification(DaemonRpcNotification {
-                    method: method_name.to_string(),
-                    params,
-                }),
-            );
-        }
-    }
-}
-
-fn push_rpc_event(shared: &Arc<(Mutex<CodexRpcShared>, Condvar)>, event: DaemonRpcStreamEvent) {
-    let (lock, _) = &**shared;
-    let mut state = lock.lock().expect("rpc shared mutex poisoned");
-    state.next_sequence += 1;
-    let sequence = state.next_sequence;
-    state.events.push_back(DaemonRpcStreamEnvelope {
-        schema_version: DAEMON_RPC_STREAM_SCHEMA_VERSION,
-        sequence,
-        event,
-    });
-    while state.events.len() > RPC_EVENT_BUFFER_CAPACITY {
-        state.events.pop_front();
-    }
-}
-
-fn request_id_key(request_id: &Value) -> Option<String> {
-    serde_json::to_string(request_id).ok()
-}
-
-fn extract_jsonrpc_error(error_value: &Value) -> String {
-    error_value
-        .get("message")
-        .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .unwrap_or_else(|| error_value.to_string())
 }
 
 #[tokio::main]
@@ -450,9 +143,6 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/sessions/{session_id}/prompt", post(prompt_session))
         .route("/v1/sessions/{session_id}/status", get(session_status))
         .route("/v1/sessions/{session_id}/stream", get(session_stream))
-        .route("/v2/app-server/request", post(app_server_rpc_request))
-        .route("/v2/app-server/respond", post(app_server_rpc_respond))
-        .route("/v2/app-server/stream", get(app_server_rpc_stream))
         .with_state(state)
 }
 
@@ -466,17 +156,9 @@ impl AppState {
                     ws_relay.upstream_endpoint
                 )
             })?;
-        let rpc_runtime = match CodexRpcRuntime::from_env() {
-            Ok(runtime) => Some(runtime),
-            Err(error) => {
-                eprintln!("warning: daemon app-server rpc bridge disabled: {error:#}");
-                None
-            }
-        };
         Ok(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
-            rpc_runtime,
             ws_relay: Arc::new(ws_relay),
         })
     }
@@ -488,7 +170,6 @@ impl AppState {
         Ok(Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
-            rpc_runtime: None,
             ws_relay: Arc::new(WebSocketRelayState {
                 upstream_endpoint: endpoint.to_string(),
                 _spawned_app_server: None,
@@ -937,238 +618,6 @@ fn runtime_event_to_daemon_event(event: RuntimeEvent) -> Option<DaemonStreamEven
     }
 }
 
-#[derive(Debug)]
-struct RealCodexTurnOutcome {
-    thread_id: String,
-    turn_id: String,
-}
-
-fn daemon_should_use_real_codex() -> bool {
-    if cfg!(test) {
-        return false;
-    }
-    match env::var("CRABBOT_DAEMON_REAL_CODEX") {
-        Ok(raw) => {
-            let value = raw.trim().to_ascii_lowercase();
-            !matches!(value.as_str(), "0" | "false" | "off" | "no")
-        }
-        Err(_) => true,
-    }
-}
-
-fn write_json_line(stdin: &mut ChildStdin, value: &Value) -> anyhow::Result<()> {
-    serde_json::to_writer(&mut *stdin, value).context("serialize json-rpc message")?;
-    stdin.write_all(b"\n").context("write json-rpc line")?;
-    stdin.flush().context("flush json-rpc line")
-}
-
-fn try_resume_or_start_thread(
-    rpc_runtime: &CodexRpcRuntime,
-    existing_thread_id: Option<&str>,
-) -> anyhow::Result<String> {
-    if let Some(existing) = existing_thread_id {
-        let thread_id = existing.trim();
-        if !thread_id.is_empty() {
-            let resumed = rpc_runtime.request(
-                "thread/resume",
-                json!({
-                    "threadId": thread_id,
-                }),
-            );
-            if let Ok((_, result)) = resumed
-                && let Some(resumed_id) = result
-                    .get("thread")
-                    .and_then(|thread| thread.get("id"))
-                    .and_then(Value::as_str)
-            {
-                return Ok(resumed_id.to_string());
-            }
-        }
-    }
-
-    let (_, started) = rpc_runtime.request("thread/start", json!({}))?;
-    started
-        .get("thread")
-        .and_then(|thread| thread.get("id"))
-        .and_then(Value::as_str)
-        .map(|thread_id| thread_id.to_string())
-        .ok_or_else(|| anyhow::anyhow!("thread/start response missing thread.id"))
-}
-
-fn approval_prompt_from_request(method: &str, params: &Value) -> String {
-    let reason = params
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("approval required");
-    let command = params
-        .get("command")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    match method {
-        "item/commandExecution/requestApproval" if !command.is_empty() => {
-            format!("{reason}: {command}")
-        }
-        _ => reason.to_string(),
-    }
-}
-
-fn stream_event_thread_id(event: &DaemonRpcStreamEvent) -> Option<&str> {
-    let params = match event {
-        DaemonRpcStreamEvent::Notification(payload) => &payload.params,
-        DaemonRpcStreamEvent::ServerRequest(payload) => &payload.params,
-        DaemonRpcStreamEvent::DecodeError(_) => return None,
-    };
-    params.get("threadId").and_then(Value::as_str).or_else(|| {
-        params
-            .get("turn")
-            .and_then(|turn| turn.get("threadId"))
-            .and_then(Value::as_str)
-    })
-}
-
-fn ingest_rpc_events_for_session(rpc_runtime: &CodexRpcRuntime, runtime: &mut SessionRuntime) {
-    let events = rpc_runtime.events_since(runtime.rpc_cursor);
-    if events.is_empty() {
-        return;
-    }
-
-    for envelope in events {
-        runtime.rpc_cursor = runtime.rpc_cursor.max(envelope.sequence);
-        let event = envelope.event;
-        let Some(thread_id) = stream_event_thread_id(&event) else {
-            continue;
-        };
-        if thread_id != runtime.codex_thread_id {
-            continue;
-        }
-
-        match event {
-            DaemonRpcStreamEvent::Notification(payload) => match payload.method.as_str() {
-                "item/agentMessage/delta" => {
-                    if let Some(delta) = payload.params.get("delta").and_then(Value::as_str) {
-                        let turn_id = payload
-                            .params
-                            .get("turnId")
-                            .and_then(Value::as_str)
-                            .or(runtime.active_turn_id.as_deref())
-                            .unwrap_or("turn_unknown")
-                            .to_string();
-                        push_event(
-                            runtime,
-                            DaemonStreamEvent::TurnStreamDelta(DaemonTurnStreamDelta {
-                                turn_id,
-                                delta: delta.to_string(),
-                            }),
-                        );
-                    }
-                }
-                "turn/completed" => {
-                    let completed_turn_id = payload
-                        .params
-                        .get("turn")
-                        .and_then(|turn| turn.get("id"))
-                        .and_then(Value::as_str)
-                        .or(runtime.active_turn_id.as_deref())
-                        .unwrap_or("turn_unknown")
-                        .to_string();
-                    let status = payload
-                        .params
-                        .get("turn")
-                        .and_then(|turn| turn.get("status"))
-                        .and_then(Value::as_str)
-                        .unwrap_or("completed")
-                        .to_string();
-                    push_event(
-                        runtime,
-                        DaemonStreamEvent::TurnCompleted(DaemonTurnCompleted {
-                            turn_id: completed_turn_id,
-                            output_summary: format!("status: {status}"),
-                        }),
-                    );
-                    runtime.active_turn_id = None;
-                    runtime.status.last_event = format!("turn_{status}");
-                    runtime.status.updated_at_unix_ms = now_unix_ms();
-                }
-                _ => {}
-            },
-            DaemonRpcStreamEvent::ServerRequest(payload) => {
-                if matches!(
-                    payload.method.as_str(),
-                    "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-                ) {
-                    let approval_turn_id = payload
-                        .params
-                        .get("turnId")
-                        .and_then(Value::as_str)
-                        .or(runtime.active_turn_id.as_deref())
-                        .unwrap_or("turn_unknown")
-                        .to_string();
-                    let approval_id = payload
-                        .params
-                        .get("approvalId")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                        .or_else(|| {
-                            payload
-                                .params
-                                .get("itemId")
-                                .and_then(Value::as_str)
-                                .map(ToString::to_string)
-                        })
-                        .or_else(|| request_id_key(&payload.request_id))
-                        .unwrap_or_else(|| "approval_request".to_string());
-                    push_event(
-                        runtime,
-                        DaemonStreamEvent::ApprovalRequired(DaemonApprovalRequired {
-                            turn_id: approval_turn_id,
-                            approval_id,
-                            action_kind: if payload.method == "item/fileChange/requestApproval" {
-                                "file_change".to_string()
-                            } else {
-                                "command_execution".to_string()
-                            },
-                            prompt: approval_prompt_from_request(&payload.method, &payload.params),
-                        }),
-                    );
-                    runtime.status.last_event = "approval_required".to_string();
-                    runtime.status.updated_at_unix_ms = now_unix_ms();
-                }
-            }
-            DaemonRpcStreamEvent::DecodeError(_) => {}
-        }
-    }
-}
-
-fn run_real_codex_turn(
-    rpc_runtime: &CodexRpcRuntime,
-    existing_thread_id: Option<&str>,
-    prompt: &str,
-) -> anyhow::Result<RealCodexTurnOutcome> {
-    let thread_id = try_resume_or_start_thread(rpc_runtime, existing_thread_id)?;
-    let (_, turn_start_result) = rpc_runtime.request(
-        "turn/start",
-        json!({
-            "threadId": thread_id,
-            "input": [
-                {
-                    "type": "text",
-                    "text": prompt,
-                    "textElements": []
-                }
-            ]
-        }),
-    )?;
-
-    let turn_id = turn_start_result
-        .get("turn")
-        .and_then(|turn| turn.get("id"))
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow::anyhow!("turn/start response missing turn.id"))?
-        .to_string();
-
-    Ok(RealCodexTurnOutcome { thread_id, turn_id })
-}
-
 fn synthesize_assistant_output(prompt: &str) -> String {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -1221,7 +670,6 @@ async fn start_session(
         codex_session_id: codex_session.session_id,
         codex_thread_id: codex_thread.thread_id,
         active_turn_id: None,
-        rpc_cursor: 0,
         next_sequence: 0,
         events: Vec::new(),
     };
@@ -1320,13 +768,8 @@ async fn session_status(
     State(state): State<AppState>,
     Path(session_id): Path<String>,
 ) -> Result<Json<DaemonSessionStatusResponse>, StatusCode> {
-    let mut sessions = state.sessions.write().await;
-    let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
-    if daemon_should_use_real_codex()
-        && let Some(rpc_runtime) = state.rpc_runtime.as_ref()
-    {
-        ingest_rpc_events_for_session(rpc_runtime, runtime);
-    }
+    let sessions = state.sessions.read().await;
+    let runtime = sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(runtime.status.clone()))
 }
 
@@ -1335,13 +778,8 @@ async fn session_stream(
     Path(session_id): Path<String>,
     Query(query): Query<StreamQuery>,
 ) -> Result<impl IntoResponse, StatusCode> {
-    let mut sessions = state.sessions.write().await;
-    let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
-    if daemon_should_use_real_codex()
-        && let Some(rpc_runtime) = state.rpc_runtime.as_ref()
-    {
-        ingest_rpc_events_for_session(rpc_runtime, runtime);
-    }
+    let sessions = state.sessions.read().await;
+    let runtime = sessions.get(&session_id).ok_or(StatusCode::NOT_FOUND)?;
     let since = query.since_sequence.unwrap_or(0);
     let lines = runtime
         .events
@@ -1357,75 +795,6 @@ async fn session_stream(
             ("content-type", "application/x-ndjson"),
             ("cache-control", "no-store"),
             ("x-crabbot-daemon-stream", "1"),
-        ],
-        payload,
-    ))
-}
-
-fn rpc_runtime_or_503(state: &AppState) -> Result<CodexRpcRuntime, StatusCode> {
-    state
-        .rpc_runtime
-        .clone()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)
-}
-
-fn map_spawn_blocking_error(error: JoinError) -> StatusCode {
-    let _ = error;
-    StatusCode::INTERNAL_SERVER_ERROR
-}
-
-async fn app_server_rpc_request(
-    State(state): State<AppState>,
-    Json(payload): Json<DaemonRpcRequest>,
-) -> Result<Json<DaemonRpcRequestResponse>, StatusCode> {
-    if payload.method.trim().is_empty() {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    let runtime = rpc_runtime_or_503(&state)?;
-    let method = payload.method.clone();
-    let params = payload.params.clone();
-    let result = tokio::task::spawn_blocking(move || runtime.request(&method, params))
-        .await
-        .map_err(map_spawn_blocking_error)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(DaemonRpcRequestResponse {
-        request_id: result.0,
-        result: result.1,
-    }))
-}
-
-async fn app_server_rpc_respond(
-    State(state): State<AppState>,
-    Json(payload): Json<DaemonRpcRespondRequest>,
-) -> Result<Json<DaemonRpcRespondResponse>, StatusCode> {
-    let runtime = rpc_runtime_or_503(&state)?;
-    let request_id = payload.request_id.clone();
-    let result = payload.result.clone();
-    tokio::task::spawn_blocking(move || runtime.respond(request_id, result))
-        .await
-        .map_err(map_spawn_blocking_error)?
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-    Ok(Json(DaemonRpcRespondResponse { ok: true }))
-}
-
-async fn app_server_rpc_stream(
-    State(state): State<AppState>,
-    Query(query): Query<StreamQuery>,
-) -> Result<impl IntoResponse, StatusCode> {
-    let runtime = rpc_runtime_or_503(&state)?;
-    let since = query.since_sequence.unwrap_or(0);
-    let lines = runtime
-        .events_since(since)
-        .into_iter()
-        .map(|event| serde_json::to_string(&event).expect("serialize daemon rpc event"))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let payload = format!("{lines}\n");
-    Ok((
-        [
-            ("content-type", "application/x-ndjson"),
-            ("cache-control", "no-store"),
-            ("x-crabbot-daemon-app-server-stream", "1"),
         ],
         payload,
     ))
@@ -1451,59 +820,6 @@ async fn prompt_session(
     };
     if daemon_state != "active" {
         return Err(StatusCode::CONFLICT);
-    }
-
-    if daemon_should_use_real_codex() {
-        let rpc_runtime = rpc_runtime_or_503(&state)?;
-        let existing_thread_id = if codex_thread_id.trim().is_empty() {
-            None
-        } else {
-            Some(codex_thread_id.clone())
-        };
-        let prompt_text = payload.prompt.clone();
-        let real_outcome = tokio::task::spawn_blocking(move || {
-            run_real_codex_turn(&rpc_runtime, existing_thread_id.as_deref(), &prompt_text)
-        })
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR);
-
-        match real_outcome {
-            Ok(Ok(real)) => {
-                let mut sessions = state.sessions.write().await;
-                let runtime = sessions.get_mut(&session_id).ok_or(StatusCode::NOT_FOUND)?;
-                if let Some(rpc_runtime) = state.rpc_runtime.as_ref() {
-                    ingest_rpc_events_for_session(rpc_runtime, runtime);
-                }
-                if runtime.status.state != "active" {
-                    return Err(StatusCode::CONFLICT);
-                }
-                if runtime.active_turn_id.is_some() {
-                    return Err(StatusCode::CONFLICT);
-                }
-                runtime.codex_thread_id = real.thread_id;
-                runtime.active_turn_id = Some(real.turn_id.clone());
-                runtime.status.last_event = "turn_started".to_string();
-                runtime.status.updated_at_unix_ms = now_unix_ms();
-                if let Some(rpc_runtime) = state.rpc_runtime.as_ref() {
-                    ingest_rpc_events_for_session(rpc_runtime, runtime);
-                }
-
-                let response = DaemonPromptResponse {
-                    session_id,
-                    turn_id: real.turn_id,
-                    state: runtime.status.state.clone(),
-                    last_event: runtime.status.last_event.clone(),
-                    updated_at_unix_ms: runtime.status.updated_at_unix_ms,
-                    last_sequence: runtime.next_sequence,
-                };
-                return Ok((StatusCode::ACCEPTED, Json(response)));
-            }
-            Ok(Err(error)) => {
-                eprintln!("error: real codex app-server prompt failed: {error:#}");
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-            Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
-        }
     }
 
     ensure_codex_initialized(&state.codex_client).await?;
