@@ -499,7 +499,7 @@ pub mod config {
                     network: None,
                     windows_sandbox_mode: None,
                 },
-                model_reasoning_summary: ReasoningSummary::None,
+                model_reasoning_summary: ReasoningSummary::Auto,
                 model_reasoning_effort: None,
                 plan_mode_reasoning_effort: None,
                 model_context_window: None,
@@ -591,12 +591,47 @@ pub mod config {
             self.config.codex_home = codex_home;
             self
         }
-        pub fn cli_overrides(self, _cli_overrides: Vec<(String, toml::Value)>) -> Self {
+        pub fn cli_overrides(mut self, cli_overrides: Vec<(String, toml::Value)>) -> Self {
+            for (key, value) in cli_overrides {
+                apply_toml_override(&mut self.config, &key, value);
+            }
             self
         }
         pub fn harness_overrides(mut self, harness_overrides: ConfigOverrides) -> Self {
+            if let Some(model) = harness_overrides.model {
+                self.config.model = Some(model);
+            }
+            if let Some(review_model) = harness_overrides.review_model {
+                self.config.review_model = Some(review_model);
+            }
             if let Some(cwd) = harness_overrides.cwd {
                 self.config.cwd = cwd;
+            }
+            if let Some(approval_policy) = harness_overrides.approval_policy {
+                let _ = self.config.permissions.approval_policy.set(approval_policy);
+            }
+            if let Some(sandbox_mode) = harness_overrides.sandbox_mode {
+                let policy = match sandbox_mode {
+                    codex_protocol::config_types::SandboxMode::ReadOnly => {
+                        crate::protocol::SandboxPolicy::new_read_only_policy()
+                    }
+                    codex_protocol::config_types::SandboxMode::WorkspaceWrite => {
+                        crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                    }
+                    codex_protocol::config_types::SandboxMode::DangerFullAccess => {
+                        crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                    }
+                };
+                let _ = self.config.permissions.sandbox_policy.set(policy);
+            }
+            if let Some(model_provider) = harness_overrides.model_provider {
+                self.config.model_provider_id = model_provider;
+            }
+            if let Some(personality) = harness_overrides.personality {
+                self.config.personality = Some(personality);
+            }
+            if let Some(compact_prompt) = harness_overrides.compact_prompt {
+                self.config.compact_prompt = Some(compact_prompt);
             }
             self
         }
@@ -609,21 +644,62 @@ pub mod config {
         pub fn from_config(config: Config) -> Self {
             Self { config }
         }
-        pub async fn build(self) -> std::io::Result<Config> {
+        pub async fn build(mut self) -> std::io::Result<Config> {
+            if self.config.codex_home
+                == std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+            {
+                if let Ok(codex_home) = find_codex_home() {
+                    self.config.codex_home = codex_home;
+                }
+            }
+            if self.config.cwd == std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir()) {
+                if let Ok(cwd) = std::env::current_dir() {
+                    self.config.cwd = cwd;
+                }
+            }
+
+            let config_path = self.config.codex_home.join("config.toml");
+            if let Ok(raw) = std::fs::read_to_string(&config_path) {
+                if let Ok(parsed) = raw.parse::<toml::Value>() {
+                    apply_toml_config(&mut self.config, &parsed);
+                }
+            }
+
             Ok(self.config)
         }
     }
 
     pub fn find_codex_home() -> anyhow::Result<std::path::PathBuf> {
-        Ok(std::env::current_dir()?)
+        if let Some(codex_home) = std::env::var_os("CODEX_HOME") {
+            let path = std::path::PathBuf::from(codex_home).canonicalize()?;
+            if !path.is_dir() {
+                anyhow::bail!("CODEX_HOME must point to a directory: {}", path.display());
+            }
+            return Ok(path);
+        }
+
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("HOME is not set and CODEX_HOME is unset"))?;
+        Ok(std::path::PathBuf::from(home).join(".codex"))
     }
 
     pub async fn load_config_as_toml_with_cli_overrides(
-        _codex_home: &std::path::Path,
+        codex_home: &std::path::Path,
         _cwd: &crate::AbsolutePathBuf,
-        _overrides: Vec<(String, toml::Value)>,
+        overrides: Vec<(String, toml::Value)>,
     ) -> anyhow::Result<toml::Value> {
-        Ok(toml::Value::Table(toml::map::Map::new()))
+        let config_path = codex_home.join("config.toml");
+        let mut merged = if config_path.exists() {
+            let raw = std::fs::read_to_string(&config_path)?;
+            raw.parse::<toml::Value>()?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+
+        for (key, value) in overrides {
+            apply_dotted_toml_value(&mut merged, &key, value)?;
+        }
+        Ok(merged)
     }
 
     pub fn resolve_oss_provider(_toml: &toml::Value, _cli: &ConfigOverrides) -> Option<String> {
@@ -635,6 +711,112 @@ pub mod config {
         _cwd: &std::path::Path,
         _trust: codex_protocol::config_types::TrustLevel,
     ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    fn apply_toml_override(config: &mut Config, key: &str, value: toml::Value) {
+        match key {
+            "model" => {
+                if let Some(model) = value.as_str() {
+                    config.model = Some(model.to_string());
+                }
+            }
+            "review_model" => {
+                if let Some(model) = value.as_str() {
+                    config.review_model = Some(model.to_string());
+                }
+            }
+            "model_provider" | "model_provider_id" => {
+                if let Some(provider) = value.as_str() {
+                    config.model_provider_id = provider.to_string();
+                }
+            }
+            "chatgpt_base_url" => {
+                if let Some(url) = value.as_str() {
+                    config.chatgpt_base_url = url.to_string();
+                }
+            }
+            "model_context_window" => {
+                if let Some(window) = value.as_integer() {
+                    config.model_context_window = Some(window);
+                }
+            }
+            "model_reasoning_summary" => {
+                if let Ok(summary) = value.clone().try_into::<ReasoningSummary>() {
+                    config.model_reasoning_summary = summary;
+                }
+            }
+            "model_reasoning_effort" => {
+                if let Ok(effort) = value
+                    .clone()
+                    .try_into::<crate::openai_models::ReasoningEffort>()
+                {
+                    config.model_reasoning_effort = Some(effort);
+                }
+            }
+            "plan_mode_reasoning_effort" => {
+                if let Ok(effort) = value
+                    .clone()
+                    .try_into::<crate::openai_models::ReasoningEffort>()
+                {
+                    config.plan_mode_reasoning_effort = Some(effort);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn apply_toml_config(config: &mut Config, parsed: &toml::Value) {
+        let Some(table) = parsed.as_table() else {
+            return;
+        };
+
+        for (key, value) in table {
+            apply_toml_override(config, key, value.clone());
+        }
+
+        if let Some(features) = table.get("features").and_then(toml::Value::as_table) {
+            for (key, value) in features {
+                let Some(feature) = crate::features::Feature::from_key(key) else {
+                    continue;
+                };
+                if value.as_bool().unwrap_or(false) {
+                    config.features.enable(feature);
+                } else {
+                    config.features.disable(feature);
+                }
+            }
+        }
+    }
+
+    fn apply_dotted_toml_value(
+        root: &mut toml::Value,
+        dotted_key: &str,
+        value: toml::Value,
+    ) -> anyhow::Result<()> {
+        let mut parts = dotted_key.split('.').peekable();
+        if parts.peek().is_none() {
+            anyhow::bail!("empty config key path");
+        }
+
+        let mut current = root;
+        while let Some(part) = parts.next() {
+            let is_last = parts.peek().is_none();
+            if is_last {
+                let table = current.as_table_mut().ok_or_else(|| {
+                    anyhow::anyhow!("config path `{dotted_key}` collides with non-table value")
+                })?;
+                table.insert(part.to_string(), value);
+                return Ok(());
+            }
+
+            let table = current.as_table_mut().ok_or_else(|| {
+                anyhow::anyhow!("config path `{dotted_key}` collides with non-table value")
+            })?;
+            current = table
+                .entry(part.to_string())
+                .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+        }
         Ok(())
     }
 
@@ -1832,6 +2014,23 @@ pub struct ThreadManager {
     threads: std::sync::Arc<Mutex<HashMap<ThreadId, std::sync::Arc<CodexThread>>>>,
 }
 
+fn thread_rpc_params_from_config(config: &crate::config::Config) -> Value {
+    let approval_policy = match config.permissions.approval_policy.get() {
+        crate::protocol::AskForApproval::UnlessTrusted => "untrusted",
+        crate::protocol::AskForApproval::OnFailure => "on-failure",
+        crate::protocol::AskForApproval::OnRequest => "on-request",
+        crate::protocol::AskForApproval::Never => "never",
+        crate::protocol::AskForApproval::Reject(_) => "on-request",
+    };
+    let sandbox = summarize_sandbox_policy(config.permissions.sandbox_policy.get());
+    json!({
+        "model": config.model,
+        "cwd": config.cwd,
+        "approvalPolicy": approval_policy,
+        "sandbox": sandbox,
+    })
+}
+
 impl Default for ThreadManager {
     fn default() -> Self {
         Self::new(
@@ -1900,13 +2099,12 @@ impl ThreadManager {
         config: crate::config::Config,
     ) -> Result<NewThread, CodexError> {
         let backend = get_shim_backend_config();
+        let start_params = thread_rpc_params_from_config(&config);
         let response = app_server_rpc_request_raw(
             &backend.app_server_endpoint,
             backend.auth_token.as_deref(),
             "thread/start",
-            json!({
-                "approvalPolicy": "on-request",
-            }),
+            start_params,
         )
         .map_err(|err| CodexError::new(format!("thread/start failed: {err}")))?;
 
@@ -1926,10 +2124,10 @@ impl ThreadManager {
         let config_snapshot = ThreadConfigSnapshot {
             model: model.clone(),
             model_provider_id: config.model_provider_id.clone(),
-            approval_policy: crate::protocol::AskForApproval::OnRequest,
-            sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.value(),
             cwd: config.cwd.clone(),
-            reasoning_effort: None,
+            reasoning_effort: config.model_reasoning_effort,
             session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
@@ -1947,10 +2145,10 @@ impl ThreadManager {
                 thread_name: None,
                 model,
                 model_provider_id: config.model_provider_id,
-                approval_policy: crate::protocol::AskForApproval::OnRequest,
-                sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+                approval_policy: config.permissions.approval_policy.value(),
+                sandbox_policy: config.permissions.sandbox_policy.value(),
                 cwd: config.cwd,
-                reasoning_effort: None,
+                reasoning_effort: config.model_reasoning_effort,
                 history_log_id: 0,
                 history_entry_count: 0,
                 initial_messages: None,
@@ -1983,13 +2181,13 @@ impl ThreadManager {
         };
         let _ = auth_manager;
         let backend = get_shim_backend_config();
+        let mut resume_params = thread_rpc_params_from_config(&config);
+        resume_params["threadId"] = Value::String(thread_id.to_string());
         let response = app_server_rpc_request_raw(
             &backend.app_server_endpoint,
             backend.auth_token.as_deref(),
             "thread/resume",
-            json!({
-                "threadId": thread_id.to_string(),
-            }),
+            resume_params,
         )
         .map_err(|err| CodexError::new(format!("thread/resume failed: {err}")))?;
         let model = response
@@ -2005,10 +2203,10 @@ impl ThreadManager {
         let config_snapshot = ThreadConfigSnapshot {
             model: model.clone(),
             model_provider_id: config.model_provider_id.clone(),
-            approval_policy: crate::protocol::AskForApproval::OnRequest,
-            sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.value(),
             cwd: config.cwd.clone(),
-            reasoning_effort: None,
+            reasoning_effort: config.model_reasoning_effort,
             session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
@@ -2026,10 +2224,10 @@ impl ThreadManager {
                 thread_name: None,
                 model,
                 model_provider_id: config.model_provider_id,
-                approval_policy: crate::protocol::AskForApproval::OnRequest,
-                sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+                approval_policy: config.permissions.approval_policy.value(),
+                sandbox_policy: config.permissions.sandbox_policy.value(),
                 cwd: config.cwd,
-                reasoning_effort: None,
+                reasoning_effort: config.model_reasoning_effort,
                 history_log_id: 0,
                 history_entry_count: 0,
                 initial_messages,
@@ -2070,13 +2268,13 @@ impl ThreadManager {
         source_thread_id: String,
     ) -> Result<NewThread, CodexError> {
         let backend = get_shim_backend_config();
+        let mut fork_params = thread_rpc_params_from_config(&config);
+        fork_params["threadId"] = Value::String(source_thread_id);
         let response = app_server_rpc_request_raw(
             &backend.app_server_endpoint,
             backend.auth_token.as_deref(),
             "thread/fork",
-            json!({
-                "threadId": source_thread_id,
-            }),
+            fork_params,
         )
         .map_err(|err| CodexError::new(format!("thread/fork failed: {err}")))?;
 
@@ -2096,10 +2294,10 @@ impl ThreadManager {
         let config_snapshot = ThreadConfigSnapshot {
             model: model.clone(),
             model_provider_id: config.model_provider_id.clone(),
-            approval_policy: crate::protocol::AskForApproval::OnRequest,
-            sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+            approval_policy: config.permissions.approval_policy.value(),
+            sandbox_policy: config.permissions.sandbox_policy.value(),
             cwd: config.cwd.clone(),
-            reasoning_effort: None,
+            reasoning_effort: config.model_reasoning_effort,
             session_source: crate::protocol::SessionSource::Cli,
         };
         let thread = std::sync::Arc::new(CodexThread::new(thread_id, config_snapshot, None));
@@ -2117,10 +2315,10 @@ impl ThreadManager {
                 thread_name: None,
                 model,
                 model_provider_id: config.model_provider_id,
-                approval_policy: crate::protocol::AskForApproval::OnRequest,
-                sandbox_policy: crate::protocol::SandboxPolicy::new_workspace_write_policy(),
+                approval_policy: config.permissions.approval_policy.value(),
+                sandbox_policy: config.permissions.sandbox_policy.value(),
                 cwd: config.cwd,
-                reasoning_effort: None,
+                reasoning_effort: config.model_reasoning_effort,
                 history_log_id: 0,
                 history_entry_count: 0,
                 initial_messages,
@@ -4064,7 +4262,10 @@ pub async fn run_startup_picker(
 
     let terminal = crate::tui::init().context("initialize tui terminal for startup picker")?;
     let mut tui = crate::tui::Tui::new(terminal);
-    let config = crate::config::Config::default();
+    let config = crate::config::ConfigBuilder::default()
+        .build()
+        .await
+        .unwrap_or_else(|_| crate::config::Config::default());
     let selection = match mode {
         StartupPicker::Resume => resume_picker::run_resume_picker(&mut tui, &config, show_all)
             .await
@@ -4115,10 +4316,12 @@ pub async fn run_main(
         None
     };
     let startup_picker_show_all = cli.resume_show_all || cli.fork_show_all;
-    let mut config = crate::config::Config::default();
+    let mut config = crate::config::ConfigBuilder::default()
+        .build()
+        .await
+        .unwrap_or_else(|_| crate::config::Config::default());
     if let Ok(cwd) = std::env::current_dir() {
-        config.cwd = cwd.clone();
-        config.codex_home = cwd;
+        config.cwd = cwd;
     }
     let thread_id = if let Some(id_or_name) = cli.fork_session_id.as_deref() {
         match resolve_named_or_id_thread_id_for_cli(&config, id_or_name)
@@ -4300,7 +4503,10 @@ async fn resolve_session_selection_from_args(
 
     let terminal = crate::tui::init().context("initialize tui terminal for startup picker")?;
     let mut tui = crate::tui::Tui::new(terminal);
-    let config = crate::config::Config::default();
+    let config = crate::config::ConfigBuilder::default()
+        .build()
+        .await
+        .unwrap_or_else(|_| crate::config::Config::default());
     let selection = match mode {
         StartupPicker::Resume => {
             resume_picker::run_resume_picker(&mut tui, &config, args.startup_picker_show_all)
@@ -4329,10 +4535,12 @@ pub async fn handle_tui(args: TuiArgs, state: &mut CliState) -> Result<app::AppE
     let mut terminal = crate::tui::init().context("initialize tui terminal")?;
     terminal.clear()?;
     let mut tui = crate::tui::Tui::new(terminal);
-    let mut config = crate::config::Config::default();
+    let mut config = crate::config::ConfigBuilder::default()
+        .build()
+        .await
+        .unwrap_or_else(|_| crate::config::Config::default());
     if let Ok(cwd) = std::env::current_dir() {
-        config.cwd = cwd.clone();
-        config.codex_home = cwd;
+        config.cwd = cwd;
     }
     if let Ok(Some(config_snapshot)) = crate::read_config_snapshot(state) {
         apply_tui_config_snapshot(&mut config, &config_snapshot);
@@ -4418,6 +4626,25 @@ fn apply_tui_config_snapshot(config: &mut crate::config::Config, snapshot: &serd
         })
     {
         config.model_reasoning_effort = Some(reasoning_effort);
+    }
+
+    if let Some(approval_policy) = snapshot
+        .get("approval_policy")
+        .or_else(|| snapshot.get("approvalPolicy"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::protocol::AskForApproval>(value).ok())
+    {
+        let _ = config.permissions.approval_policy.set(approval_policy);
+    }
+
+    if let Some(sandbox_policy) = snapshot
+        .get("sandbox")
+        .or_else(|| snapshot.get("sandbox_policy"))
+        .or_else(|| snapshot.get("sandboxPolicy"))
+        .cloned()
+        .and_then(|value| serde_json::from_value::<crate::protocol::SandboxPolicy>(value).ok())
+    {
+        let _ = config.permissions.sandbox_policy.set(sandbox_policy);
     }
 
     if let Some(plan_mode_reasoning_effort) = snapshot

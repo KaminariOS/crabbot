@@ -1956,16 +1956,88 @@ fn summarize_server_request(request: &DaemonRpcServerRequest) -> String {
 }
 
 pub(crate) fn start_thread(state: &CliState) -> Result<String> {
+    let snapshot = read_config_snapshot(state).ok().flatten();
+    let start_params = thread_start_params_from_snapshot(snapshot.as_ref());
     let response = app_server_rpc_request(
         &state.config.app_server_endpoint,
         state.config.auth_token.as_deref(),
         "thread/start",
-        json!({
-            "approvalPolicy": "on-request"
-        }),
+        start_params,
     )?;
     extract_thread_id_from_rpc_result(&response.result)
         .ok_or_else(|| anyhow!("failed to initialize app-server thread"))
+}
+
+fn thread_start_params_from_snapshot(snapshot: Option<&Value>) -> Value {
+    let mut params = json!({
+        "approvalPolicy": "on-request",
+        "sandbox": "workspace-write",
+    });
+
+    let Some(snapshot) = snapshot else {
+        return params;
+    };
+
+    if let Some(model) = snapshot.get("model").and_then(Value::as_str) {
+        params["model"] = Value::String(model.to_string());
+    }
+    if let Some(cwd) = snapshot.get("cwd").and_then(Value::as_str) {
+        params["cwd"] = Value::String(cwd.to_string());
+    }
+
+    if let Some(approval) = snapshot
+        .get("approval_policy")
+        .or_else(|| snapshot.get("approvalPolicy"))
+        .and_then(approval_policy_for_thread_start)
+    {
+        params["approvalPolicy"] = approval;
+    }
+
+    if let Some(sandbox) = snapshot
+        .get("sandbox")
+        .or_else(|| snapshot.get("sandbox_policy"))
+        .or_else(|| snapshot.get("sandboxPolicy"))
+        .and_then(sandbox_for_thread_start)
+    {
+        params["sandbox"] = sandbox;
+    }
+
+    params
+}
+
+fn approval_policy_for_thread_start(value: &Value) -> Option<Value> {
+    if let Some(raw) = value.as_str() {
+        return Some(Value::String(raw.to_string()));
+    }
+
+    if let Ok(policy) = serde_json::from_value::<crate::protocol::AskForApproval>(value.clone()) {
+        let normalized = match policy {
+            crate::protocol::AskForApproval::UnlessTrusted => "untrusted",
+            crate::protocol::AskForApproval::OnFailure => "on-failure",
+            crate::protocol::AskForApproval::OnRequest => "on-request",
+            crate::protocol::AskForApproval::Never => "never",
+            crate::protocol::AskForApproval::Reject(_) => "on-request",
+        };
+        return Some(Value::String(normalized.to_string()));
+    }
+
+    if value.get("reject").is_some() || value.get("Reject").is_some() {
+        return Some(Value::String("on-request".to_string()));
+    }
+
+    None
+}
+
+fn sandbox_for_thread_start(value: &Value) -> Option<Value> {
+    if let Some(raw) = value.as_str() {
+        return Some(Value::String(raw.to_string()));
+    }
+
+    if let Ok(policy) = serde_json::from_value::<crate::protocol::SandboxPolicy>(value.clone()) {
+        return Some(Value::String(summarize_sandbox_policy(&policy)));
+    }
+
+    None
 }
 
 pub(crate) fn start_turn(state: &CliState, thread_id: &str, text: &str) -> Result<Option<String>> {
