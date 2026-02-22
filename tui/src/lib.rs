@@ -1977,6 +1977,17 @@ impl CodexThread {
                 }
                 None
             }
+            "thread/tokenUsage/updated" => {
+                let info = crate::core_compat::parse_token_usage_updated(&notification.params)
+                    .map(|(token_usage_info, _total)| token_usage_info);
+                Some(crate::protocol::Event {
+                    id: format!("seq-{sequence}"),
+                    msg: crate::protocol::EventMsg::TokenCount(crate::protocol::TokenCountEvent {
+                        info,
+                        rate_limits: None,
+                    }),
+                })
+            }
             _ => None,
         }
     }

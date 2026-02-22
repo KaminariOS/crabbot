@@ -1325,7 +1325,7 @@ fn parse_reasoning_effort_value(
     }
 }
 
-fn parse_token_usage_updated(
+pub(crate) fn parse_token_usage_updated(
     params: &Value,
 ) -> Option<(
     codex_core::protocol::TokenUsageInfo,
