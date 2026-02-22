@@ -1554,8 +1554,18 @@ fn parse_token_usage_updated_from_info(
 }
 
 fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::RateLimitSnapshot> {
-    let primary = parse_rate_limit_window(value.get("primary"));
-    let secondary = parse_rate_limit_window(value.get("secondary"));
+    let primary = parse_rate_limit_window(
+        value
+            .get("primary")
+            .or_else(|| value.get("primaryWindow"))
+            .or_else(|| value.get("primary_window")),
+    );
+    let secondary = parse_rate_limit_window(
+        value
+            .get("secondary")
+            .or_else(|| value.get("secondaryWindow"))
+            .or_else(|| value.get("secondary_window")),
+    );
     let credits = value
         .get("credits")
         .map(|credits| codex_core::protocol::CreditsSnapshot {
@@ -1594,20 +1604,33 @@ fn parse_rate_limit_snapshot(value: &Value) -> Option<codex_core::protocol::Rate
 
 fn parse_rate_limit_window(value: Option<&Value>) -> Option<codex_core::protocol::RateLimitWindow> {
     let window = value?;
+    let used_percent = window
+        .get("usedPercent")
+        .or_else(|| window.get("used_percent"))
+        .and_then(Value::as_f64)?;
+    let window_minutes = window
+        .get("windowMinutes")
+        .or_else(|| window.get("window_minutes"))
+        .or_else(|| window.get("windowDurationMins"))
+        .or_else(|| window.get("window_duration_mins"))
+        .and_then(Value::as_i64)
+        .or_else(|| {
+            window
+                .get("limitWindowSeconds")
+                .or_else(|| window.get("limit_window_seconds"))
+                .and_then(Value::as_i64)
+                .map(|seconds| seconds / 60)
+        });
+
     Some(codex_core::protocol::RateLimitWindow {
-        used_percent: window
-            .get("usedPercent")
-            .or_else(|| window.get("used_percent"))
-            .and_then(Value::as_f64)
-            .unwrap_or_default(),
+        used_percent,
         resets_at: window
             .get("resetsAt")
             .or_else(|| window.get("resets_at"))
+            .or_else(|| window.get("resetAt"))
+            .or_else(|| window.get("reset_at"))
             .and_then(Value::as_i64),
-        window_minutes: window
-            .get("windowMinutes")
-            .or_else(|| window.get("window_minutes"))
-            .and_then(Value::as_i64),
+        window_minutes,
     })
 }
 
@@ -3162,5 +3185,49 @@ mod tests {
         let line = r#"{"id":1,"result":{"ok":true}}"#;
         let envelope = decode_app_server_wire_line(line, 14).expect("decode should succeed");
         assert!(envelope.is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_snapshot_ignores_empty_secondary_window() {
+        let value = json!({
+            "limitId": "codex",
+            "primary": {
+                "usedPercent": 63.0,
+                "windowMinutes": 10080,
+                "resetsAt": 1_708_000_000
+            },
+            "secondary": {}
+        });
+
+        let snapshot = parse_rate_limit_snapshot(&value).expect("snapshot should parse");
+        assert!(snapshot.primary.is_some());
+        assert!(snapshot.secondary.is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_snapshot_accepts_window_aliases() {
+        let value = json!({
+            "limitId": "codex",
+            "primaryWindow": {
+                "usedPercent": 63.0,
+                "windowDurationMins": 10080,
+                "resetAt": 1_708_000_000
+            },
+            "secondary_window": {
+                "usedPercent": 11.0,
+                "limitWindowSeconds": 18_000,
+                "resetsAt": 1_708_000_001
+            }
+        });
+
+        let snapshot = parse_rate_limit_snapshot(&value).expect("snapshot should parse");
+        assert_eq!(
+            snapshot.primary.as_ref().and_then(|w| w.window_minutes),
+            Some(10080)
+        );
+        assert_eq!(
+            snapshot.secondary.as_ref().and_then(|w| w.window_minutes),
+            Some(300)
+        );
     }
 }

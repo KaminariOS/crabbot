@@ -157,8 +157,18 @@ fn parse_rate_limit_snapshots_from_result(
 fn parse_rate_limit_snapshot_value(
     value: &serde_json::Value,
 ) -> Option<crate::protocol::RateLimitSnapshot> {
-    let primary = parse_rate_limit_window_value(value.get("primary"));
-    let secondary = parse_rate_limit_window_value(value.get("secondary"));
+    let primary = parse_rate_limit_window_value(
+        value
+            .get("primary")
+            .or_else(|| value.get("primaryWindow"))
+            .or_else(|| value.get("primary_window")),
+    );
+    let secondary = parse_rate_limit_window_value(
+        value
+            .get("secondary")
+            .or_else(|| value.get("secondaryWindow"))
+            .or_else(|| value.get("secondary_window")),
+    );
     let credits = value
         .get("credits")
         .map(|credits| crate::protocol::CreditsSnapshot {
@@ -203,21 +213,96 @@ fn parse_rate_limit_window_value(
     value: Option<&serde_json::Value>,
 ) -> Option<crate::protocol::RateLimitWindow> {
     let window = value?;
+    let used_percent = window
+        .get("usedPercent")
+        .or_else(|| window.get("used_percent"))
+        .and_then(serde_json::Value::as_f64)?;
+    let window_minutes = window
+        .get("windowMinutes")
+        .or_else(|| window.get("window_minutes"))
+        .or_else(|| window.get("windowDurationMins"))
+        .or_else(|| window.get("window_duration_mins"))
+        .and_then(serde_json::Value::as_i64)
+        .or_else(|| {
+            window
+                .get("limitWindowSeconds")
+                .or_else(|| window.get("limit_window_seconds"))
+                .and_then(serde_json::Value::as_i64)
+                .map(|seconds| seconds / 60)
+        });
+
     Some(crate::protocol::RateLimitWindow {
-        used_percent: window
-            .get("usedPercent")
-            .or_else(|| window.get("used_percent"))
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or_default(),
+        used_percent,
         resets_at: window
             .get("resetsAt")
             .or_else(|| window.get("resets_at"))
+            .or_else(|| window.get("resetAt"))
+            .or_else(|| window.get("reset_at"))
             .and_then(serde_json::Value::as_i64),
-        window_minutes: window
-            .get("windowMinutes")
-            .or_else(|| window.get("window_minutes"))
-            .and_then(serde_json::Value::as_i64),
+        window_minutes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_rate_limit_snapshots_from_result;
+    use serde_json::json;
+
+    #[test]
+    fn parse_rate_limit_snapshots_ignores_empty_secondary_window() {
+        let result = json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 64.0,
+                        "windowMinutes": 10080,
+                        "resetsAt": 1_708_000_000
+                    },
+                    "secondary": {}
+                }
+            }
+        });
+
+        let snapshots = parse_rate_limit_snapshots_from_result(&result);
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert!(snapshot.primary.is_some());
+        assert!(snapshot.secondary.is_none());
+    }
+
+    #[test]
+    fn parse_rate_limit_snapshots_accepts_window_aliases() {
+        let result = json!({
+            "rateLimitsByLimitId": {
+                "codex": {
+                    "limitId": "codex",
+                    "primaryWindow": {
+                        "usedPercent": 64.0,
+                        "windowDurationMins": 10080,
+                        "resetAt": 1_708_000_000
+                    },
+                    "secondary_window": {
+                        "usedPercent": 12.0,
+                        "limitWindowSeconds": 18_000,
+                        "resetsAt": 1_708_000_001
+                    }
+                }
+            }
+        });
+
+        let snapshots = parse_rate_limit_snapshots_from_result(&result);
+        assert_eq!(snapshots.len(), 1);
+        let snapshot = &snapshots[0];
+        assert_eq!(
+            snapshot.primary.as_ref().and_then(|w| w.window_minutes),
+            Some(10080)
+        );
+        assert_eq!(
+            snapshot.secondary.as_ref().and_then(|w| w.window_minutes),
+            Some(300)
+        );
+    }
 }
 
 pub mod config {
