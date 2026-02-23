@@ -307,14 +307,20 @@ mod tests {
 
 pub mod config {
     use crate::WireApi;
+    use codex_protocol::config_types::TrustLevel;
     use std::collections::BTreeMap;
+    use std::io::ErrorKind;
+    use std::path::Path;
     use std::path::PathBuf;
 
     pub mod types {
         use serde::Deserialize;
+        use serde::Deserializer;
         use serde::Serialize;
+        use serde::de::Error as SerdeError;
         use std::collections::HashMap;
         use std::path::PathBuf;
+        use std::time::Duration;
 
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
         #[serde(rename_all = "lowercase")]
@@ -336,7 +342,7 @@ pub mod config {
         }
 
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-        #[serde(tag = "type", rename_all = "snake_case")]
+        #[serde(untagged, deny_unknown_fields, rename_all = "snake_case")]
         pub enum McpServerTransportConfig {
             Stdio {
                 command: String,
@@ -345,12 +351,14 @@ pub mod config {
                 #[serde(default)]
                 env: Option<HashMap<String, String>>,
                 #[serde(default)]
-                env_vars: Option<HashMap<String, String>>,
+                env_vars: Vec<String>,
                 #[serde(default)]
                 cwd: Option<PathBuf>,
             },
             StreamableHttp {
                 url: String,
+                #[serde(default)]
+                bearer_token_env_var: Option<String>,
                 #[serde(default)]
                 http_headers: Option<HashMap<String, String>>,
                 #[serde(default)]
@@ -358,13 +366,143 @@ pub mod config {
             },
         }
 
-        #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+        #[derive(Debug, Clone, Serialize)]
         pub struct McpServerConfig {
+            #[serde(flatten)]
             pub transport: McpServerTransportConfig,
             #[serde(default = "enabled_default")]
             pub enabled: bool,
             #[serde(default)]
+            pub required: bool,
+            #[serde(default)]
             pub disabled_reason: Option<String>,
+            #[serde(default, with = "option_duration_secs")]
+            pub startup_timeout_sec: Option<Duration>,
+            #[serde(default, with = "option_duration_secs")]
+            pub tool_timeout_sec: Option<Duration>,
+            #[serde(default)]
+            pub enabled_tools: Option<Vec<String>>,
+            #[serde(default)]
+            pub disabled_tools: Option<Vec<String>>,
+            #[serde(default)]
+            pub scopes: Option<Vec<String>>,
+        }
+
+        #[derive(Debug, Deserialize, Clone)]
+        #[serde(deny_unknown_fields)]
+        struct RawMcpServerConfig {
+            pub command: Option<String>,
+            #[serde(default)]
+            pub args: Option<Vec<String>>,
+            #[serde(default)]
+            pub env: Option<HashMap<String, String>>,
+            #[serde(default)]
+            pub env_vars: Option<Vec<String>>,
+            #[serde(default)]
+            pub cwd: Option<PathBuf>,
+            #[serde(default)]
+            pub http_headers: Option<HashMap<String, String>>,
+            #[serde(default)]
+            pub env_http_headers: Option<HashMap<String, String>>,
+            pub url: Option<String>,
+            pub bearer_token: Option<String>,
+            pub bearer_token_env_var: Option<String>,
+            #[serde(default)]
+            pub startup_timeout_sec: Option<f64>,
+            #[serde(default)]
+            pub startup_timeout_ms: Option<u64>,
+            #[serde(default, with = "option_duration_secs")]
+            pub tool_timeout_sec: Option<Duration>,
+            #[serde(default)]
+            pub enabled: Option<bool>,
+            #[serde(default)]
+            pub required: Option<bool>,
+            #[serde(default)]
+            pub enabled_tools: Option<Vec<String>>,
+            #[serde(default)]
+            pub disabled_tools: Option<Vec<String>>,
+            #[serde(default)]
+            pub scopes: Option<Vec<String>>,
+        }
+
+        impl<'de> Deserialize<'de> for McpServerConfig {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let mut raw = RawMcpServerConfig::deserialize(deserializer)?;
+
+                let startup_timeout_sec = match (raw.startup_timeout_sec, raw.startup_timeout_ms) {
+                    (Some(sec), _) => {
+                        let duration =
+                            Duration::try_from_secs_f64(sec).map_err(SerdeError::custom)?;
+                        Some(duration)
+                    }
+                    (None, Some(ms)) => Some(Duration::from_millis(ms)),
+                    (None, None) => None,
+                };
+
+                fn throw_if_set<E, T>(
+                    transport: &str,
+                    field: &str,
+                    value: Option<&T>,
+                ) -> Result<(), E>
+                where
+                    E: SerdeError,
+                {
+                    if value.is_none() {
+                        return Ok(());
+                    }
+                    Err(E::custom(format!(
+                        "{field} is not supported for {transport}"
+                    )))
+                }
+
+                let transport = if let Some(command) = raw.command.clone() {
+                    throw_if_set("stdio", "url", raw.url.as_ref())?;
+                    throw_if_set(
+                        "stdio",
+                        "bearer_token_env_var",
+                        raw.bearer_token_env_var.as_ref(),
+                    )?;
+                    throw_if_set("stdio", "bearer_token", raw.bearer_token.as_ref())?;
+                    throw_if_set("stdio", "http_headers", raw.http_headers.as_ref())?;
+                    throw_if_set("stdio", "env_http_headers", raw.env_http_headers.as_ref())?;
+                    McpServerTransportConfig::Stdio {
+                        command,
+                        args: raw.args.clone().unwrap_or_default(),
+                        env: raw.env.clone(),
+                        env_vars: raw.env_vars.clone().unwrap_or_default(),
+                        cwd: raw.cwd.take(),
+                    }
+                } else if let Some(url) = raw.url.clone() {
+                    throw_if_set("streamable_http", "args", raw.args.as_ref())?;
+                    throw_if_set("streamable_http", "env", raw.env.as_ref())?;
+                    throw_if_set("streamable_http", "env_vars", raw.env_vars.as_ref())?;
+                    throw_if_set("streamable_http", "cwd", raw.cwd.as_ref())?;
+                    throw_if_set("streamable_http", "bearer_token", raw.bearer_token.as_ref())?;
+                    McpServerTransportConfig::StreamableHttp {
+                        url,
+                        bearer_token_env_var: raw.bearer_token_env_var.clone(),
+                        http_headers: raw.http_headers.take(),
+                        env_http_headers: raw.env_http_headers.take(),
+                    }
+                } else {
+                    return Err(SerdeError::custom("invalid transport"));
+                };
+
+                Ok(Self {
+                    transport,
+                    enabled: raw.enabled.unwrap_or_else(enabled_default),
+                    required: raw.required.unwrap_or_default(),
+                    disabled_reason: None,
+                    startup_timeout_sec,
+                    tool_timeout_sec: raw.tool_timeout_sec,
+                    enabled_tools: raw.enabled_tools,
+                    disabled_tools: raw.disabled_tools,
+                    scopes: raw.scopes,
+                })
+            }
         }
 
         fn enabled_default() -> bool {
@@ -377,9 +515,51 @@ pub mod config {
                     command: String::new(),
                     args: Vec::new(),
                     env: None,
-                    env_vars: None,
+                    env_vars: Vec::new(),
                     cwd: None,
                 }
+            }
+        }
+
+        impl Default for McpServerConfig {
+            fn default() -> Self {
+                Self {
+                    transport: McpServerTransportConfig::default(),
+                    enabled: enabled_default(),
+                    required: false,
+                    disabled_reason: None,
+                    startup_timeout_sec: None,
+                    tool_timeout_sec: None,
+                    enabled_tools: None,
+                    disabled_tools: None,
+                    scopes: None,
+                }
+            }
+        }
+
+        mod option_duration_secs {
+            use serde::Deserialize;
+            use serde::Deserializer;
+            use serde::Serializer;
+            use std::time::Duration;
+
+            pub fn serialize<S>(value: &Option<Duration>, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                match value {
+                    Some(duration) => serializer.serialize_some(&duration.as_secs_f64()),
+                    None => serializer.serialize_none(),
+                }
+            }
+
+            pub fn deserialize<'de, D>(deserializer: D) -> Result<Option<Duration>, D::Error>
+            where
+                D: Deserializer<'de>,
+            {
+                let secs = Option::<f64>::deserialize(deserializer)?;
+                secs.map(|sec| Duration::try_from_secs_f64(sec).map_err(serde::de::Error::custom))
+                    .transpose()
             }
         }
 
@@ -661,14 +841,27 @@ pub mod config {
         pub sandbox_mode: Option<codex_protocol::config_types::SandboxMode>,
         pub model_provider: Option<String>,
         pub config_profile: Option<String>,
+        pub oss_provider: Option<String>,
         pub personality: Option<crate::config_types::Personality>,
         pub compact_prompt: Option<String>,
         pub additional_writable_roots: Vec<PathBuf>,
     }
 
-    #[derive(Debug, Clone, Default)]
+    #[derive(Debug, Clone)]
     pub struct ConfigBuilder {
         config: Config,
+        cli_overrides: Vec<(String, toml::Value)>,
+        harness_overrides: Option<ConfigOverrides>,
+    }
+
+    impl Default for ConfigBuilder {
+        fn default() -> Self {
+            Self {
+                config: Config::default(),
+                cli_overrides: Vec::new(),
+                harness_overrides: None,
+            }
+        }
     }
 
     impl ConfigBuilder {
@@ -677,47 +870,11 @@ pub mod config {
             self
         }
         pub fn cli_overrides(mut self, cli_overrides: Vec<(String, toml::Value)>) -> Self {
-            for (key, value) in cli_overrides {
-                apply_toml_override(&mut self.config, &key, value);
-            }
+            self.cli_overrides.extend(cli_overrides);
             self
         }
         pub fn harness_overrides(mut self, harness_overrides: ConfigOverrides) -> Self {
-            if let Some(model) = harness_overrides.model {
-                self.config.model = Some(model);
-            }
-            if let Some(review_model) = harness_overrides.review_model {
-                self.config.review_model = Some(review_model);
-            }
-            if let Some(cwd) = harness_overrides.cwd {
-                self.config.cwd = cwd;
-            }
-            if let Some(approval_policy) = harness_overrides.approval_policy {
-                let _ = self.config.permissions.approval_policy.set(approval_policy);
-            }
-            if let Some(sandbox_mode) = harness_overrides.sandbox_mode {
-                let policy = match sandbox_mode {
-                    codex_protocol::config_types::SandboxMode::ReadOnly => {
-                        crate::protocol::SandboxPolicy::new_read_only_policy()
-                    }
-                    codex_protocol::config_types::SandboxMode::WorkspaceWrite => {
-                        crate::protocol::SandboxPolicy::new_workspace_write_policy()
-                    }
-                    codex_protocol::config_types::SandboxMode::DangerFullAccess => {
-                        crate::protocol::SandboxPolicy::new_workspace_write_policy()
-                    }
-                };
-                let _ = self.config.permissions.sandbox_policy.set(policy);
-            }
-            if let Some(model_provider) = harness_overrides.model_provider {
-                self.config.model_provider_id = model_provider;
-            }
-            if let Some(personality) = harness_overrides.personality {
-                self.config.personality = Some(personality);
-            }
-            if let Some(compact_prompt) = harness_overrides.compact_prompt {
-                self.config.compact_prompt = Some(compact_prompt);
-            }
+            self.harness_overrides = Some(harness_overrides);
             self
         }
         pub fn cloud_requirements(
@@ -727,7 +884,11 @@ pub mod config {
             self
         }
         pub fn from_config(config: Config) -> Self {
-            Self { config }
+            Self {
+                config,
+                cli_overrides: Vec::new(),
+                harness_overrides: None,
+            }
         }
         pub async fn build(mut self) -> std::io::Result<Config> {
             if self.config.codex_home
@@ -743,14 +904,57 @@ pub mod config {
                 }
             }
 
-            let config_path = self.config.codex_home.join("config.toml");
-            if let Ok(raw) = std::fs::read_to_string(&config_path) {
-                if let Ok(parsed) = raw.parse::<toml::Value>() {
-                    apply_toml_config(&mut self.config, &parsed);
-                }
+            let layer_stack = load_config_layer_stack(
+                self.config.codex_home.as_path(),
+                self.config.cwd.as_path(),
+                &self.cli_overrides,
+            )?;
+            let merged = layer_stack.effective_config();
+            apply_toml_config(&mut self.config, &merged)?;
+            if let Some(harness_overrides) = self.harness_overrides.take() {
+                apply_harness_overrides(&mut self.config, harness_overrides);
             }
+            self.config.config_layer_stack = layer_stack;
 
             Ok(self.config)
+        }
+    }
+
+    fn apply_harness_overrides(config: &mut Config, harness_overrides: ConfigOverrides) {
+        if let Some(model) = harness_overrides.model {
+            config.model = Some(model);
+        }
+        if let Some(review_model) = harness_overrides.review_model {
+            config.review_model = Some(review_model);
+        }
+        if let Some(cwd) = harness_overrides.cwd {
+            config.cwd = cwd;
+        }
+        if let Some(approval_policy) = harness_overrides.approval_policy {
+            let _ = config.permissions.approval_policy.set(approval_policy);
+        }
+        if let Some(sandbox_mode) = harness_overrides.sandbox_mode {
+            let policy = match sandbox_mode {
+                codex_protocol::config_types::SandboxMode::ReadOnly => {
+                    crate::protocol::SandboxPolicy::new_read_only_policy()
+                }
+                codex_protocol::config_types::SandboxMode::WorkspaceWrite => {
+                    crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                }
+                codex_protocol::config_types::SandboxMode::DangerFullAccess => {
+                    crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                }
+            };
+            let _ = config.permissions.sandbox_policy.set(policy);
+        }
+        if let Some(model_provider) = harness_overrides.model_provider {
+            config.model_provider_id = model_provider;
+        }
+        if let Some(personality) = harness_overrides.personality {
+            config.personality = Some(personality);
+        }
+        if let Some(compact_prompt) = harness_overrides.compact_prompt {
+            config.compact_prompt = Some(compact_prompt);
         }
     }
 
@@ -770,32 +974,143 @@ pub mod config {
 
     pub async fn load_config_as_toml_with_cli_overrides(
         codex_home: &std::path::Path,
-        _cwd: &crate::AbsolutePathBuf,
+        cwd: &crate::AbsolutePathBuf,
         overrides: Vec<(String, toml::Value)>,
     ) -> anyhow::Result<toml::Value> {
+        let stack = load_config_layer_stack(codex_home, cwd.as_path(), &overrides)?;
+        Ok(stack.effective_config())
+    }
+
+    /// Mirrors upstream precedence: explicit CLI > profile config > global config.
+    pub fn resolve_oss_provider(toml: &toml::Value, cli: &ConfigOverrides) -> Option<String> {
+        if let Some(provider) = cli.oss_provider.as_ref() {
+            return Some(provider.clone());
+        }
+
+        let root = toml.as_table()?;
+        let selected_profile = cli.config_profile.clone().or_else(|| {
+            root.get("profile")
+                .and_then(toml::Value::as_str)
+                .map(ToString::to_string)
+        });
+        if let Some(selected_profile) = selected_profile {
+            if let Some(profile_provider) = root
+                .get("profiles")
+                .and_then(toml::Value::as_table)
+                .and_then(|profiles| profiles.get(selected_profile.as_str()))
+                .and_then(toml::Value::as_table)
+                .and_then(|profile| profile.get("oss_provider"))
+                .and_then(toml::Value::as_str)
+            {
+                return Some(profile_provider.to_string());
+            }
+        }
+
+        root.get("oss_provider")
+            .and_then(toml::Value::as_str)
+            .map(|s| s.to_string())
+    }
+
+    pub fn set_project_trust_level(
+        codex_home: &std::path::Path,
+        cwd: &std::path::Path,
+        trust: codex_protocol::config_types::TrustLevel,
+    ) -> anyhow::Result<()> {
         let config_path = codex_home.join("config.toml");
-        let mut merged = if config_path.exists() {
-            let raw = std::fs::read_to_string(&config_path)?;
-            raw.parse::<toml::Value>()?
+        let mut root = if config_path.exists() {
+            std::fs::read_to_string(&config_path)?
+                .parse::<toml::Value>()
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?
         } else {
             toml::Value::Table(toml::map::Map::new())
         };
 
-        for (key, value) in overrides {
-            apply_dotted_toml_value(&mut merged, &key, value)?;
+        let root_table = root
+            .as_table_mut()
+            .ok_or_else(|| anyhow::anyhow!("config root must be a table"))?;
+        if !root_table
+            .get("projects")
+            .is_some_and(toml::Value::is_table)
+        {
+            root_table.insert(
+                "projects".to_string(),
+                toml::Value::Table(toml::map::Map::new()),
+            );
         }
-        Ok(merged)
+
+        let projects = root_table
+            .get_mut("projects")
+            .and_then(toml::Value::as_table_mut)
+            .ok_or_else(|| anyhow::anyhow!("projects table missing after initialization"))?;
+        let project_key = cwd.to_string_lossy().to_string();
+
+        let mut project_table = projects
+            .get(&project_key)
+            .and_then(toml::Value::as_table)
+            .cloned()
+            .unwrap_or_default();
+        project_table.insert(
+            "trust_level".to_string(),
+            toml::Value::String(match trust {
+                TrustLevel::Trusted => "trusted".to_string(),
+                TrustLevel::Untrusted => "untrusted".to_string(),
+            }),
+        );
+        projects.insert(project_key, toml::Value::Table(project_table));
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let serialized = toml::to_string_pretty(&root)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        std::fs::write(config_path, serialized)?;
+        Ok(())
     }
 
-    pub fn resolve_oss_provider(_toml: &toml::Value, _cli: &ConfigOverrides) -> Option<String> {
-        None
-    }
+    pub fn set_default_oss_provider(codex_home: &Path, provider: &str) -> std::io::Result<()> {
+        match provider {
+            crate::LMSTUDIO_OSS_PROVIDER_ID | crate::OLLAMA_OSS_PROVIDER_ID => {}
+            crate::LEGACY_OLLAMA_CHAT_PROVIDER_ID => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    crate::OLLAMA_CHAT_PROVIDER_REMOVED_ERROR,
+                ));
+            }
+            _ => {
+                return Err(std::io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "Invalid OSS provider '{provider}'. Must be one of: {}, {}",
+                        crate::LMSTUDIO_OSS_PROVIDER_ID,
+                        crate::OLLAMA_OSS_PROVIDER_ID
+                    ),
+                ));
+            }
+        }
 
-    pub fn set_project_trust_level(
-        _codex_home: &std::path::Path,
-        _cwd: &std::path::Path,
-        _trust: codex_protocol::config_types::TrustLevel,
-    ) -> anyhow::Result<()> {
+        let config_path = codex_home.join("config.toml");
+        let mut root = if config_path.exists() {
+            std::fs::read_to_string(&config_path)?
+                .parse::<toml::Value>()
+                .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+
+        let root_table = root.as_table_mut().ok_or_else(|| {
+            std::io::Error::new(ErrorKind::InvalidData, "config root must be a table")
+        })?;
+        root_table.insert(
+            "oss_provider".to_string(),
+            toml::Value::String(provider.to_string()),
+        );
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let serialized = toml::to_string_pretty(&root)
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))?;
+        std::fs::write(config_path, serialized)?;
         Ok(())
     }
 
@@ -826,6 +1141,11 @@ pub mod config {
                     config.model_context_window = Some(window);
                 }
             }
+            "model_auto_compact_token_limit" => {
+                if let Some(limit) = value.as_integer() {
+                    config.model_auto_compact_token_limit = Some(limit);
+                }
+            }
             "model_reasoning_summary" => {
                 if let Ok(summary) = value.clone().try_into::<ReasoningSummary>() {
                     config.model_reasoning_summary = summary;
@@ -847,13 +1167,97 @@ pub mod config {
                     config.plan_mode_reasoning_effort = Some(effort);
                 }
             }
+            "approval_policy" => {
+                if let Ok(policy) = value.clone().try_into::<crate::protocol::AskForApproval>() {
+                    let _ = config.permissions.approval_policy.set(policy);
+                }
+            }
+            "sandbox_mode" => {
+                if let Ok(sandbox_mode) = value
+                    .clone()
+                    .try_into::<codex_protocol::config_types::SandboxMode>()
+                {
+                    let policy = match sandbox_mode {
+                        codex_protocol::config_types::SandboxMode::ReadOnly => {
+                            crate::protocol::SandboxPolicy::new_read_only_policy()
+                        }
+                        codex_protocol::config_types::SandboxMode::WorkspaceWrite => {
+                            crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                        }
+                        codex_protocol::config_types::SandboxMode::DangerFullAccess => {
+                            crate::protocol::SandboxPolicy::new_workspace_write_policy()
+                        }
+                    };
+                    let _ = config.permissions.sandbox_policy.set(policy);
+                }
+            }
+            "user_instructions" => {
+                config.user_instructions = value.as_str().map(ToString::to_string);
+            }
+            "base_instructions" => {
+                config.base_instructions = value.as_str().map(ToString::to_string);
+            }
+            "developer_instructions" => {
+                config.developer_instructions = value.as_str().map(ToString::to_string);
+            }
+            "compact_prompt" => {
+                config.compact_prompt = value.as_str().map(ToString::to_string);
+            }
+            "commit_attribution" => {
+                config.commit_attribution = value.as_str().map(ToString::to_string);
+            }
+            "notify" => {
+                config.notify = value.as_array().map(|arr| {
+                    arr.iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(ToString::to_string)
+                        .collect()
+                });
+            }
+            "animations" => {
+                if let Some(v) = value.as_bool() {
+                    config.animations = v;
+                }
+            }
+            "show_tooltips" => {
+                if let Some(v) = value.as_bool() {
+                    config.show_tooltips = v;
+                }
+            }
+            "disable_paste_burst" => {
+                if let Some(v) = value.as_bool() {
+                    config.disable_paste_burst = v;
+                }
+            }
+            "feedback_enabled" => {
+                if let Some(v) = value.as_bool() {
+                    config.feedback_enabled = v;
+                }
+            }
+            "hide_agent_reasoning" => {
+                if let Some(v) = value.as_bool() {
+                    config.hide_agent_reasoning = v;
+                }
+            }
+            "show_raw_agent_reasoning" => {
+                if let Some(v) = value.as_bool() {
+                    config.show_raw_agent_reasoning = v;
+                }
+            }
+            "personality" => {
+                if let Ok(personality) =
+                    value.clone().try_into::<crate::config_types::Personality>()
+                {
+                    config.personality = Some(personality);
+                }
+            }
             _ => {}
         }
     }
 
-    fn apply_toml_config(config: &mut Config, parsed: &toml::Value) {
+    fn apply_toml_config(config: &mut Config, parsed: &toml::Value) -> std::io::Result<()> {
         let Some(table) = parsed.as_table() else {
-            return;
+            return Ok(());
         };
 
         for (key, value) in table {
@@ -872,6 +1276,45 @@ pub mod config {
                 }
             }
         }
+
+        if let Some(mcp_servers) = table.get("mcp_servers")
+            && let Ok(servers) = mcp_servers
+                .clone()
+                .try_into::<std::collections::BTreeMap<String, types::McpServerConfig>>()
+        {
+            config.mcp_servers = McpServers(servers);
+        }
+
+        if let Some(tui) = table.get("tui").and_then(toml::Value::as_table) {
+            if let Some(notifications) = tui.get("notifications")
+                && let Ok(parsed) = notifications.clone().try_into::<types::Notifications>()
+            {
+                config.tui_notifications = parsed;
+            }
+            if let Some(method) = tui.get("notification_method")
+                && let Ok(parsed) = method.clone().try_into::<types::NotificationMethod>()
+            {
+                config.tui_notification_method = parsed;
+            }
+            if let Some(alt_screen) = tui.get("alternate_screen")
+                && let Ok(parsed) = alt_screen
+                    .clone()
+                    .try_into::<codex_protocol::config_types::AltScreenMode>()
+            {
+                config.tui_alternate_screen = parsed;
+            }
+            if let Some(status_line) = tui.get("status_line").and_then(toml::Value::as_array) {
+                config.tui_status_line = Some(
+                    status_line
+                        .iter()
+                        .filter_map(toml::Value::as_str)
+                        .map(ToString::to_string)
+                        .collect(),
+                );
+            }
+        }
+
+        Ok(())
     }
 
     fn apply_dotted_toml_value(
@@ -903,6 +1346,95 @@ pub mod config {
                 .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
         }
         Ok(())
+    }
+
+    fn load_toml_file(path: &Path) -> std::io::Result<toml::Value> {
+        let raw = std::fs::read_to_string(path)?;
+        raw.parse::<toml::Value>()
+            .map_err(|e| std::io::Error::new(ErrorKind::InvalidData, e))
+    }
+
+    fn merge_toml_values(base: &mut toml::Value, overlay: &toml::Value) {
+        match (base, overlay) {
+            (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+                for (k, v) in overlay_table {
+                    match base_table.get_mut(k) {
+                        Some(base_value) => merge_toml_values(base_value, v),
+                        None => {
+                            base_table.insert(k.clone(), v.clone());
+                        }
+                    }
+                }
+            }
+            (base_value, overlay_value) => {
+                *base_value = overlay_value.clone();
+            }
+        }
+    }
+
+    fn load_config_layer_stack(
+        codex_home: &Path,
+        cwd: &Path,
+        cli_overrides: &[(String, toml::Value)],
+    ) -> std::io::Result<crate::config_loader::ConfigLayerStack> {
+        let mut layers: Vec<crate::config_loader::ConfigLayerEntry> = Vec::new();
+
+        let user_file = codex_home.join("config.toml");
+        let user_path = crate::AbsolutePathBuf::from_absolute_path(&user_file)?;
+        let user_config = if user_file.exists() {
+            load_toml_file(&user_file)?
+        } else {
+            toml::Value::Table(toml::map::Map::new())
+        };
+        layers.push(crate::config_loader::ConfigLayerEntry::new(
+            crate::ConfigLayerSource::User { file: user_path },
+            user_config,
+        ));
+
+        let cwd_config_file = cwd.join("config.toml");
+        if cwd_config_file.exists() {
+            let cwd_config = load_toml_file(&cwd_config_file)?;
+            let dot_codex_folder = crate::AbsolutePathBuf::from_absolute_path(cwd)?;
+            layers.push(crate::config_loader::ConfigLayerEntry::new(
+                crate::ConfigLayerSource::Project { dot_codex_folder },
+                cwd_config,
+            ));
+        }
+
+        let mut project_layers: Vec<crate::config_loader::ConfigLayerEntry> = Vec::new();
+        for ancestor in cwd.ancestors().collect::<Vec<_>>().into_iter().rev() {
+            let dot_codex = ancestor.join(".codex");
+            let config_file = dot_codex.join("config.toml");
+            if !config_file.exists() {
+                continue;
+            }
+            let cfg = load_toml_file(&config_file)?;
+            project_layers.push(crate::config_loader::ConfigLayerEntry::new(
+                crate::ConfigLayerSource::Project {
+                    dot_codex_folder: crate::AbsolutePathBuf::from_absolute_path(dot_codex)?,
+                },
+                cfg,
+            ));
+        }
+        layers.extend(project_layers);
+
+        if !cli_overrides.is_empty() {
+            let mut cli_layer = toml::Value::Table(toml::map::Map::new());
+            for (key, value) in cli_overrides {
+                apply_dotted_toml_value(&mut cli_layer, key, value.clone())
+                    .map_err(std::io::Error::other)?;
+            }
+            layers.push(crate::config_loader::ConfigLayerEntry::new(
+                crate::ConfigLayerSource::SessionFlags,
+                cli_layer,
+            ));
+        }
+
+        crate::config_loader::ConfigLayerStack::new(
+            layers,
+            crate::config_loader::ConfigRequirements::default(),
+            crate::config_loader::ConfigRequirementsToml::default(),
+        )
     }
 
     pub mod edit {
@@ -997,6 +1529,14 @@ pub enum WireApi {
     ChatCompletions,
     Responses,
 }
+
+pub const DEFAULT_LMSTUDIO_PORT: u16 = 1234;
+pub const DEFAULT_OLLAMA_PORT: u16 = 11434;
+pub const LMSTUDIO_OSS_PROVIDER_ID: &str = "lmstudio";
+pub const OLLAMA_OSS_PROVIDER_ID: &str = "ollama";
+pub const LEGACY_OLLAMA_CHAT_PROVIDER_ID: &str = "ollama_chat";
+pub const OLLAMA_CHAT_PROVIDER_REMOVED_ERROR: &str =
+    "The legacy `ollama_chat` provider has been removed; use `ollama` instead.";
 
 #[derive(Debug, Clone)]
 pub struct CachedAuth {
@@ -3450,10 +3990,22 @@ pub mod config_loader {
         pub source: RequirementSource,
     }
 
+    impl<T> Sourced<T> {
+        pub fn new(value: T, source: RequirementSource) -> Self {
+            Self { value, source }
+        }
+    }
+
     #[derive(Debug, Clone, PartialEq)]
     pub struct ConstrainedWithSource<T> {
         pub value: crate::config::ValueRef<T>,
         pub source: Option<RequirementSource>,
+    }
+
+    impl<T> ConstrainedWithSource<T> {
+        pub fn new(value: crate::config::ValueRef<T>, source: Option<RequirementSource>) -> Self {
+            Self { value, source }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq)]
@@ -3597,10 +4149,11 @@ pub mod config_loader {
 
     impl ConfigLayerStack {
         pub fn new(
-            layers: Vec<ConfigLayerEntry>,
+            mut layers: Vec<ConfigLayerEntry>,
             requirements: ConfigRequirements,
             requirements_toml: ConfigRequirementsToml,
         ) -> std::io::Result<Self> {
+            layers.sort_by_key(|layer| layer.name.precedence());
             Ok(Self {
                 layers,
                 requirements,
@@ -3629,7 +4182,32 @@ pub mod config_loader {
         }
 
         pub fn effective_config(&self) -> toml::Value {
-            toml::Value::Table(toml::map::Map::new())
+            let mut merged = toml::Value::Table(toml::map::Map::new());
+            for layer in &self.layers {
+                if layer.is_disabled() {
+                    continue;
+                }
+                merge_toml_values(&mut merged, &layer.config);
+            }
+            merged
+        }
+    }
+
+    fn merge_toml_values(base: &mut toml::Value, overlay: &toml::Value) {
+        match (base, overlay) {
+            (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+                for (key, value) in overlay_table {
+                    match base_table.get_mut(key) {
+                        Some(base_value) => merge_toml_values(base_value, value),
+                        None => {
+                            base_table.insert(key.clone(), value.clone());
+                        }
+                    }
+                }
+            }
+            (base_value, overlay_value) => {
+                *base_value = overlay_value.clone();
+            }
         }
     }
 
@@ -4119,7 +4697,7 @@ mod codex_utils_cli_compat {
 
         pub fn format_env_display(
             env: Option<&HashMap<String, String>>,
-            env_vars: &Option<HashMap<String, String>>,
+            env_vars: &[String],
         ) -> String {
             let mut entries: Vec<String> = Vec::new();
             if let Some(env) = env {
@@ -4127,11 +4705,7 @@ mod codex_utils_cli_compat {
                 pairs.sort_by(|(a, _), (b, _)| a.cmp(b));
                 entries.extend(pairs.into_iter().map(|(k, _)| format!("{k}=*****")));
             }
-            if let Some(env_vars) = env_vars {
-                let mut keys: Vec<_> = env_vars.keys().collect();
-                keys.sort();
-                entries.extend(keys.into_iter().map(|k| format!("{k}=*****")));
-            }
+            entries.extend(env_vars.iter().map(|k| format!("{k}=*****")));
             if entries.is_empty() {
                 "-".to_string()
             } else {
