@@ -2410,6 +2410,77 @@ impl CodexThread {
         sequence: u64,
         notification: &crabbot_protocol::DaemonRpcNotification,
     ) -> Option<crate::protocol::Event> {
+        fn parse_user_message_item(
+            item: &serde_json::Value,
+        ) -> Option<(String, Vec<crate::user_input::TextElement>)> {
+            let item_type = item
+                .get("type")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let role = item
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let is_user_item = matches!(
+                item_type.as_str(),
+                "usermessage" | "user_message" | "user-message"
+            ) || (item_type == "message" && role == "user");
+            if !is_user_item {
+                return None;
+            }
+
+            let text = item
+                .get("text")
+                .or_else(|| item.get("message"))
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    item.get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .map(|content| {
+                            content
+                                .iter()
+                                .filter_map(|entry| {
+                                    entry.get("text").and_then(serde_json::Value::as_str)
+                                })
+                                .collect::<Vec<_>>()
+                                .join("")
+                        })
+                        .filter(|text| !text.is_empty())
+                })?;
+
+            let text_elements = item
+                .get("text_elements")
+                .or_else(|| item.get("textElements"))
+                .cloned()
+                .and_then(|value| {
+                    serde_json::from_value::<Vec<crate::user_input::TextElement>>(value).ok()
+                })
+                .or_else(|| {
+                    item.get("content")
+                        .and_then(serde_json::Value::as_array)
+                        .and_then(|content| {
+                            content.iter().find_map(|entry| {
+                                entry
+                                    .get("text_elements")
+                                    .or_else(|| entry.get("textElements"))
+                                    .cloned()
+                                    .and_then(|value| {
+                                        serde_json::from_value::<
+                                            Vec<crate::user_input::TextElement>,
+                                        >(value)
+                                        .ok()
+                                    })
+                            })
+                        })
+                })
+                .unwrap_or_default();
+
+            Some((text, text_elements))
+        }
+
         match notification.method.as_str() {
             "turn/started" => notification
                 .params
@@ -2511,6 +2582,19 @@ impl CodexThread {
                             crate::protocol::AgentMessageEvent {
                                 message,
                                 phase: None,
+                            },
+                        ),
+                    });
+                }
+                if let Some((message, text_elements)) = parse_user_message_item(item) {
+                    return Some(crate::protocol::Event {
+                        id: format!("seq-{sequence}"),
+                        msg: crate::protocol::EventMsg::UserMessage(
+                            crate::protocol::UserMessageEvent {
+                                message,
+                                images: None,
+                                local_images: Vec::new(),
+                                text_elements,
                             },
                         ),
                     });

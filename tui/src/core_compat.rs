@@ -592,15 +592,7 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
         "item/completed" => notification
             .params
             .get("item")
-            .and_then(|item| item.get("type"))
-            .and_then(Value::as_str)
-            .filter(|item_type| *item_type == "user_message" || *item_type == "userMessage")
-            .and_then(|_| {
-                notification
-                    .params
-                    .get("item")
-                    .and_then(parse_user_message_item)
-            })
+            .and_then(parse_user_message_item)
             .map(|(text, text_elements)| {
                 vec![UiEvent::UserMessage {
                     text,
@@ -815,6 +807,16 @@ fn map_rpc_notification(notification: &DaemonRpcNotification) -> Vec<UiEvent> {
             vec![UiEvent::CollabEvent(format!("[collab] {method}"))]
         }
         "codex/event" => map_codex_event_notification(&notification.params),
+        method if method.starts_with("codex/event/") => {
+            let wrapped = if notification.params.get("event").is_some()
+                || notification.params.get("payload").is_some()
+            {
+                notification.params.clone()
+            } else {
+                json!({ "event": notification.params.clone() })
+            };
+            map_codex_event_notification(&wrapped)
+        }
         _ => Vec::new(),
     }
 }

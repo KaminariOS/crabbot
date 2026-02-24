@@ -269,28 +269,33 @@ impl ThreadEventStore {
     }
 
     fn push_event(&mut self, event: Event) {
+        let _ = self.push_event_for_delivery(event);
+    }
+
+    fn push_event_for_delivery(&mut self, event: Event) -> Option<Event> {
         match &event.msg {
             EventMsg::SessionConfigured(_) => {
-                self.session_configured = Some(event);
-                return;
+                self.session_configured = Some(event.clone());
+                return Some(event);
             }
             EventMsg::ItemCompleted(completed) => {
                 if let TurnItem::UserMessage(item) = &completed.item {
                     if !event.id.is_empty() && self.user_message_ids.contains(&event.id) {
-                        return;
+                        return None;
                     }
                     let legacy = Event {
                         id: event.id,
                         msg: item.as_legacy_event(),
                     };
-                    self.push_legacy_event(legacy);
-                    return;
+                    self.push_legacy_event(legacy.clone());
+                    return Some(legacy);
                 }
             }
             _ => {}
         }
 
-        self.push_legacy_event(event);
+        self.push_legacy_event(event.clone());
+        Some(event)
     }
 
     fn push_legacy_event(&mut self, event: Event) {
@@ -777,17 +782,17 @@ impl App {
             (channel.sender.clone(), Arc::clone(&channel.store))
         };
 
-        let should_send = {
+        let (event_to_send, should_send) = {
             let mut guard = store.lock().await;
-            guard.push_event(event.clone());
-            guard.active
+            let event_to_send = guard.push_event_for_delivery(event);
+            (event_to_send, guard.active)
         };
 
-        if should_send {
+        if should_send && let Some(event_to_send) = event_to_send {
             // Never await a bounded channel send on the main TUI loop: if the receiver falls behind,
             // `send().await` can block and the UI stops drawing. If the channel is full, wait in a
             // spawned task instead.
-            match sender.try_send(event) {
+            match sender.try_send(event_to_send) {
                 Ok(()) => {}
                 Err(TrySendError::Full(event)) => {
                     tokio::spawn(async move {
@@ -2756,12 +2761,15 @@ impl App {
                         break;
                     }
                 };
-                let should_send = {
+                let (event_to_send, should_send) = {
                     let mut guard = store.lock().await;
-                    guard.push_event(event.clone());
-                    guard.active
+                    let event_to_send = guard.push_event_for_delivery(event);
+                    (event_to_send, guard.active)
                 };
-                if should_send && let Err(err) = sender.send(event).await {
+                if should_send
+                    && let Some(event_to_send) = event_to_send
+                    && let Err(err) = sender.send(event_to_send).await
+                {
                     tracing::debug!("external thread {thread_id} channel closed: {err}");
                     break;
                 }
@@ -3170,6 +3178,55 @@ mod tests {
             .expect("timed out waiting for second event")
             .expect("channel closed unexpectedly");
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn enqueue_thread_event_normalizes_user_item_completed_for_live_delivery() -> Result<()> {
+        let mut app = make_test_app().await;
+        let thread_id = ThreadId::new();
+        app.thread_event_channels
+            .insert(thread_id, ThreadEventChannel::new(2));
+        app.set_thread_active(thread_id, true).await;
+
+        let event_id = "evt-user-1".to_string();
+        app.enqueue_thread_event(
+            thread_id,
+            Event {
+                id: event_id.clone(),
+                msg: EventMsg::ItemCompleted(codex_protocol::protocol::ItemCompletedEvent {
+                    item: TurnItem::UserMessage(codex_protocol::items::UserMessageItem {
+                        role: "user".to_string(),
+                        content: "test sync".to_string(),
+                        images: None,
+                        local_images: Vec::new(),
+                        text_elements: Vec::new(),
+                    }),
+                }),
+            },
+        )
+        .await?;
+
+        let mut rx = app
+            .thread_event_channels
+            .get_mut(&thread_id)
+            .expect("missing thread channel")
+            .receiver
+            .take()
+            .expect("missing receiver");
+
+        let received = time::timeout(Duration::from_millis(50), rx.recv())
+            .await
+            .expect("timed out waiting for normalized event")
+            .expect("channel closed unexpectedly");
+
+        assert_eq!(received.id, event_id);
+        match received.msg {
+            EventMsg::UserMessage(user) => {
+                assert_eq!(user.message, "test sync");
+            }
+            other => panic!("expected normalized UserMessage event, got {other:?}"),
+        }
         Ok(())
     }
 
