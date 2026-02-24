@@ -1,7 +1,7 @@
 [approval required] id=approval_golden_1 action=shell_command
 prompt: Allow ls -la?
-after approval, resume with: crabbot codex resume --session-id sess_golden
-[session interrupted] resume with: crabbot codex resume --session-id sess_golden
+after approval, resume with: crab codex resume --session-id sess_golden
+[session interrupted] resume with: crab codex resume --session-id sess_golden
 [session resumed] stream is active again
 Hello, world!
 [turn turn_golden_1 complete] done

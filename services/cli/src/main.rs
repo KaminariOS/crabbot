@@ -48,11 +48,11 @@ use test_helpers::*;
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "crabbot",
+    name = "crab",
     about = "Crabbot Linux CLI",
     disable_version_flag = true,
     subcommand_negates_reqs = true,
-    override_usage = "crabbot [OPTIONS] [PROMPT]\n       crabbot [OPTIONS] <COMMAND> [ARGS]"
+    override_usage = "crab [OPTIONS] [PROMPT]\n       crab [OPTIONS] <COMMAND> [ARGS]"
 )]
 struct Cli {
     /// Print version
@@ -1386,7 +1386,7 @@ fn ensure_daemon_ready(state: &CliState) -> Result<()> {
         )
         .with_context(|| {
             format!(
-                "daemon is not reachable at {}; run `crabbot daemon up`",
+                "daemon is not reachable at {}; run `crab daemon up`",
                 state.config.daemon_endpoint
             )
         })?;
@@ -1401,7 +1401,7 @@ fn ensure_daemon_ready(state: &CliState) -> Result<()> {
     )
     .with_context(|| {
         format!(
-            "daemon is not reachable at {}; run `crabbot daemon up`",
+            "daemon is not reachable at {}; run `crab daemon up`",
             state.config.daemon_endpoint
         )
     })
@@ -1661,7 +1661,7 @@ fn render_attach_tui_with_columns_and_fallback(
                             output.push('\n');
                         }
                         output.push_str(&format!(
-                            "[session interrupted] resume with: crabbot codex resume --session-id {session_id}\n"
+                            "[session interrupted] resume with: crab codex resume --session-id {session_id}\n"
                         ));
                     }
 
@@ -1694,7 +1694,7 @@ fn render_attach_tui_with_columns_and_fallback(
                 ));
                 output.push_str(&format!("prompt: {}\n", payload.prompt));
                 output.push_str(&format!(
-                    "after approval, resume with: crabbot codex resume --session-id {session_id}\n"
+                    "after approval, resume with: crab codex resume --session-id {session_id}\n"
                 ));
             }
             DaemonStreamEvent::Heartbeat(_) => {}
