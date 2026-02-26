@@ -5950,10 +5950,9 @@ impl AppServerWsClient {
     }
 
     fn read_text_with_timeout(&mut self, timeout: Duration) -> Result<Option<String>> {
-        // Non-plain transports (e.g. TLS) may ignore this fast-poll timeout.
-        if let MaybeTlsStream::Plain(stream) = self.socket.get_mut() {
-            let _ = stream.set_read_timeout(Some(timeout));
-        }
+        // Keep polling non-blocking across plain and TLS transports. Without this,
+        // a stalled TLS read can block forever and starve local events like Ctrl-C shutdown.
+        set_ws_stream_read_timeout(self.socket.get_mut(), timeout);
 
         loop {
             match self.socket.read() {
@@ -6101,6 +6100,23 @@ impl AppServerWsClient {
             }
         }
         Ok(out)
+    }
+}
+
+fn set_ws_stream_read_timeout(stream: &mut MaybeTlsStream<TcpStream>, timeout: Duration) {
+    match stream {
+        MaybeTlsStream::Plain(socket) => {
+            let _ = socket.set_read_timeout(Some(timeout));
+        }
+        #[cfg(feature = "native-tls")]
+        MaybeTlsStream::NativeTls(socket) => {
+            let _ = socket.get_mut().set_read_timeout(Some(timeout));
+        }
+        #[cfg(feature = "__rustls-tls")]
+        MaybeTlsStream::Rustls(socket) => {
+            let _ = socket.sock.set_read_timeout(Some(timeout));
+        }
+        _ => {}
     }
 }
 
