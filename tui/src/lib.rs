@@ -6646,36 +6646,14 @@ fn parse_agent_message_text_from_turn(value: &serde_json::Value) -> Option<Strin
         .and_then(serde_json::Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let role = value
-        .get("role")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let is_agent_item = matches!(
-        item_type.as_str(),
-        "agentmessage" | "agent_message" | "agent-message"
-    ) || (item_type == "message" && role == "assistant");
-    if !is_agent_item {
+    if item_type != "agentmessage" {
         return None;
     }
 
     let message = value
         .get("text")
-        .or_else(|| value.get("message"))
         .and_then(serde_json::Value::as_str)
-        .map(str::to_string)
-        .or_else(|| {
-            value
-                .get("content")
-                .and_then(serde_json::Value::as_array)
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|entry| entry.get("text").and_then(serde_json::Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-        })?;
+        .map(str::to_string)?;
 
     if message.is_empty() {
         None

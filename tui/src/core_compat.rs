@@ -2972,35 +2972,14 @@ fn parse_agent_message_text(item: &Value) -> Option<String> {
         .and_then(Value::as_str)
         .unwrap_or_default()
         .to_ascii_lowercase();
-    let role = item
-        .get("role")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    let is_agent_item = matches!(
-        item_type.as_str(),
-        "agentmessage" | "agent_message" | "agent-message"
-    ) || (item_type == "message" && role == "assistant");
-    if !is_agent_item {
+    if item_type != "agentmessage" {
         return None;
     }
 
     let text = item
         .get("text")
-        .or_else(|| item.get("message"))
         .and_then(Value::as_str)
-        .map(ToString::to_string)
-        .or_else(|| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .map(|content| {
-                    content
-                        .iter()
-                        .filter_map(|entry| entry.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>()
-                        .join("")
-                })
-        })?;
+        .map(ToString::to_string)?;
     if text.is_empty() {
         return None;
     }
