@@ -332,6 +332,7 @@ mod tests {
             pending_events: VecDeque::new(),
             pending_server_requests: HashMap::new(),
             pending_request_user_input_by_turn_id: HashMap::new(),
+            stream_reconnect_attempt: 0,
             config_snapshot: ThreadConfigSnapshot {
                 model: "test".to_string(),
                 model_provider_id: "openai".to_string(),
@@ -343,6 +344,33 @@ mod tests {
             },
             rollout_path: None,
         }
+    }
+
+    #[test]
+    fn reconnect_backoff_caps() {
+        assert_eq!(
+            crate::reconnect_backoff(1),
+            std::time::Duration::from_millis(200)
+        );
+        assert_eq!(
+            crate::reconnect_backoff(2),
+            std::time::Duration::from_millis(400)
+        );
+        assert_eq!(
+            crate::reconnect_backoff(6),
+            std::time::Duration::from_millis(5000)
+        );
+        assert_eq!(
+            crate::reconnect_backoff(30),
+            std::time::Duration::from_millis(5000)
+        );
+    }
+
+    #[test]
+    fn reconnect_status_message_caps_attempt_display() {
+        assert_eq!(crate::reconnect_status_message(1), "Reconnecting... 1/5");
+        assert_eq!(crate::reconnect_status_message(5), "Reconnecting... 5/5");
+        assert_eq!(crate::reconnect_status_message(8), "Reconnecting... 5/5");
     }
 
     #[test]
@@ -1951,6 +1979,7 @@ struct CodexThreadState {
     pending_events: VecDeque<crate::protocol::Event>,
     pending_server_requests: HashMap<String, PendingServerRequest>,
     pending_request_user_input_by_turn_id: HashMap<String, VecDeque<String>>,
+    stream_reconnect_attempt: u32,
     config_snapshot: ThreadConfigSnapshot,
     rollout_path: Option<std::path::PathBuf>,
 }
@@ -2030,6 +2059,7 @@ impl CodexThread {
                 pending_events: VecDeque::new(),
                 pending_server_requests: HashMap::new(),
                 pending_request_user_input_by_turn_id: HashMap::new(),
+                stream_reconnect_attempt: 0,
                 config_snapshot,
                 rollout_path,
             })),
@@ -3286,11 +3316,52 @@ impl CodexThread {
                 )
             };
 
-            let envelopes =
-                fetch_app_server_stream(&endpoint, auth_token.as_deref(), Some(since_sequence))
-                    .map_err(|err| {
-                        CodexError::new(format!("fetch app-server stream failed: {err}"))
-                    })?;
+            let endpoint_for_fetch = endpoint.clone();
+            let auth_token_for_fetch = auth_token.clone();
+            let fetch_result = tokio::task::spawn_blocking(move || {
+                fetch_app_server_stream(
+                    &endpoint_for_fetch,
+                    auth_token_for_fetch.as_deref(),
+                    Some(since_sequence),
+                )
+            })
+            .await
+            .map_err(|err| CodexError::new(format!("app-server stream task join failed: {err}")))?;
+
+            let envelopes = match fetch_result {
+                Ok(envelopes) => {
+                    if let Ok(mut state) = self.state.lock() {
+                        state.stream_reconnect_attempt = 0;
+                    }
+                    envelopes
+                }
+                Err(err) => {
+                    let (attempt, details) = {
+                        let mut state = self
+                            .state
+                            .lock()
+                            .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+                        state.stream_reconnect_attempt =
+                            state.stream_reconnect_attempt.saturating_add(1);
+                        (
+                            state.stream_reconnect_attempt,
+                            format!("fetch app-server stream failed: {err}"),
+                        )
+                    };
+
+                    tokio::time::sleep(reconnect_backoff(attempt)).await;
+                    return Ok(crate::protocol::Event {
+                        id: format!("stream-reconnect-{attempt}"),
+                        msg: crate::protocol::EventMsg::StreamError(
+                            crate::protocol::StreamErrorEvent {
+                                message: reconnect_status_message(attempt),
+                                codex_error_info: Some(crate::protocol::CodexErrorInfo::Other),
+                                additional_details: Some(details),
+                            },
+                        ),
+                    });
+                }
+            };
 
             if !envelopes.is_empty() {
                 let mut state = self
@@ -3424,6 +3495,18 @@ impl CodexThread {
             .ok()
             .and_then(|state| state.rollout_path.clone())
     }
+}
+
+fn reconnect_backoff(attempt: u32) -> Duration {
+    let attempt = attempt.max(1);
+    let shift = (attempt - 1).min(5);
+    let base_ms = 200u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(base_ms.min(5000))
+}
+
+fn reconnect_status_message(attempt: u32) -> String {
+    let total = 5u32;
+    format!("Reconnecting... {}/{}", attempt.min(total), total)
 }
 
 #[derive(Debug, Clone)]
