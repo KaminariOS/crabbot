@@ -33,7 +33,12 @@ use crabbot_protocol::DaemonTurnStreamDelta;
 use crabbot_protocol::HealthResponse;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use jsonwebtoken::Algorithm;
+use jsonwebtoken::EncodingKey;
+use jsonwebtoken::Header;
+use reqwest::Client;
 use serde::Deserialize;
+use serde::Serialize;
 use std::collections::HashMap;
 use std::env;
 use std::net::SocketAddr;
@@ -57,6 +62,8 @@ const DEFAULT_CODEX_APP_SERVER_ENDPOINT: &str = "ws://127.0.0.1:8789";
 const CODEX_PROTOCOL_VERSION: &str = "2026-02-14";
 const DAEMON_RUNTIME_USER_ID: &str = "daemon_local_user";
 const DEFAULT_CODEX_BIN: &str = "codex";
+const DEFAULT_FCM_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
+const FCM_SCOPE: &str = "https://www.googleapis.com/auth/firebase.messaging";
 static APPROVAL_NOTIFY_ARGV: OnceLock<Option<Vec<String>>> = OnceLock::new();
 
 #[derive(Clone)]
@@ -64,6 +71,7 @@ struct AppState {
     sessions: Arc<RwLock<HashMap<String, SessionRuntime>>>,
     codex_client: CodexAppServerClient,
     ws_relay: Arc<WebSocketRelayState>,
+    push_notifications: Arc<PushNotificationState>,
 }
 
 struct SpawnedAppServer {
@@ -93,11 +101,68 @@ struct SessionRuntime {
     active_turn_id: Option<String>,
     next_sequence: u64,
     events: Vec<DaemonStreamEnvelope>,
+    last_user_prompt: Option<String>,
+    turn_buffers: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
 struct StreamQuery {
     since_sequence: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+struct PushRegistrationRequest {
+    token: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PushRegistrationResponse {
+    ok: bool,
+}
+
+#[derive(Debug, Clone)]
+struct PushRegistration {
+    token: String,
+    session_id: Option<String>,
+}
+
+#[derive(Debug)]
+struct PushNotificationState {
+    client: Client,
+    service_account: Option<FcmServiceAccount>,
+    registrations: Arc<RwLock<HashMap<String, PushRegistration>>>,
+}
+
+#[derive(Debug, Clone)]
+struct FcmServiceAccount {
+    project_id: String,
+    client_email: String,
+    private_key: String,
+    token_uri: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FcmServiceAccountFile {
+    project_id: String,
+    client_email: String,
+    private_key: String,
+    token_uri: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct FcmJwtClaims {
+    iss: String,
+    sub: String,
+    aud: String,
+    scope: String,
+    iat: u64,
+    exp: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OAuthTokenResponse {
+    access_token: String,
 }
 
 #[tokio::main]
@@ -143,6 +208,7 @@ fn router_with_state(state: AppState) -> Router {
         .route("/v1/sessions/{session_id}/prompt", post(prompt_session))
         .route("/v1/sessions/{session_id}/status", get(session_status))
         .route("/v1/sessions/{session_id}/stream", get(session_stream))
+        .route("/v1/notifications/register", post(register_push_token))
         .with_state(state)
 }
 
@@ -160,6 +226,7 @@ impl AppState {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             codex_client,
             ws_relay: Arc::new(ws_relay),
+            push_notifications: Arc::new(PushNotificationState::from_env()),
         })
     }
 
@@ -174,6 +241,7 @@ impl AppState {
                 upstream_endpoint: endpoint.to_string(),
                 _spawned_app_server: None,
             }),
+            push_notifications: Arc::new(PushNotificationState::disabled()),
         })
     }
 }
@@ -329,6 +397,7 @@ async fn proxy_websocket_connection(
     let upstream_to_client = async {
         while let Some(message) = upstream_receiver.next().await {
             let message = message.context("read message from upstream websocket")?;
+            maybe_notify_user_for_ws_approval_request(&message);
             let Some(mapped) = map_upstream_to_client_message(message) else {
                 continue;
             };
@@ -381,11 +450,13 @@ fn map_upstream_to_client_message(message: UpstreamWsMessage) -> Option<AxumWsMe
     }
 }
 
-async fn health() -> Json<HealthResponse> {
+async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
+    let device_token_registered = state.push_notifications.has_registrations().await;
     Json(HealthResponse {
         status: "ok".to_string(),
         service: "crabbot_daemon".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
+        device_token_registered: Some(device_token_registered),
     })
 }
 
@@ -428,8 +499,49 @@ fn build_session_status(
     }
 }
 
-fn push_event(runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
+fn push_event(state: &AppState, runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
     maybe_notify_user_for_approval(&event);
+
+    match &event {
+        DaemonStreamEvent::TurnStreamDelta(payload) => {
+            runtime
+                .turn_buffers
+                .entry(payload.turn_id.clone())
+                .or_default()
+                .push_str(&payload.delta);
+        }
+        DaemonStreamEvent::TurnCompleted(payload) => {
+            let response = runtime
+                .turn_buffers
+                .remove(&payload.turn_id)
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| payload.output_summary.clone());
+            let title = runtime
+                .last_user_prompt
+                .as_deref()
+                .map(truncate_for_notification)
+                .unwrap_or_else(|| runtime.status.session_id.clone());
+            state.push_notifications.notify_turn_completed(
+                &runtime.status.session_id,
+                &title,
+                &response,
+            );
+        }
+        DaemonStreamEvent::ApprovalRequired(payload) => {
+            let title = runtime
+                .last_user_prompt
+                .as_deref()
+                .map(truncate_for_notification)
+                .unwrap_or_else(|| runtime.status.session_id.clone());
+            let body = format!("Approval required: {}", payload.action_kind);
+            state.push_notifications.notify_approval_required(
+                &runtime.status.session_id,
+                &title,
+                &body,
+            );
+        }
+        DaemonStreamEvent::SessionState(_) | DaemonStreamEvent::Heartbeat(_) => {}
+    }
 
     runtime.next_sequence += 1;
     let sequence = runtime.next_sequence;
@@ -451,6 +563,31 @@ fn push_event(runtime: &mut SessionRuntime, event: DaemonStreamEvent) -> u64 {
 
 fn maybe_notify_user_for_approval(event: &DaemonStreamEvent) {
     let Some(payload) = legacy_approval_notify_json(event) else {
+        return;
+    };
+    let Some(argv) = approval_notify_argv() else {
+        return;
+    };
+    let Some(mut command) = command_from_argv(argv) else {
+        return;
+    };
+    let spawn_result = command
+        .arg(payload)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+
+    if let Err(error) = spawn_result {
+        eprintln!("warning: failed to run approval notification command: {error}");
+    }
+}
+
+fn maybe_notify_user_for_ws_approval_request(message: &UpstreamWsMessage) {
+    let UpstreamWsMessage::Text(text) = message else {
+        return;
+    };
+    let Some(payload) = approval_notify_json_from_ws_request(text.as_ref()) else {
         return;
     };
     let Some(argv) = approval_notify_argv() else {
@@ -496,6 +633,39 @@ fn legacy_approval_notify_json(event: &DaemonStreamEvent) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn approval_notify_json_from_ws_request(raw: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let method = value.get("method")?.as_str()?;
+    if !method.starts_with("item/") || !method.ends_with("/requestApproval") {
+        return None;
+    }
+    let params = value.get("params")?.as_object()?;
+    let turn_id = params.get("turnId")?.as_str()?.to_string();
+    let approval_id = params
+        .get("approvalId")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .or_else(|| {
+            value.get("id").map(|id| match id {
+                serde_json::Value::String(value) => value.clone(),
+                other => other.to_string(),
+            })
+        })?;
+    let prompt = params
+        .get("reason")
+        .and_then(|value| value.as_str())
+        .unwrap_or("Approval required before continuing this action")
+        .to_string();
+
+    serde_json::to_string(&ApprovalNotification::ApprovalRequired {
+        turn_id,
+        approval_id,
+        action_kind: method.to_string(),
+        prompt,
+    })
+    .ok()
 }
 
 fn command_from_argv(argv: &[String]) -> Option<Command> {
@@ -556,6 +726,237 @@ fn parse_notify_argv_from_toml(raw: &str) -> Option<Vec<String>> {
         return None;
     }
     Some(argv)
+}
+
+impl PushNotificationState {
+    fn from_env() -> Self {
+        Self {
+            client: Client::new(),
+            service_account: load_fcm_service_account_from_env(),
+            registrations: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    fn disabled() -> Self {
+        Self {
+            client: Client::new(),
+            service_account: None,
+            registrations: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    async fn register(&self, request: PushRegistrationRequest) {
+        let token = request.token;
+        let session_id = request.session_id;
+        let mut registrations = self.registrations.write().await;
+        let previous = registrations.insert(
+            token.clone(),
+            PushRegistration {
+                token,
+                session_id: session_id.clone(),
+            },
+        );
+        if previous.is_none() {
+            let session_label = session_id.as_deref().unwrap_or("all");
+            eprintln!("info: device token registered (session_id={session_label})");
+        }
+    }
+
+    async fn has_registrations(&self) -> bool {
+        !self.registrations.read().await.is_empty()
+    }
+
+    fn notify_turn_completed(&self, session_id: &str, title: &str, body: &str) {
+        self.notify(session_id, title, body, "turn_completed");
+    }
+
+    fn notify_approval_required(&self, session_id: &str, title: &str, body: &str) {
+        self.notify(session_id, title, body, "approval_required");
+    }
+
+    fn notify(&self, session_id: &str, title: &str, body: &str, kind: &str) {
+        let Some(service_account) = self.service_account.clone() else {
+            return;
+        };
+        let session_id = session_id.to_string();
+        let title = truncate_for_notification(title);
+        let body = truncate_for_notification(body);
+        let kind = kind.to_string();
+        let client = self.client.clone();
+        let registrations = self.registrations.clone();
+
+        tokio::spawn(async move {
+            let access_token = match fetch_fcm_access_token(&client, &service_account).await {
+                Some(token) => token,
+                None => return,
+            };
+            let endpoint = format!(
+                "https://fcm.googleapis.com/v1/projects/{}/messages:send",
+                service_account.project_id
+            );
+
+            let targets = {
+                let registrations = registrations.read().await;
+                registrations
+                    .values()
+                    .filter(|registration| {
+                        registration
+                            .session_id
+                            .as_deref()
+                            .is_none_or(|value| value == session_id.as_str())
+                    })
+                    .map(|registration| registration.token.clone())
+                    .collect::<Vec<_>>()
+            };
+
+            for token in targets {
+                let payload = serde_json::json!({
+                    "message": {
+                        "token": token,
+                        "notification": {
+                            "title": title,
+                            "body": body
+                        },
+                        "android": {
+                            "priority": "high",
+                            "notification": {
+                                "sound": "default",
+                                "channel_id": "high-priority"
+                            }
+                        },
+                        "data": {
+                            "session_id": session_id,
+                            "kind": kind
+                        }
+                    }
+                });
+
+                let response = client
+                    .post(&endpoint)
+                    .bearer_auth(&access_token)
+                    .header("Content-Type", "application/json")
+                    .json(&payload)
+                    .send()
+                    .await;
+
+                match response {
+                    Ok(resp) if resp.status().is_success() => {}
+                    Ok(resp) => {
+                        eprintln!(
+                            "warning: fcm v1 push failed with status {} for session {}",
+                            resp.status(),
+                            session_id
+                        );
+                    }
+                    Err(error) => {
+                        eprintln!(
+                            "warning: fcm v1 push request failed for session {}: {}",
+                            session_id, error
+                        );
+                    }
+                }
+            }
+        });
+    }
+}
+
+fn truncate_for_notification(text: &str) -> String {
+    let normalized = text.trim();
+    if normalized.len() <= 160 {
+        return normalized.to_string();
+    }
+    format!("{}…", normalized.chars().take(159).collect::<String>())
+}
+
+fn load_fcm_service_account_from_env() -> Option<FcmServiceAccount> {
+    let raw = if let Ok(path) = env::var("CRABBOT_FCM_SERVICE_ACCOUNT_JSON_PATH") {
+        match std::fs::read_to_string(&path) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "warning: failed to read CRABBOT_FCM_SERVICE_ACCOUNT_JSON_PATH `{path}`: {error}"
+                );
+                return None;
+            }
+        }
+    } else {
+        match env::var("CRABBOT_FCM_SERVICE_ACCOUNT_JSON") {
+            Ok(value) => value,
+            Err(_) => return None,
+        }
+    };
+
+    let parsed: FcmServiceAccountFile = match serde_json::from_str(&raw) {
+        Ok(value) => value,
+        Err(error) => {
+            eprintln!("warning: failed to parse FCM service account json: {error}");
+            return None;
+        }
+    };
+
+    let token_uri = parsed
+        .token_uri
+        .unwrap_or_else(|| DEFAULT_FCM_TOKEN_URI.to_string());
+    if parsed.project_id.trim().is_empty()
+        || parsed.client_email.trim().is_empty()
+        || parsed.private_key.trim().is_empty()
+    {
+        return None;
+    }
+
+    Some(FcmServiceAccount {
+        project_id: parsed.project_id,
+        client_email: parsed.client_email,
+        private_key: parsed.private_key,
+        token_uri,
+    })
+}
+
+async fn fetch_fcm_access_token(client: &Client, account: &FcmServiceAccount) -> Option<String> {
+    let now_secs = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs();
+    let claims = FcmJwtClaims {
+        iss: account.client_email.clone(),
+        sub: account.client_email.clone(),
+        aud: account.token_uri.clone(),
+        scope: FCM_SCOPE.to_string(),
+        iat: now_secs.saturating_sub(5),
+        exp: now_secs.saturating_add(3500),
+    };
+    let key = EncodingKey::from_rsa_pem(account.private_key.as_bytes()).ok()?;
+    let assertion = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &key).ok()?;
+
+    let response = client
+        .post(&account.token_uri)
+        .form(&[
+            ("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+            ("assertion", assertion.as_str()),
+        ])
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        eprintln!(
+            "warning: failed to acquire fcm access token, status {}",
+            response.status()
+        );
+        return None;
+    }
+    let parsed: OAuthTokenResponse = response.json().await.ok()?;
+    if parsed.access_token.trim().is_empty() {
+        return None;
+    }
+    Some(parsed.access_token)
+}
+
+async fn register_push_token(
+    State(state): State<AppState>,
+    Json(payload): Json<PushRegistrationRequest>,
+) -> Result<(StatusCode, Json<PushRegistrationResponse>), StatusCode> {
+    if payload.token.trim().is_empty() {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    state.push_notifications.register(payload).await;
+    Ok((StatusCode::OK, Json(PushRegistrationResponse { ok: true })))
 }
 
 fn split_for_stream(text: &str, chunk_size: usize) -> Vec<String> {
@@ -672,8 +1073,11 @@ async fn start_session(
         active_turn_id: None,
         next_sequence: 0,
         events: Vec::new(),
+        last_user_prompt: None,
+        turn_buffers: HashMap::new(),
     };
     push_event(
+        &state,
         &mut runtime,
         DaemonStreamEvent::SessionState(DaemonSessionState {
             state: "active".to_string(),
@@ -740,6 +1144,7 @@ async fn mutate_session_state(
         runtime.active_turn_id = None;
     }
     push_event(
+        &state,
         runtime,
         DaemonStreamEvent::SessionState(DaemonSessionState {
             state: runtime.status.state.clone(),
@@ -899,8 +1304,9 @@ async fn prompt_session(
         return Err(StatusCode::CONFLICT);
     }
     runtime.active_turn_id = Some(turn_id.clone());
+    runtime.last_user_prompt = Some(payload.prompt.clone());
     for mapped in mapped_events {
-        push_event(runtime, mapped);
+        push_event(&state, runtime, mapped);
     }
     runtime.active_turn_id = None;
     runtime.status.last_event = "turn_completed".to_string();
@@ -1174,6 +1580,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let value = read_json(response).await;
         assert_eq!(value["service"], json!("crabbot_daemon"));
+        assert_eq!(value["device_token_registered"], json!(false));
     }
 
     #[test]
@@ -1219,6 +1626,43 @@ mod tests {
                 turn_id: "turn_1".to_string(),
                 output_summary: "done".to_string(),
             }))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn approval_notification_parses_ws_request_approval_message() {
+        let payload = approval_notify_json_from_ws_request(
+            r#"{
+                "jsonrpc":"2.0",
+                "id":42,
+                "method":"item/commandExecution/requestApproval",
+                "params":{
+                    "threadId":"thread_1",
+                    "turnId":"turn_1",
+                    "approvalId":"approval_1",
+                    "reason":"needs approval"
+                }
+            }"#,
+        )
+        .expect("ws request should generate payload");
+        let parsed: serde_json::Value = serde_json::from_str(&payload).expect("valid json");
+        assert_eq!(parsed["type"], "approval-required");
+        assert_eq!(parsed["turn-id"], "turn_1");
+        assert_eq!(parsed["approval-id"], "approval_1");
+        assert_eq!(
+            parsed["action-kind"],
+            "item/commandExecution/requestApproval"
+        );
+        assert_eq!(parsed["prompt"], "needs approval");
+    }
+
+    #[test]
+    fn approval_notification_ignores_non_approval_ws_messages() {
+        assert!(
+            approval_notify_json_from_ws_request(
+                r#"{"jsonrpc":"2.0","method":"turn/started","params":{"turnId":"turn_1"}}"#
+            )
             .is_none()
         );
     }

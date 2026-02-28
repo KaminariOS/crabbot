@@ -1302,6 +1302,22 @@ fn fetch_api_health(api_endpoint: &str, auth_token: Option<&str>) -> Result<Heal
         .context("parse api health response")
 }
 
+fn fetch_daemon_health(daemon_endpoint: &str, auth_token: Option<&str>) -> Result<HealthResponse> {
+    if endpoint_uses_websocket_transport(daemon_endpoint) {
+        bail!("daemon endpoint uses websocket transport");
+    }
+    let client = health_http_client()?;
+    let url = endpoint_url(daemon_endpoint, "/health");
+    let response = apply_auth(client.get(url), auth_token)
+        .send()
+        .context("request daemon health")?
+        .error_for_status()
+        .context("daemon health returned error status")?;
+    response
+        .json::<HealthResponse>()
+        .context("parse daemon health response")
+}
+
 fn health_http_client() -> Result<Client> {
     Client::builder()
         .timeout(Duration::from_millis(250))

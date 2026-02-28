@@ -8,6 +8,8 @@ pub struct HealthResponse {
     pub status: String,
     pub service: String,
     pub version: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_token_registered: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

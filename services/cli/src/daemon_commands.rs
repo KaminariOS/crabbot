@@ -174,15 +174,29 @@ fn daemon_restart(state_path: &Path, state: &mut CliState, args: DaemonUpArgs) -
 fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
     let pid_path = daemon_pid_path(state_path)?;
     let saved = load_daemon_process_state(&pid_path)?;
-    let healthy = daemon_is_healthy(
+    let health = fetch_daemon_health(
         &state.config.daemon_endpoint,
         state.config.auth_token.as_deref(),
-    );
+    )
+    .ok();
+    let healthy = health
+        .as_ref()
+        .map(|response| response.status == "ok")
+        .unwrap_or_else(|| {
+            daemon_is_healthy(
+                &state.config.daemon_endpoint,
+                state.config.auth_token.as_deref(),
+            )
+        });
+    let device_token_registered = health
+        .and_then(|response| response.device_token_registered)
+        .map(|registered| if registered { "yes" } else { "no" })
+        .unwrap_or("n/a");
 
     if let Some(process) = saved {
         let running = process_exists(process.pid);
         return Ok(format!(
-            "daemon: {}\nendpoint: {}\npid: {}\nhealth: {}\n\n{}",
+            "daemon: {}\nendpoint: {}\npid: {}\nhealth: {}\ndevice token registered: {}\n\n{}",
             if running {
                 "up"
             } else {
@@ -191,6 +205,7 @@ fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
             process.endpoint,
             process.pid,
             if healthy { "ok" } else { "unhealthy" },
+            device_token_registered,
             format_daemon_websocket_qr_output(&process.endpoint)
         ));
     }
@@ -201,18 +216,20 @@ fn daemon_status(state_path: &Path, state: &CliState) -> Result<String> {
             .map(|pid| pid.to_string())
             .unwrap_or_else(|| "n/a".to_string());
         return Ok(format!(
-            "daemon: up (unmanaged)\nendpoint: {}\npid: {}\nhealth: ok\n\n{}",
+            "daemon: up (unmanaged)\nendpoint: {}\npid: {}\nhealth: ok\ndevice token registered: {}\n\n{}",
             state.config.daemon_endpoint,
             pid_display,
+            device_token_registered,
             format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
         ));
     }
 
     Ok(format!(
-        "daemon: {}\nendpoint: {}\npid: n/a\nhealth: {}\n\n{}",
+        "daemon: {}\nendpoint: {}\npid: n/a\nhealth: {}\ndevice token registered: {}\n\n{}",
         "down",
         state.config.daemon_endpoint,
         "unhealthy",
+        device_token_registered,
         format_daemon_websocket_qr_output(&state.config.daemon_endpoint)
     ))
 }

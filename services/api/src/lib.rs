@@ -368,6 +368,7 @@ async fn health(State(state): State<AppState>) -> Json<HealthResponse> {
         status: "ok".to_string(),
         service: state.service_name,
         version: env!("CARGO_PKG_VERSION").to_string(),
+        device_token_registered: None,
     })
 }
 
