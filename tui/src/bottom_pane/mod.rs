@@ -128,6 +128,7 @@ pub(crate) use chat_composer::ChatComposerConfig;
 pub(crate) use chat_composer::InputResult;
 use codex_protocol::custom_prompts::CustomPrompt;
 
+use crate::status_indicator_widget::StatusDetailsCapitalization;
 use crate::status_indicator_widget::StatusIndicatorWidget;
 pub(crate) use experimental_features_view::ExperimentalFeatureItem;
 pub(crate) use experimental_features_view::ExperimentalFeaturesView;
@@ -272,6 +273,18 @@ impl BottomPane {
 
     pub fn set_connectors_enabled(&mut self, enabled: bool) {
         self.composer.set_connectors_enabled(enabled);
+    }
+
+    pub fn set_voice_transcription_enabled(&mut self, _enabled: bool) {
+        self.request_redraw();
+    }
+
+    pub fn set_realtime_conversation_enabled(&mut self, _enabled: bool) {
+        self.request_redraw();
+    }
+
+    pub fn set_audio_device_selection_enabled(&mut self, _enabled: bool) {
+        self.request_redraw();
     }
 
     #[cfg(target_os = "windows")]
@@ -552,13 +565,21 @@ impl BottomPane {
     /// Update the status indicator header (defaults to "Working") and details below it.
     ///
     /// Passing `None` clears any existing details. No-ops if the status indicator is not active.
-    pub(crate) fn update_status(&mut self, header: String, details: Option<String>) {
+    pub(crate) fn update_status(
+        &mut self,
+        header: String,
+        details: Option<String>,
+        details_capitalization: StatusDetailsCapitalization,
+        details_max_lines: usize,
+    ) {
         if let Some(status) = self.status.as_mut() {
             status.update_header(header);
-            status.update_details(details);
+            status.update_details(details, details_capitalization, details_max_lines);
             self.request_redraw();
         }
     }
+
+    pub(crate) fn pre_draw_tick(&mut self) {}
 
     /// Show the transient "press again to quit" hint for `key`.
     ///
@@ -1019,7 +1040,9 @@ mod tests {
             id: "1".to_string(),
             command: vec!["echo".into(), "ok".into()],
             reason: None,
+            available_decisions: vec![],
             network_approval_context: None,
+            additional_permissions: None,
             proposed_execpolicy_amendment: None,
         }
     }
@@ -1278,6 +1301,8 @@ mod tests {
         pane.update_status(
             "Working".to_string(),
             Some("First detail line\nSecond detail line".to_string()),
+            StatusDetailsCapitalization::CapitalizeFirst,
+            3,
         );
         pane.set_queued_user_messages(vec!["Queued follow-up question".to_string()]);
 

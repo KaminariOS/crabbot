@@ -13,6 +13,7 @@ use crate::exec_command::strip_bash_lc_and_escape;
 use crate::history_cell;
 use crate::key_hint;
 use crate::key_hint::KeyBinding;
+use crate::models::PermissionProfile;
 use crate::render::highlight::highlight_bash_to_lines;
 use crate::render::renderable::ColumnRenderable;
 use crate::render::renderable::Renderable;
@@ -43,7 +44,9 @@ pub(crate) enum ApprovalRequest {
         id: String,
         command: Vec<String>,
         reason: Option<String>,
+        available_decisions: Vec<ReviewDecision>,
         network_approval_context: Option<NetworkApprovalContext>,
+        additional_permissions: Option<PermissionProfile>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
     ApplyPatch {
@@ -110,13 +113,17 @@ impl ApprovalOverlay {
     ) -> (Vec<ApprovalOption>, SelectionViewParams) {
         let (options, title) = match &variant {
             ApprovalVariant::Exec {
+                available_decisions,
                 network_approval_context,
+                additional_permissions,
                 proposed_execpolicy_amendment,
                 ..
             } => (
                 exec_options(
+                    available_decisions,
                     proposed_execpolicy_amendment.clone(),
                     network_approval_context.as_ref(),
+                    additional_permissions.as_ref(),
                 ),
                 network_approval_context.as_ref().map_or_else(
                     || "Would you like to run the following command?".to_string(),
@@ -356,7 +363,9 @@ impl From<ApprovalRequest> for ApprovalRequestState {
                 id,
                 command,
                 reason,
+                available_decisions,
                 network_approval_context,
+                additional_permissions,
                 proposed_execpolicy_amendment,
             } => {
                 let mut header: Vec<Line<'static>> = Vec::new();
@@ -376,7 +385,9 @@ impl From<ApprovalRequest> for ApprovalRequestState {
                     variant: ApprovalVariant::Exec {
                         id,
                         command,
+                        available_decisions,
                         network_approval_context,
+                        additional_permissions,
                         proposed_execpolicy_amendment,
                     },
                     header: Box::new(Paragraph::new(header).wrap(Wrap { trim: false })),
@@ -432,7 +443,9 @@ enum ApprovalVariant {
     Exec {
         id: String,
         command: Vec<String>,
+        available_decisions: Vec<ReviewDecision>,
         network_approval_context: Option<NetworkApprovalContext>,
+        additional_permissions: Option<PermissionProfile>,
         proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     },
     ApplyPatch {
@@ -467,30 +480,41 @@ impl ApprovalOption {
 }
 
 fn exec_options(
+    available_decisions: &[ReviewDecision],
     proposed_execpolicy_amendment: Option<ExecPolicyAmendment>,
     network_approval_context: Option<&NetworkApprovalContext>,
+    _additional_permissions: Option<&PermissionProfile>,
 ) -> Vec<ApprovalOption> {
+    let supports = |decision: &ReviewDecision| {
+        if available_decisions.is_empty() {
+            true
+        } else {
+            available_decisions.contains(decision)
+        }
+    };
+
     if network_approval_context.is_some() {
-        return vec![
-            ApprovalOption {
-                label: "Yes, just this once".to_string(),
-                decision: ApprovalDecision::Review(ReviewDecision::Approved),
-                display_shortcut: None,
-                additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
-            },
-            ApprovalOption {
+        let mut options = vec![ApprovalOption {
+            label: "Yes, just this once".to_string(),
+            decision: ApprovalDecision::Review(ReviewDecision::Approved),
+            display_shortcut: None,
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('y'))],
+        }];
+        if supports(&ReviewDecision::ApprovedForSession) {
+            options.push(ApprovalOption {
                 label: "Yes, and allow this host for this session".to_string(),
                 decision: ApprovalDecision::Review(ReviewDecision::ApprovedForSession),
                 display_shortcut: None,
                 additional_shortcuts: vec![key_hint::plain(KeyCode::Char('a'))],
-            },
-            ApprovalOption {
-                label: "No, and tell Codex what to do differently".to_string(),
-                decision: ApprovalDecision::Review(ReviewDecision::Abort),
-                display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
-                additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
-            },
-        ];
+            });
+        }
+        options.push(ApprovalOption {
+            label: "No, and tell Codex what to do differently".to_string(),
+            decision: ApprovalDecision::Review(ReviewDecision::Abort),
+            display_shortcut: Some(key_hint::plain(KeyCode::Esc)),
+            additional_shortcuts: vec![key_hint::plain(KeyCode::Char('n'))],
+        });
+        return options;
     }
 
     vec![ApprovalOption {
@@ -585,7 +609,9 @@ mod tests {
             id: "test".to_string(),
             command: vec!["echo".to_string(), "hi".to_string()],
             reason: Some("reason".to_string()),
+            available_decisions: vec![],
             network_approval_context: None,
+            additional_permissions: None,
             proposed_execpolicy_amendment: None,
         }
     }
@@ -628,7 +654,9 @@ mod tests {
                 id: "test".to_string(),
                 command: vec!["echo".to_string()],
                 reason: None,
+                available_decisions: vec![],
                 network_approval_context: None,
+                additional_permissions: None,
                 proposed_execpolicy_amendment: Some(ExecPolicyAmendment::new(vec![
                     "echo".to_string(),
                 ])),
@@ -667,7 +695,9 @@ mod tests {
             id: "test".into(),
             command,
             reason: None,
+            available_decisions: vec![],
             network_approval_context: None,
+            additional_permissions: None,
             proposed_execpolicy_amendment: None,
         };
 

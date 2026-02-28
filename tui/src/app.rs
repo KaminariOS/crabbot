@@ -664,6 +664,7 @@ impl App {
             model: Some(self.chat_widget.current_model().to_string()),
             status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
             otel_manager: self.otel_manager.clone(),
+            startup_tooltip_override: None,
         }
     }
 
@@ -1226,6 +1227,7 @@ impl App {
                     model: Some(model.clone()),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    startup_tooltip_override: None,
                 };
                 ChatWidget::new(init, thread_manager.clone())
             }
@@ -1256,6 +1258,7 @@ impl App {
                     model: config.model.clone(),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    startup_tooltip_override: None,
                 };
                 ChatWidget::new_from_existing(init, resumed.thread, resumed.session_configured)
             }
@@ -1287,6 +1290,7 @@ impl App {
                     model: config.model.clone(),
                     status_line_invalid_items_warned: status_line_invalid_items_warned.clone(),
                     otel_manager: otel_manager.clone(),
+                    startup_tooltip_override: None,
                 };
                 ChatWidget::new_from_existing(init, forked.thread, forked.session_configured)
             }
@@ -1540,6 +1544,7 @@ impl App {
                     model: Some(model),
                     status_line_invalid_items_warned: self.status_line_invalid_items_warned.clone(),
                     otel_manager: self.otel_manager.clone(),
+                    startup_tooltip_override: None,
                 };
                 self.chat_widget = ChatWidget::new(init, self.server.clone());
                 self.reset_thread_event_state();
@@ -1552,6 +1557,9 @@ impl App {
                     self.chat_widget.add_plain_history_lines(lines);
                 }
                 tui.frame_requester().schedule_frame();
+            }
+            AppEvent::ClearUi => {
+                self.app_event_tx.send(AppEvent::NewSession);
             }
             AppEvent::OpenResumePicker => {
                 match crate::resume_picker::run_resume_picker(tui, &self.config, false).await? {
@@ -1856,6 +1864,16 @@ impl App {
             AppEvent::UpdateModel(model) => {
                 self.chat_widget.set_model(&model);
                 self.refresh_status_line();
+            }
+            AppEvent::OpenRealtimeAudioDeviceSelection { kind } => {
+                self.chat_widget.open_realtime_audio_device_selection(kind);
+            }
+            AppEvent::PersistRealtimeAudioDeviceSelection { kind, name } => {
+                self.chat_widget.set_realtime_audio_device(kind, name);
+            }
+            AppEvent::RestartRealtimeAudioDevice { .. } => {}
+            AppEvent::SyntaxThemeSelected { name } => {
+                self.chat_widget.set_tui_theme(Some(name));
             }
             AppEvent::UpdateCollaborationMode(mask) => {
                 self.chat_widget.set_collaboration_mask(mask);

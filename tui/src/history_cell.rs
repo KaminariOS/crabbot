@@ -1025,6 +1025,7 @@ pub(crate) fn new_session_info(
     requested_model: &str,
     event: SessionConfiguredEvent,
     is_first_event: bool,
+    _startup_tooltip_override: Option<String>,
     auth_plan: Option<PlanType>,
 ) -> SessionInfoCell {
     let SessionConfiguredEvent {

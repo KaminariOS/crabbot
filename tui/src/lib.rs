@@ -245,8 +245,23 @@ fn parse_rate_limit_window_value(
 
 #[cfg(test)]
 mod tests {
+    use super::CodexThread;
+    use super::CodexThreadState;
+    use super::ThreadConfigSnapshot;
     use super::parse_rate_limit_snapshots_from_result;
+    use crate::ThreadId;
+    use crate::protocol::AgentMessageEvent;
+    use crate::protocol::AskForApproval;
+    use crate::protocol::Event;
+    use crate::protocol::EventMsg;
+    use crate::protocol::SandboxPolicy;
+    use crate::protocol::SessionSource;
+    use crate::protocol::TurnCompleteEvent;
+    use crate::protocol::TurnStartedEvent;
+    use codex_protocol::config_types::ModeKind;
     use serde_json::json;
+    use std::collections::HashMap;
+    use std::collections::VecDeque;
 
     #[test]
     fn parse_rate_limit_snapshots_ignores_empty_secondary_window() {
@@ -302,6 +317,130 @@ mod tests {
             snapshot.secondary.as_ref().and_then(|w| w.window_minutes),
             Some(300)
         );
+    }
+
+    fn make_thread_state_for_event_queue_tests() -> CodexThreadState {
+        CodexThreadState {
+            thread_id: ThreadId::new(),
+            app_server_endpoint: String::new(),
+            auth_token: None,
+            last_sequence: 0,
+            next_submission_id: 1,
+            current_turn_id: None,
+            last_agent_message_in_turn: None,
+            pending_events: VecDeque::new(),
+            pending_server_requests: HashMap::new(),
+            pending_request_user_input_by_turn_id: HashMap::new(),
+            config_snapshot: ThreadConfigSnapshot {
+                model: "test".to_string(),
+                model_provider_id: "openai".to_string(),
+                approval_policy: AskForApproval::OnRequest,
+                sandbox_policy: SandboxPolicy::new_workspace_write_policy(),
+                cwd: std::env::temp_dir(),
+                reasoning_effort: None,
+                session_source: SessionSource::Cli,
+            },
+            rollout_path: None,
+        }
+    }
+
+    #[test]
+    fn enqueue_pending_event_dedupes_identical_agent_message_in_turn() {
+        let mut state = make_thread_state_for_event_queue_tests();
+        let turn_id = "turn-1".to_string();
+
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "1".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: turn_id.clone(),
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                }),
+            },
+        );
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "2".to_string(),
+                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "Same final message".to_string(),
+                    phase: None,
+                }),
+            },
+        );
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "3".to_string(),
+                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "Same final message".to_string(),
+                    phase: None,
+                }),
+            },
+        );
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "4".to_string(),
+                msg: EventMsg::TurnComplete(TurnCompleteEvent {
+                    turn_id,
+                    last_agent_message: None,
+                }),
+            },
+        );
+
+        let agent_messages = state
+            .pending_events
+            .iter()
+            .filter(|event| matches!(event.msg, EventMsg::AgentMessage(_)))
+            .count();
+        assert_eq!(agent_messages, 1);
+    }
+
+    #[test]
+    fn enqueue_pending_event_preserves_distinct_agent_messages() {
+        let mut state = make_thread_state_for_event_queue_tests();
+
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "1".to_string(),
+                msg: EventMsg::TurnStarted(TurnStartedEvent {
+                    turn_id: "turn-1".to_string(),
+                    model_context_window: None,
+                    collaboration_mode_kind: ModeKind::Default,
+                }),
+            },
+        );
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "2".to_string(),
+                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "First message".to_string(),
+                    phase: None,
+                }),
+            },
+        );
+        CodexThread::enqueue_pending_event(
+            &mut state,
+            Event {
+                id: "3".to_string(),
+                msg: EventMsg::AgentMessage(AgentMessageEvent {
+                    message: "Second message".to_string(),
+                    phase: None,
+                }),
+            },
+        );
+
+        let agent_messages = state
+            .pending_events
+            .iter()
+            .filter(|event| matches!(event.msg, EventMsg::AgentMessage(_)))
+            .count();
+        assert_eq!(agent_messages, 2);
     }
 }
 
@@ -592,6 +731,9 @@ pub mod config {
     pub struct ValueRef<T>(pub T);
 
     impl<T> ValueRef<T> {
+        pub fn allow_only(value: T) -> Self {
+            Self(value)
+        }
         pub fn get(&self) -> &T {
             &self.0
         }
@@ -609,6 +751,8 @@ pub mod config {
             Ok(())
         }
     }
+
+    pub type Constrained<T> = ValueRef<T>;
 
     #[derive(Debug, Clone)]
     pub struct NetworkProxySpec {
@@ -676,6 +820,12 @@ pub mod config {
         pub model_migrations: std::collections::BTreeMap<String, String>,
     }
 
+    #[derive(Debug, Clone, Default)]
+    pub struct RealtimeAudioConfig {
+        pub microphone: Option<String>,
+        pub speaker: Option<String>,
+    }
+
     #[derive(Debug, Clone)]
     pub struct Config {
         pub codex_home: std::path::PathBuf,
@@ -713,6 +863,8 @@ pub mod config {
         pub tui_notifications: types::Notifications,
         pub tui_alternate_screen: codex_protocol::config_types::AltScreenMode,
         pub tui_status_line: Option<Vec<String>>,
+        pub tui_theme: Option<String>,
+        pub realtime_audio: RealtimeAudioConfig,
         pub config_layer_stack: crate::config_loader::ConfigLayerStack,
         pub tui_notification_method: types::NotificationMethod,
         pub cli_auth_credentials_store_mode: crate::auth::AuthCredentialsStoreMode,
@@ -792,6 +944,8 @@ pub mod config {
                 tui_notifications: types::Notifications::default(),
                 tui_alternate_screen: codex_protocol::config_types::AltScreenMode::default(),
                 tui_status_line: None,
+                tui_theme: None,
+                realtime_audio: RealtimeAudioConfig::default(),
                 config_layer_stack: crate::config_loader::ConfigLayerStack::default(),
                 tui_notification_method: types::NotificationMethod::Auto,
                 cli_auth_credentials_store_mode: crate::auth::AuthCredentialsStoreMode::Plaintext,
@@ -1760,6 +1914,9 @@ struct CodexThreadState {
     last_sequence: u64,
     next_submission_id: u64,
     current_turn_id: Option<String>,
+    // Last finalized agent message seen within the current turn.
+    // Used to suppress duplicate AgentMessage events emitted by mixed app-server notifications.
+    last_agent_message_in_turn: Option<String>,
     pending_events: VecDeque<crate::protocol::Event>,
     pending_server_requests: HashMap<String, PendingServerRequest>,
     pending_request_user_input_by_turn_id: HashMap<String, VecDeque<String>>,
@@ -1786,6 +1943,13 @@ pub struct ThreadConfigSnapshot {
 }
 
 impl CodexThread {
+    pub async fn set_app_server_client_name(
+        &self,
+        _client_name: Option<String>,
+    ) -> std::result::Result<(), String> {
+        Ok(())
+    }
+
     fn request_id_to_key(request_id: &crate::mcp::RequestId) -> String {
         match request_id {
             crate::mcp::RequestId::String(id) => id.clone(),
@@ -1831,6 +1995,7 @@ impl CodexThread {
                 last_sequence: 0,
                 next_submission_id: 1,
                 current_turn_id: None,
+                last_agent_message_in_turn: None,
                 pending_events: VecDeque::new(),
                 pending_server_requests: HashMap::new(),
                 pending_request_user_input_by_turn_id: HashMap::new(),
@@ -1844,6 +2009,26 @@ impl CodexThread {
         let id = format!("op-{}", state.next_submission_id);
         state.next_submission_id += 1;
         id
+    }
+
+    fn enqueue_pending_event(state: &mut CodexThreadState, event: crate::protocol::Event) {
+        match &event.msg {
+            crate::protocol::EventMsg::TurnStarted(_) => {
+                state.last_agent_message_in_turn = None;
+            }
+            crate::protocol::EventMsg::TurnComplete(_)
+            | crate::protocol::EventMsg::TurnAborted(_) => {
+                state.last_agent_message_in_turn = None;
+            }
+            crate::protocol::EventMsg::AgentMessage(agent) => {
+                if state.last_agent_message_in_turn.as_deref() == Some(agent.message.as_str()) {
+                    return;
+                }
+                state.last_agent_message_in_turn = Some(agent.message.clone());
+            }
+            _ => {}
+        }
+        state.pending_events.push_back(event);
     }
 
     fn user_input_to_wire_item(input: &crate::user_input::UserInput) -> Option<Value> {
@@ -1887,9 +2072,7 @@ impl CodexThread {
             .state
             .lock()
             .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
-        state
-            .pending_events
-            .push_back(crate::protocol::Event { id: event_id, msg });
+        Self::enqueue_pending_event(&mut state, crate::protocol::Event { id: event_id, msg });
         Ok(())
     }
     pub async fn submit(&self, op: crate::protocol::Op) -> Result<String, CodexError> {
@@ -2578,10 +2761,13 @@ impl CodexThread {
                     .lock()
                     .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
                 state.current_turn_id = None;
-                state.pending_events.push_back(crate::protocol::Event {
-                    id: format!("seq-local-shutdown-{submission_id}"),
-                    msg: crate::protocol::EventMsg::ShutdownComplete,
-                });
+                Self::enqueue_pending_event(
+                    &mut state,
+                    crate::protocol::Event {
+                        id: format!("seq-local-shutdown-{submission_id}"),
+                        msg: crate::protocol::EventMsg::ShutdownComplete,
+                    },
+                );
             }
             _ => {
                 return Err(CodexError::new(format!(
@@ -3142,7 +3328,7 @@ impl CodexThread {
                                 if let Some(request_key) = resolved_request_key.as_deref() {
                                     Self::cleanup_pending_request_by_key(&mut state, request_key);
                                 }
-                                state.pending_events.push_back(event);
+                                Self::enqueue_pending_event(&mut state, event);
                             }
                         }
                         crabbot_protocol::DaemonRpcStreamEvent::ServerRequest(request) => {
@@ -3152,22 +3338,25 @@ impl CodexThread {
                                 &mut state,
                             );
                             for event in mapped {
-                                state.pending_events.push_back(event);
+                                Self::enqueue_pending_event(&mut state, event);
                             }
                         }
                         crabbot_protocol::DaemonRpcStreamEvent::DecodeError(err) => {
-                            state.pending_events.push_back(crate::protocol::Event {
-                                id: format!("seq-{}", envelope.sequence),
-                                msg: crate::protocol::EventMsg::Error(
-                                    crate::protocol::ErrorEvent {
-                                        message: format!(
-                                            "app-server stream decode error: {}",
-                                            err.message
-                                        ),
-                                        codex_error_info: None,
-                                    },
-                                ),
-                            });
+                            Self::enqueue_pending_event(
+                                &mut state,
+                                crate::protocol::Event {
+                                    id: format!("seq-{}", envelope.sequence),
+                                    msg: crate::protocol::EventMsg::Error(
+                                        crate::protocol::ErrorEvent {
+                                            message: format!(
+                                                "app-server stream decode error: {}",
+                                                err.message
+                                            ),
+                                            codex_error_info: None,
+                                        },
+                                    ),
+                                },
+                            );
                         }
                     }
                 }
@@ -3845,6 +4034,8 @@ pub mod features {
         CollaborationModes,
         Personality,
         Apps,
+        RealtimeConversation,
+        VoiceTranscription,
         PreventIdleSleep,
         RuntimeMetrics,
         GhostCommit,
@@ -3965,6 +4156,24 @@ pub mod features {
             stage: FeatureStage::Stable,
         },
         FeatureSpec {
+            id: Feature::RealtimeConversation,
+            key: "realtime_conversation",
+            default_enabled: false,
+            stage: FeatureStage::Experimental(
+                "Realtime conversation is still experimental.",
+                "Realtime conversation",
+            ),
+        },
+        FeatureSpec {
+            id: Feature::VoiceTranscription,
+            key: "voice_transcription",
+            default_enabled: false,
+            stage: FeatureStage::Experimental(
+                "Voice transcription is still experimental.",
+                "Voice transcription",
+            ),
+        },
+        FeatureSpec {
             id: Feature::PreventIdleSleep,
             key: "prevent_idle_sleep",
             default_enabled: false,
@@ -4071,7 +4280,9 @@ pub mod skills {
             pub interface: Option<SkillInterface>,
             pub dependencies: Option<SkillDependencies>,
             pub policy: Option<serde_json::Value>,
+            pub permission_profile: Option<serde_json::Value>,
             pub permissions: Option<serde_json::Value>,
+            pub path_to_skills_md: std::path::PathBuf,
             pub path: std::path::PathBuf,
             pub scope: codex_protocol::protocol::SkillScope,
         }
@@ -4090,6 +4301,7 @@ pub mod protocol {
 
 pub mod models {
     pub use codex_protocol::models::*;
+    pub type PermissionProfile = serde_json::Value;
 }
 
 pub mod user_input {
@@ -5399,6 +5611,7 @@ mod chatwidget;
 mod cli;
 pub use cli::Cli;
 mod clipboard_paste;
+mod clipboard_text;
 mod collaboration_modes;
 mod color;
 mod core_compat;
@@ -5456,6 +5669,7 @@ mod get_git_diff;
 mod history_cell;
 mod insert_history;
 mod key_hint;
+mod line_truncation;
 pub mod live_wrap;
 mod markdown;
 mod markdown_render;
@@ -5481,6 +5695,7 @@ mod streaming;
 mod style;
 mod terminal_palette;
 mod text_formatting;
+mod theme_picker;
 mod tooltips;
 pub mod tui;
 mod ui_consts;

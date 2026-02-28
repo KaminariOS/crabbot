@@ -72,11 +72,14 @@ impl ExecCell {
         call_id: &str,
         output: CommandOutput,
         duration: Duration,
-    ) {
+    ) -> bool {
         if let Some(call) = self.calls.iter_mut().rev().find(|c| c.call_id == call_id) {
             call.output = Some(output);
             call.duration = Some(duration);
             call.start_time = None;
+            true
+        } else {
+            false
         }
     }
 
