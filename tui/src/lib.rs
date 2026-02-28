@@ -3479,7 +3479,9 @@ impl ThreadManager {
     ) -> Self {
         let (thread_created_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
-            models_manager: std::sync::Arc::new(crate::models_manager::manager::ModelsManager),
+            models_manager: std::sync::Arc::new(
+                crate::models_manager::manager::ModelsManager::default(),
+            ),
             thread_created_tx,
             threads: std::sync::Arc::new(Mutex::new(HashMap::new())),
         }
@@ -5068,8 +5070,17 @@ pub mod models_manager {
 
     pub mod manager {
         use crate::config::Config;
+        use anyhow::Context;
         use codex_protocol::config_types::CollaborationModeMask;
+        use codex_protocol::openai_models::ModelAvailabilityNux;
         use codex_protocol::openai_models::ModelPreset;
+        use codex_protocol::openai_models::ReasoningEffort;
+        use codex_protocol::openai_models::ReasoningEffortPreset;
+        use codex_protocol::openai_models::default_input_modalities;
+        use serde_json::Value;
+        use serde_json::json;
+        use std::sync::Arc;
+        use std::sync::Mutex;
 
         #[derive(Debug, Clone, Copy)]
         pub enum RefreshStrategy {
@@ -5078,24 +5089,191 @@ pub mod models_manager {
         }
 
         #[derive(Debug, Clone, Default)]
-        pub struct ModelsManager;
+        pub struct ModelsManager {
+            cached_models: Arc<Mutex<Vec<ModelPreset>>>,
+        }
 
         impl ModelsManager {
             pub fn from_config(_config: &Config) -> Self {
-                Self
+                Self::default()
             }
-            pub async fn list_models(&self, _strategy: RefreshStrategy) -> Vec<ModelPreset> {
-                Vec::new()
+
+            fn fetch_models_from_backend(&self) -> anyhow::Result<Vec<ModelPreset>> {
+                let backend = crate::get_shim_backend_config();
+                let response = crate::app_server_rpc_request_raw(
+                    &backend.app_server_endpoint,
+                    backend.auth_token.as_deref(),
+                    "model/list",
+                    json!({
+                        "includeHidden": true,
+                        "limit": 256,
+                    }),
+                )
+                .context("failed to call model/list")?;
+
+                let data = response
+                    .result
+                    .get("data")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+
+                let mut models = Vec::new();
+                for item in data {
+                    let model = item
+                        .get("model")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .trim()
+                        .to_string();
+                    if model.is_empty() {
+                        continue;
+                    }
+
+                    let id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| model.clone());
+                    let display_name = item
+                        .get("displayName")
+                        .or_else(|| item.get("display_name"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| model.clone());
+                    let description = item
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    let default_reasoning_effort = item
+                        .get("defaultReasoningEffort")
+                        .or_else(|| item.get("default_reasoning_effort"))
+                        .and_then(|v| serde_json::from_value::<ReasoningEffort>(v.clone()).ok())
+                        .unwrap_or(ReasoningEffort::Medium);
+
+                    let mut supported_reasoning_efforts = item
+                        .get("supportedReasoningEfforts")
+                        .or_else(|| item.get("supported_reasoning_efforts"))
+                        .and_then(Value::as_array)
+                        .map(|efforts| {
+                            efforts
+                                .iter()
+                                .filter_map(|entry| {
+                                    let effort = entry
+                                        .get("reasoningEffort")
+                                        .or_else(|| entry.get("reasoning_effort"))
+                                        .and_then(|v| {
+                                            serde_json::from_value::<ReasoningEffort>(v.clone())
+                                                .ok()
+                                        })?;
+                                    let description = entry
+                                        .get("description")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default()
+                                        .to_string();
+                                    Some(ReasoningEffortPreset {
+                                        effort,
+                                        description,
+                                    })
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    if supported_reasoning_efforts.is_empty() {
+                        supported_reasoning_efforts.push(ReasoningEffortPreset {
+                            effort: default_reasoning_effort,
+                            description: "default".to_string(),
+                        });
+                    }
+
+                    let input_modalities = item
+                        .get("inputModalities")
+                        .or_else(|| item.get("input_modalities"))
+                        .and_then(|v| {
+                            serde_json::from_value::<
+                                Vec<codex_protocol::openai_models::InputModality>,
+                            >(v.clone())
+                            .ok()
+                        })
+                        .unwrap_or_else(default_input_modalities);
+
+                    let availability_nux = item
+                        .get("availabilityNux")
+                        .or_else(|| item.get("availability_nux"))
+                        .and_then(|v| {
+                            serde_json::from_value::<ModelAvailabilityNux>(v.clone()).ok()
+                        });
+
+                    models.push(ModelPreset {
+                        id,
+                        model,
+                        display_name,
+                        description,
+                        default_reasoning_effort,
+                        supported_reasoning_efforts,
+                        supports_personality: item
+                            .get("supportsPersonality")
+                            .or_else(|| item.get("supports_personality"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        is_default: item
+                            .get("isDefault")
+                            .or_else(|| item.get("is_default"))
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        upgrade: None,
+                        show_in_picker: !item
+                            .get("hidden")
+                            .and_then(Value::as_bool)
+                            .unwrap_or(false),
+                        availability_nux,
+                        supported_in_api: true,
+                        input_modalities,
+                    });
+                }
+
+                Ok(models)
+            }
+
+            pub async fn list_models(&self, strategy: RefreshStrategy) -> Vec<ModelPreset> {
+                let cached = self.try_list_models().unwrap_or_default();
+                if matches!(strategy, RefreshStrategy::Offline) && !cached.is_empty() {
+                    return cached;
+                }
+
+                match self.fetch_models_from_backend() {
+                    Ok(models) => {
+                        if let Ok(mut lock) = self.cached_models.lock() {
+                            *lock = models.clone();
+                        }
+                        models
+                    }
+                    Err(_) => cached,
+                }
             }
             pub fn try_list_models(&self) -> anyhow::Result<Vec<ModelPreset>> {
-                Ok(Vec::new())
+                let lock = self
+                    .cached_models
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("models cache mutex poisoned"))?;
+                Ok(lock.clone())
             }
             pub async fn get_default_model(
                 &self,
                 model: &Option<String>,
-                _strategy: RefreshStrategy,
+                strategy: RefreshStrategy,
             ) -> String {
-                model.clone().unwrap_or_default()
+                if let Some(model) = model.as_ref() {
+                    return model.clone();
+                }
+                self.list_models(strategy)
+                    .await
+                    .into_iter()
+                    .find(|preset| preset.is_default)
+                    .map(|preset| preset.model)
+                    .unwrap_or_default()
             }
             pub fn list_collaboration_modes(&self) -> Vec<CollaborationModeMask> {
                 Vec::new()
