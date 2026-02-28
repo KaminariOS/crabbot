@@ -6,7 +6,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::render::renderable::Renderable;
 use crate::wrapping::RtOptions;
-use crate::wrapping::adaptive_wrap_lines;
+use crate::wrapping::word_wrap_lines;
 
 /// Widget that lists inactive threads with outstanding approval requests.
 pub(crate) struct PendingThreadApprovals {
@@ -44,7 +44,7 @@ impl PendingThreadApprovals {
 
         let mut lines = Vec::new();
         for thread in self.threads.iter().take(3) {
-            let wrapped = adaptive_wrap_lines(
+            let wrapped = word_wrap_lines(
                 std::iter::once(Line::from(format!("Approval needed in {thread}"))),
                 RtOptions::new(width as usize)
                     .initial_indent(Line::from(vec!["  ".into(), "!".red().bold(), " ".into()]))

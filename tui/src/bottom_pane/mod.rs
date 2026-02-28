@@ -17,7 +17,6 @@ use std::path::PathBuf;
 
 use crate::app_event::ConnectorsSnapshot;
 use crate::app_event_sender::AppEventSender;
-use crate::bottom_pane::pending_thread_approvals::PendingThreadApprovals;
 use crate::bottom_pane::queued_user_messages::QueuedUserMessages;
 use crate::bottom_pane::unified_exec_footer::UnifiedExecFooter;
 use crate::key_hint;
@@ -89,7 +88,6 @@ pub(crate) use skills_toggle_view::SkillsToggleView;
 pub(crate) use status_line_setup::StatusLineItem;
 pub(crate) use status_line_setup::StatusLineSetupView;
 mod paste_burst;
-mod pending_thread_approvals;
 pub mod popup_consts;
 mod queued_user_messages;
 mod scroll_state;
@@ -168,8 +166,6 @@ pub(crate) struct BottomPane {
     unified_exec_footer: UnifiedExecFooter,
     /// Queued user messages to show above the composer while a turn is running.
     queued_user_messages: QueuedUserMessages,
-    /// Inactive threads with pending approval requests.
-    pending_thread_approvals: PendingThreadApprovals,
     context_window_percent: Option<i64>,
     context_window_used_tokens: Option<i64>,
 }
@@ -218,7 +214,6 @@ impl BottomPane {
             status: None,
             unified_exec_footer: UnifiedExecFooter::new(),
             queued_user_messages: QueuedUserMessages::new(),
-            pending_thread_approvals: PendingThreadApprovals::new(),
             esc_backtrack_hint: false,
             animations_enabled,
             context_window_percent: None,
@@ -228,6 +223,12 @@ impl BottomPane {
 
     pub fn set_skills(&mut self, skills: Option<Vec<SkillMetadata>>) {
         self.composer.set_skill_mentions(skills);
+        self.request_redraw();
+    }
+
+    /// Compatibility shim for fork-specific chatwidget flow.
+    /// Upstream bottom pane does not surface inactive-thread approvals.
+    pub fn set_pending_thread_approvals(&mut self, _threads: Vec<String>) {
         self.request_redraw();
     }
 
@@ -938,20 +939,14 @@ impl BottomPane {
             if self.status.is_none() && !self.unified_exec_footer.is_empty() {
                 flex.push(0, RenderableItem::Borrowed(&self.unified_exec_footer));
             }
-            let has_pending_thread_approvals = !self.pending_thread_approvals.is_empty();
             let has_queued_messages = !self.queued_user_messages.messages.is_empty();
             let has_status_or_footer =
                 self.status.is_some() || !self.unified_exec_footer.is_empty();
-            let has_inline_previews = has_pending_thread_approvals || has_queued_messages;
-            if has_inline_previews && has_status_or_footer {
-                flex.push(0, RenderableItem::Owned("".into()));
-            }
-            flex.push(1, RenderableItem::Borrowed(&self.pending_thread_approvals));
-            if has_pending_thread_approvals && has_queued_messages {
+            if has_queued_messages && has_status_or_footer {
                 flex.push(0, RenderableItem::Owned("".into()));
             }
             flex.push(1, RenderableItem::Borrowed(&self.queued_user_messages));
-            if !has_inline_previews && has_status_or_footer {
+            if !has_queued_messages && has_status_or_footer {
                 flex.push(0, RenderableItem::Owned("".into()));
             }
             let mut flex2 = FlexRenderable::new();
@@ -971,18 +966,6 @@ impl BottomPane {
         if self.composer.set_status_line_enabled(enabled) {
             self.request_redraw();
         }
-    }
-
-    /// Update the inactive-thread approval list shown above the composer.
-    pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
-        if self.pending_thread_approvals.set_threads(threads) {
-            self.request_redraw();
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn pending_thread_approvals(&self) -> &[String] {
-        self.pending_thread_approvals.threads()
     }
 }
 
