@@ -81,13 +81,7 @@ impl ChatWidget {
         )
     }
 
-    pub(super) fn should_render_realtime_user_message_event(
-        &self,
-        event: &UserMessageEvent,
-    ) -> bool {
-        if !self.realtime_conversation.is_live() {
-            return false;
-        }
+    pub(super) fn should_render_user_message_event(&self, event: &UserMessageEvent) -> bool {
         let key = Self::rendered_user_message_event_from_event(event);
         self.last_rendered_user_message_event.as_ref() != Some(&key)
     }

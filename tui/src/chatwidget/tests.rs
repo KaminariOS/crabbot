@@ -481,6 +481,37 @@ async fn replayed_user_message_with_only_local_images_does_not_render_history_ce
 }
 
 #[tokio::test]
+async fn live_user_message_event_renders_history_cell() {
+    let (mut chat, mut rx, _ops) = make_chatwidget_manual(None).await;
+
+    chat.handle_codex_event(Event {
+        id: "live-user-message".into(),
+        msg: EventMsg::UserMessage(UserMessageEvent {
+            message: "hello from another client".to_string(),
+            images: None,
+            text_elements: Vec::new(),
+            local_images: Vec::new(),
+        }),
+    });
+
+    let mut user_cell = None;
+    while let Ok(ev) = rx.try_recv() {
+        if let AppEvent::InsertHistoryCell(cell) = ev
+            && let Some(cell) = cell.as_any().downcast_ref::<UserHistoryCell>()
+        {
+            user_cell = Some(cell.message.clone());
+            break;
+        }
+    }
+
+    assert_eq!(
+        user_cell,
+        Some("hello from another client".to_string()),
+        "expected live user message to render in history",
+    );
+}
+
+#[tokio::test]
 async fn forked_thread_history_line_includes_name_and_id_snapshot() {
     let (chat, mut rx, _op_rx) = make_chatwidget_manual(None).await;
     let mut chat = chat;

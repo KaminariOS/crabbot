@@ -4448,7 +4448,7 @@ impl ChatWidget {
                 }
             }
             EventMsg::UserMessage(ev) => {
-                if from_replay || self.should_render_realtime_user_message_event(&ev) {
+                if from_replay || self.should_render_user_message_event(&ev) {
                     self.on_user_message_event(ev);
                 }
             }
