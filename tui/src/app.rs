@@ -1566,7 +1566,7 @@ impl App {
 
         let file_search = FileSearchManager::new(config.cwd.clone(), app_event_tx.clone());
         #[cfg(not(debug_assertions))]
-        let upgrade_version = crate::updates::get_upgrade_version(&config);
+        let upgrade_version: Option<String> = None;
 
         let mut app = Self {
             server: thread_manager.clone(),
