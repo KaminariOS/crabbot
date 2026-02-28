@@ -4400,6 +4400,15 @@ impl ChatWidget {
         self.bottom_pane.set_queued_user_messages(messages);
     }
 
+    pub(crate) fn set_pending_thread_approvals(&mut self, threads: Vec<String>) {
+        self.bottom_pane.set_pending_thread_approvals(threads);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pending_thread_approvals(&self) -> &[String] {
+        self.bottom_pane.pending_thread_approvals()
+    }
+
     pub(crate) fn add_diff_in_progress(&mut self) {
         self.request_redraw();
     }
@@ -7077,7 +7086,7 @@ impl ChatWidget {
         self.bottom_pane.clear_esc_backtrack_hint();
     }
     /// Forward an `Op` directly to codex.
-    pub(crate) fn submit_op(&mut self, op: Op) {
+    pub(crate) fn submit_op(&mut self, op: Op) -> bool {
         // Record outbound operation for session replay fidelity.
         crate::session_log::log_outbound_op(&op);
         if matches!(&op, Op::Review { .. }) && !self.bottom_pane.is_task_running() {
@@ -7085,7 +7094,9 @@ impl ChatWidget {
         }
         if let Err(e) = self.codex_op_tx.send(op) {
             tracing::error!("failed to submit op: {e}");
+            return false;
         }
+        true
     }
 
     fn on_list_mcp_tools(&mut self, ev: McpListToolsResponseEvent) {

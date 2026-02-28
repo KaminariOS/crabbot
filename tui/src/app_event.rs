@@ -75,6 +75,9 @@ pub(crate) enum AppEvent {
     /// bubbling channels through layers of widgets.
     CodexOp(codex_protocol::protocol::Op),
 
+    /// Recompute inactive-thread pending approvals and refresh the footer indicator.
+    RefreshPendingThreadApprovals,
+
     /// Kick off an asynchronous file search for the given query (text after
     /// the `@`). Previous searches may be cancelled by the app layer so there
     /// is at most one in-flight search.

@@ -99,6 +99,9 @@ use tokio::sync::mpsc::error::TrySendError;
 use tokio::sync::mpsc::unbounded_channel;
 use toml::Value as TomlValue;
 
+mod pending_interactive_replay;
+use self::pending_interactive_replay::PendingInteractiveReplayState;
+
 const EXTERNAL_EDITOR_HINT: &str = "Save and close external editor to continue.";
 const THREAD_EVENT_CHANNEL_CAPACITY: usize = 32768;
 /// Baseline cadence for periodic stream commit animation ticks.
@@ -247,6 +250,7 @@ struct ThreadEventStore {
     session_configured: Option<Event>,
     buffer: VecDeque<Event>,
     user_message_ids: HashSet<String>,
+    pending_interactive_replay: PendingInteractiveReplayState,
     capacity: usize,
     active: bool,
 }
@@ -257,6 +261,7 @@ impl ThreadEventStore {
             session_configured: None,
             buffer: VecDeque::new(),
             user_message_ids: HashSet::new(),
+            pending_interactive_replay: PendingInteractiveReplayState::default(),
             capacity,
             active: false,
         }
@@ -269,6 +274,7 @@ impl ThreadEventStore {
     }
 
     fn push_event(&mut self, event: Event) {
+        self.pending_interactive_replay.note_event(&event);
         let _ = self.push_event_for_delivery(event);
     }
 
@@ -308,18 +314,44 @@ impl ThreadEventStore {
         self.buffer.push_back(event);
         if self.buffer.len() > self.capacity
             && let Some(removed) = self.buffer.pop_front()
-            && matches!(removed.msg, EventMsg::UserMessage(_))
-            && !removed.id.is_empty()
         {
-            self.user_message_ids.remove(&removed.id);
+            self.pending_interactive_replay.note_evicted_event(&removed);
+            if matches!(removed.msg, EventMsg::UserMessage(_)) && !removed.id.is_empty() {
+                self.user_message_ids.remove(&removed.id);
+            }
         }
     }
 
     fn snapshot(&self) -> ThreadEventSnapshot {
         ThreadEventSnapshot {
             session_configured: self.session_configured.clone(),
-            events: self.buffer.iter().cloned().collect(),
+            events: self
+                .buffer
+                .iter()
+                .filter(|event| {
+                    self.pending_interactive_replay
+                        .should_replay_snapshot_event(event)
+                })
+                .cloned()
+                .collect(),
         }
+    }
+
+    fn note_outbound_op(&mut self, op: &Op) {
+        self.pending_interactive_replay.note_outbound_op(op);
+    }
+
+    fn op_can_change_pending_replay_state(op: &Op) -> bool {
+        PendingInteractiveReplayState::op_can_change_state(op)
+    }
+
+    fn event_can_change_pending_thread_approvals(event: &Event) -> bool {
+        PendingInteractiveReplayState::event_can_change_pending_thread_approvals(event)
+    }
+
+    fn has_pending_thread_approvals(&self) -> bool {
+        self.pending_interactive_replay
+            .has_pending_thread_approvals()
     }
 }
 
@@ -720,6 +752,7 @@ impl App {
         };
         self.active_thread_id = Some(thread_id);
         self.active_thread_rx = receiver;
+        self.refresh_pending_thread_approvals().await;
     }
 
     async fn store_active_thread_receiver(&mut self) {
@@ -741,31 +774,10 @@ impl App {
         thread_id: ThreadId,
     ) -> Option<(mpsc::Receiver<Event>, ThreadEventSnapshot)> {
         let channel = self.thread_event_channels.get_mut(&thread_id)?;
-        let mut receiver = channel.receiver.take()?;
-        // While this thread was inactive, we buffered events in `ThreadEventStore` but may still
-        // have stale queued items left in the per-thread receiver from when it was last active.
-        // Drop those queued items before taking the replay snapshot to avoid double-applying them
-        // (snapshot replay + immediate receiver drain).
-        let mut dropped_stale_events = 0usize;
-        loop {
-            match receiver.try_recv() {
-                Ok(_) => {
-                    dropped_stale_events = dropped_stale_events.saturating_add(1);
-                }
-                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
-            }
-        }
+        let receiver = channel.receiver.take()?;
         let mut store = channel.store.lock().await;
         store.active = true;
         let snapshot = store.snapshot();
-        if dropped_stale_events > 0 {
-            tracing::debug!(
-                thread_id = %thread_id,
-                dropped_stale_events,
-                replay_events = snapshot.events.len(),
-                "dropped stale queued thread events before replay"
-            );
-        }
         Some((receiver, snapshot))
     }
 
@@ -774,9 +786,61 @@ impl App {
             self.set_thread_active(active_id, false).await;
         }
         self.active_thread_rx = None;
+        self.refresh_pending_thread_approvals().await;
+    }
+
+    async fn note_active_thread_outbound_op(&mut self, op: &Op) {
+        if !ThreadEventStore::op_can_change_pending_replay_state(op) {
+            return;
+        }
+        let Some(thread_id) = self.active_thread_id else {
+            return;
+        };
+        let Some(channel) = self.thread_event_channels.get(&thread_id) else {
+            return;
+        };
+        let mut store = channel.store.lock().await;
+        store.note_outbound_op(op);
+    }
+
+    async fn refresh_pending_thread_approvals(&mut self) {
+        let channels: Vec<(ThreadId, Arc<Mutex<ThreadEventStore>>)> = self
+            .thread_event_channels
+            .iter()
+            .map(|(thread_id, channel)| (*thread_id, Arc::clone(&channel.store)))
+            .collect();
+
+        let mut pending_thread_ids = Vec::new();
+        for (thread_id, store) in channels {
+            if Some(thread_id) == self.active_thread_id {
+                continue;
+            }
+
+            let store = store.lock().await;
+            if store.has_pending_thread_approvals() {
+                pending_thread_ids.push(thread_id);
+            }
+        }
+
+        pending_thread_ids.sort_by_key(ThreadId::to_string);
+        let threads = pending_thread_ids
+            .into_iter()
+            .map(|thread_id| {
+                if self.primary_thread_id == Some(thread_id) {
+                    "Main [default]".to_string()
+                } else {
+                    let thread_id = thread_id.to_string();
+                    let short_id: String = thread_id.chars().take(8).collect();
+                    format!("Agent ({short_id})")
+                }
+            })
+            .collect();
+        self.chat_widget.set_pending_thread_approvals(threads);
     }
 
     async fn enqueue_thread_event(&mut self, thread_id: ThreadId, event: Event) -> Result<()> {
+        let refresh_pending_thread_approvals =
+            ThreadEventStore::event_can_change_pending_thread_approvals(&event);
         let (sender, store) = {
             let channel = self.ensure_thread_channel(thread_id);
             (channel.sender.clone(), Arc::clone(&channel.store))
@@ -805,6 +869,9 @@ impl App {
                     tracing::warn!("thread {thread_id} event channel closed");
                 }
             }
+        }
+        if refresh_pending_thread_approvals {
+            self.refresh_pending_thread_approvals().await;
         }
         Ok(())
     }
@@ -959,6 +1026,7 @@ impl App {
         self.active_thread_rx = None;
         self.primary_thread_id = None;
         self.pending_primary_events.clear();
+        self.chat_widget.set_pending_thread_approvals(Vec::new());
     }
 
     async fn drain_active_thread_events(&mut self, tui: &mut tui::Tui) -> Result<()> {
@@ -1716,7 +1784,16 @@ impl App {
                 return Ok(AppRunControl::Exit(ExitReason::Fatal(message)));
             }
             AppEvent::CodexOp(op) => {
-                self.chat_widget.submit_op(op);
+                let replay_state_op =
+                    ThreadEventStore::op_can_change_pending_replay_state(&op).then(|| op.clone());
+                let submitted = self.chat_widget.submit_op(op);
+                if submitted && let Some(op) = replay_state_op.as_ref() {
+                    self.note_active_thread_outbound_op(op).await;
+                    self.refresh_pending_thread_approvals().await;
+                }
+            }
+            AppEvent::RefreshPendingThreadApprovals => {
+                self.refresh_pending_thread_approvals().await;
             }
             AppEvent::DiffResult(text) => {
                 // Clear the in-progress state in the bottom pane
@@ -2751,6 +2828,7 @@ impl App {
             ThreadEventChannel::new_with_session_configured(THREAD_EVENT_CHANNEL_CAPACITY, event);
         let sender = channel.sender.clone();
         let store = Arc::clone(&channel.store);
+        let app_event_tx = self.app_event_tx.clone();
         self.thread_event_channels.insert(thread_id, channel);
         tokio::spawn(async move {
             loop {
@@ -2761,11 +2839,16 @@ impl App {
                         break;
                     }
                 };
+                let refresh_pending_thread_approvals =
+                    ThreadEventStore::event_can_change_pending_thread_approvals(&event);
                 let (event_to_send, should_send) = {
                     let mut guard = store.lock().await;
                     let event_to_send = guard.push_event_for_delivery(event);
                     (event_to_send, guard.active)
                 };
+                if refresh_pending_thread_approvals {
+                    app_event_tx.send(AppEvent::RefreshPendingThreadApprovals);
+                }
                 if should_send
                     && let Some(event_to_send) = event_to_send
                     && let Err(err) = sender.send(event_to_send).await

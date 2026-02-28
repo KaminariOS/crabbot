@@ -1761,8 +1761,17 @@ struct CodexThreadState {
     next_submission_id: u64,
     current_turn_id: Option<String>,
     pending_events: VecDeque<crate::protocol::Event>,
+    pending_server_requests: HashMap<String, PendingServerRequest>,
+    pending_request_user_input_by_turn_id: HashMap<String, VecDeque<String>>,
     config_snapshot: ThreadConfigSnapshot,
     rollout_path: Option<std::path::PathBuf>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingServerRequest {
+    request_id: Value,
+    method: String,
+    turn_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1777,6 +1786,37 @@ pub struct ThreadConfigSnapshot {
 }
 
 impl CodexThread {
+    fn request_id_to_key(request_id: &crate::mcp::RequestId) -> String {
+        match request_id {
+            crate::mcp::RequestId::String(id) => id.clone(),
+            crate::mcp::RequestId::Integer(id) => id.to_string(),
+        }
+    }
+
+    fn cleanup_pending_requests_for_turn(state: &mut CodexThreadState, turn_id: &str) {
+        let stale_keys: Vec<String> = state
+            .pending_server_requests
+            .iter()
+            .filter_map(|(key, pending)| {
+                (pending.turn_id.as_deref() == Some(turn_id)).then(|| key.clone())
+            })
+            .collect();
+        for key in stale_keys {
+            state.pending_server_requests.remove(&key);
+        }
+        state.pending_request_user_input_by_turn_id.remove(turn_id);
+    }
+
+    fn cleanup_pending_request_by_key(state: &mut CodexThreadState, request_key: &str) {
+        state.pending_server_requests.remove(request_key);
+        for queue in state.pending_request_user_input_by_turn_id.values_mut() {
+            queue.retain(|queued_key| queued_key != request_key);
+        }
+        state
+            .pending_request_user_input_by_turn_id
+            .retain(|_, queue| !queue.is_empty());
+    }
+
     fn new(
         thread_id: ThreadId,
         config_snapshot: ThreadConfigSnapshot,
@@ -1792,6 +1832,8 @@ impl CodexThread {
                 next_submission_id: 1,
                 current_turn_id: None,
                 pending_events: VecDeque::new(),
+                pending_server_requests: HashMap::new(),
+                pending_request_user_input_by_turn_id: HashMap::new(),
                 config_snapshot,
                 rollout_path,
             })),
@@ -2353,11 +2395,157 @@ impl CodexThread {
                     ),
                 )?;
             }
-            crate::protocol::Op::ExecApproval { .. }
-            | crate::protocol::Op::PatchApproval { .. }
-            | crate::protocol::Op::ResolveElicitation { .. }
-            | crate::protocol::Op::UserInputAnswer { .. }
-            | crate::protocol::Op::DynamicToolResponse { .. }
+            crate::protocol::Op::ExecApproval { id, decision, .. } => {
+                let approve = !matches!(decision, crate::protocol::ReviewDecision::Abort);
+                let pending = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+                    state.pending_server_requests.remove(&id)
+                };
+                let Some(pending) = pending else {
+                    return Err(CodexError::new(format!(
+                        "missing pending exec approval request mapping for id: {id}"
+                    )));
+                };
+                let decision = match pending.method.as_str() {
+                    "execCommandApproval" | "applyPatchApproval" => {
+                        if approve {
+                            "approved"
+                        } else {
+                            "denied"
+                        }
+                    }
+                    _ => {
+                        if approve {
+                            "accept"
+                        } else {
+                            "decline"
+                        }
+                    }
+                };
+                app_server_rpc_respond(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    pending.request_id,
+                    json!({ "decision": decision }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit exec approval response failed: {err}"))
+                })?;
+            }
+            crate::protocol::Op::PatchApproval { id, decision } => {
+                let approve = !matches!(decision, crate::protocol::ReviewDecision::Abort);
+                let pending = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+                    state.pending_server_requests.remove(&id)
+                };
+                let Some(pending) = pending else {
+                    return Err(CodexError::new(format!(
+                        "missing pending patch approval request mapping for id: {id}"
+                    )));
+                };
+                let decision = match pending.method.as_str() {
+                    "execCommandApproval" | "applyPatchApproval" => {
+                        if approve {
+                            "approved"
+                        } else {
+                            "denied"
+                        }
+                    }
+                    _ => {
+                        if approve {
+                            "accept"
+                        } else {
+                            "decline"
+                        }
+                    }
+                };
+                app_server_rpc_respond(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    pending.request_id,
+                    json!({ "decision": decision }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit patch approval response failed: {err}"))
+                })?;
+            }
+            crate::protocol::Op::ResolveElicitation {
+                request_id,
+                decision,
+                ..
+            } => {
+                let key = Self::request_id_to_key(&request_id);
+                let pending = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+                    state.pending_server_requests.remove(&key)
+                };
+                let Some(pending) = pending else {
+                    return Err(CodexError::new(format!(
+                        "missing pending elicitation request mapping for id: {key}"
+                    )));
+                };
+                let decision = match decision {
+                    crate::protocol::ElicitationAction::Accept => "accept",
+                    crate::protocol::ElicitationAction::Decline => "decline",
+                    crate::protocol::ElicitationAction::Cancel => "cancel",
+                };
+                app_server_rpc_respond(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    pending.request_id,
+                    json!({ "decision": decision }),
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit elicitation response failed: {err}"))
+                })?;
+            }
+            crate::protocol::Op::UserInputAnswer { id, response } => {
+                let pending = {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .map_err(|_| CodexError::new("codex thread mutex poisoned"))?;
+                    let key = state
+                        .pending_request_user_input_by_turn_id
+                        .get_mut(&id)
+                        .and_then(|queue| queue.pop_front());
+                    if let Some(queue) = state.pending_request_user_input_by_turn_id.get(&id)
+                        && queue.is_empty()
+                    {
+                        state.pending_request_user_input_by_turn_id.remove(&id);
+                    }
+                    key.and_then(|key| state.pending_server_requests.remove(&key))
+                };
+                let Some(pending) = pending else {
+                    return Err(CodexError::new(format!(
+                        "missing pending request_user_input mapping for turn id: {id}"
+                    )));
+                };
+                let result = serde_json::to_value(response).map_err(|err| {
+                    CodexError::new(format!(
+                        "serialize request_user_input response failed: {err}"
+                    ))
+                })?;
+                app_server_rpc_respond(
+                    &endpoint,
+                    auth_token.as_deref(),
+                    pending.request_id,
+                    result,
+                )
+                .map_err(|err| {
+                    CodexError::new(format!("submit request_user_input response failed: {err}"))
+                })?;
+            }
+            crate::protocol::Op::DynamicToolResponse { .. }
             | crate::protocol::Op::Undo
             | crate::protocol::Op::DropMemories
             | crate::protocol::Op::UpdateMemories
@@ -2612,7 +2800,249 @@ impl CodexThread {
                     }),
                 })
             }
+            "serverRequest/resolved" => Some(crate::protocol::Event {
+                id: format!("seq-{sequence}"),
+                msg: crate::protocol::EventMsg::BackgroundEvent(
+                    crate::protocol::BackgroundEventEvent {
+                        message: "server request resolved".to_string(),
+                    },
+                ),
+            }),
             _ => None,
+        }
+    }
+
+    fn command_vec_from_value(value: Option<&Value>) -> Vec<String> {
+        match value {
+            Some(Value::Array(items)) => items
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect(),
+            Some(Value::String(command)) => vec![command.clone()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn fallback_events_from_server_request(
+        sequence: u64,
+        request: &crabbot_protocol::DaemonRpcServerRequest,
+        state: &mut CodexThreadState,
+    ) -> Vec<crate::protocol::Event> {
+        let request_key = request_id_key_for_cli(&request.request_id);
+        let turn_id = request
+            .params
+            .get("turnId")
+            .or_else(|| request.params.get("turn_id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+
+        match request.method.as_str() {
+            "item/commandExecution/requestApproval" | "execCommandApproval" => {
+                let operation_id = request
+                    .params
+                    .get("id")
+                    .or_else(|| request.params.get("callId"))
+                    .or_else(|| request.params.get("itemId"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| request_key.clone());
+                state.pending_server_requests.insert(
+                    operation_id.clone(),
+                    PendingServerRequest {
+                        request_id: request.request_id.clone(),
+                        method: request.method.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let command = Self::command_vec_from_value(
+                    request
+                        .params
+                        .get("command")
+                        .or_else(|| request.params.get("cmd")),
+                );
+                let cwd = request
+                    .params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from)
+                    .unwrap_or_else(|| {
+                        std::env::current_dir().unwrap_or_else(|_| std::env::temp_dir())
+                    });
+                let reason = request
+                    .params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let network_approval_context = request
+                    .params
+                    .get("networkApprovalContext")
+                    .or_else(|| request.params.get("network_approval_context"))
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok());
+                let proposed_execpolicy_amendment = request
+                    .params
+                    .get("proposedExecpolicyAmendment")
+                    .or_else(|| request.params.get("proposed_execpolicy_amendment"))
+                    .cloned();
+                vec![crate::protocol::Event {
+                    id: format!("seq-{sequence}"),
+                    msg: crate::protocol::EventMsg::ExecApprovalRequest(
+                        crate::protocol::ExecApprovalRequestEvent {
+                            call_id: operation_id,
+                            approval_id: request
+                                .params
+                                .get("approvalId")
+                                .or_else(|| request.params.get("approval_id"))
+                                .and_then(Value::as_str)
+                                .map(ToString::to_string),
+                            turn_id: turn_id.unwrap_or_default(),
+                            command,
+                            cwd,
+                            reason,
+                            network_approval_context,
+                            proposed_execpolicy_amendment: proposed_execpolicy_amendment
+                                .and_then(|value| serde_json::from_value(value).ok()),
+                            parsed_cmd: Vec::new(),
+                        },
+                    ),
+                }]
+            }
+            "item/fileChange/requestApproval" | "applyPatchApproval" => {
+                let operation_id = request
+                    .params
+                    .get("id")
+                    .or_else(|| request.params.get("callId"))
+                    .or_else(|| request.params.get("itemId"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| request_key.clone());
+                state.pending_server_requests.insert(
+                    operation_id.clone(),
+                    PendingServerRequest {
+                        request_id: request.request_id.clone(),
+                        method: request.method.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let reason = request
+                    .params
+                    .get("reason")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string);
+                let changes = request
+                    .params
+                    .get("changes")
+                    .or_else(|| request.params.get("fileChanges"))
+                    .cloned()
+                    .and_then(|value| {
+                        serde_json::from_value::<
+                            HashMap<std::path::PathBuf, crate::protocol::FileChange>,
+                        >(value)
+                        .ok()
+                    })
+                    .unwrap_or_default();
+                let grant_root = request
+                    .params
+                    .get("grantRoot")
+                    .or_else(|| request.params.get("grant_root"))
+                    .and_then(Value::as_str)
+                    .map(std::path::PathBuf::from);
+                vec![crate::protocol::Event {
+                    id: format!("seq-{sequence}"),
+                    msg: crate::protocol::EventMsg::ApplyPatchApprovalRequest(
+                        crate::protocol::ApplyPatchApprovalRequestEvent {
+                            call_id: operation_id,
+                            turn_id: turn_id.unwrap_or_default(),
+                            changes,
+                            reason,
+                            grant_root,
+                        },
+                    ),
+                }]
+            }
+            "item/tool/elicit" | "item/mcpToolCall/requestApproval" => {
+                let elicitation_request_id = request
+                    .params
+                    .get("requestId")
+                    .or_else(|| request.params.get("request_id"))
+                    .and_then(Value::as_str)
+                    .map(|s| crate::mcp::RequestId::String(s.to_string()))
+                    .unwrap_or_else(|| crate::mcp::RequestId::String(request_key.clone()));
+                let elicitation_key = Self::request_id_to_key(&elicitation_request_id);
+                state.pending_server_requests.insert(
+                    elicitation_key,
+                    PendingServerRequest {
+                        request_id: request.request_id.clone(),
+                        method: request.method.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let server_name = request
+                    .params
+                    .get("serverName")
+                    .or_else(|| request.params.get("server_name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("mcp")
+                    .to_string();
+                let message = request
+                    .params
+                    .get("message")
+                    .or_else(|| request.params.get("prompt"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP tool needs your approval.")
+                    .to_string();
+                vec![crate::protocol::Event {
+                    id: format!("seq-{sequence}"),
+                    msg: crate::protocol::EventMsg::ElicitationRequest(
+                        crate::protocol::ElicitationRequestEvent {
+                            server_name,
+                            id: elicitation_request_id,
+                            message,
+                        },
+                    ),
+                }]
+            }
+            "item/tool/requestUserInput" => {
+                state.pending_server_requests.insert(
+                    request_key.clone(),
+                    PendingServerRequest {
+                        request_id: request.request_id.clone(),
+                        method: request.method.clone(),
+                        turn_id: turn_id.clone(),
+                    },
+                );
+                let turn_id = turn_id.unwrap_or_default();
+                state
+                    .pending_request_user_input_by_turn_id
+                    .entry(turn_id.clone())
+                    .or_default()
+                    .push_back(request_key.clone());
+                let call_id = request
+                    .params
+                    .get("callId")
+                    .or_else(|| request.params.get("call_id"))
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or(request_key);
+                let questions = request
+                    .params
+                    .get("questions")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value(value).ok())
+                    .unwrap_or_default();
+                vec![crate::protocol::Event {
+                    id: format!("seq-{sequence}"),
+                    msg: crate::protocol::EventMsg::RequestUserInput(
+                        crate::request_user_input::RequestUserInputEvent {
+                            call_id,
+                            turn_id,
+                            questions,
+                        },
+                    ),
+                }]
+            }
+            _ => Vec::new(),
         }
     }
 
@@ -2656,36 +3086,89 @@ impl CodexThread {
                     state.last_sequence = envelope.sequence;
                     match envelope.event {
                         crabbot_protocol::DaemonRpcStreamEvent::Notification(notification) => {
+                            let resolved_request_key =
+                                if notification.method == "serverRequest/resolved" {
+                                    notification
+                                        .params
+                                        .get("requestId")
+                                        .or_else(|| notification.params.get("request_id"))
+                                        .map(|value| match value {
+                                            Value::String(id) => Some(id.clone()),
+                                            Value::Number(id) => Some(id.to_string()),
+                                            _ => None,
+                                        })
+                                        .unwrap_or(None)
+                                } else {
+                                    None
+                                };
                             let mapped = Self::fallback_event_from_notification(
                                 envelope.sequence,
                                 &notification,
                             );
-                            if let Some(mut event) = mapped {
-                                match &mut event.msg {
-                                    crate::protocol::EventMsg::TurnStarted(payload) => {
-                                        state.current_turn_id = Some(payload.turn_id.clone());
-                                    }
-                                    crate::protocol::EventMsg::TurnComplete(_)
-                                    | crate::protocol::EventMsg::TurnAborted(_) => {
-                                        state.current_turn_id = None;
-                                    }
-                                    _ => {}
-                                }
+                            if let Some(event) = mapped {
                                 if let crate::protocol::EventMsg::TurnStarted(payload) = &event.msg
                                 {
+                                    if let Some(previous_turn_id) = state.current_turn_id.clone() {
+                                        if previous_turn_id != payload.turn_id {
+                                            Self::cleanup_pending_requests_for_turn(
+                                                &mut state,
+                                                &previous_turn_id,
+                                            );
+                                        }
+                                    }
                                     state.current_turn_id = Some(payload.turn_id.clone());
                                 } else if matches!(
                                     &event.msg,
                                     crate::protocol::EventMsg::TurnComplete(_)
                                         | crate::protocol::EventMsg::TurnAborted(_)
                                 ) {
+                                    if let crate::protocol::EventMsg::TurnComplete(payload) =
+                                        &event.msg
+                                    {
+                                        Self::cleanup_pending_requests_for_turn(
+                                            &mut state,
+                                            &payload.turn_id,
+                                        );
+                                    } else if let crate::protocol::EventMsg::TurnAborted(payload) =
+                                        &event.msg
+                                        && let Some(turn_id) = payload.turn_id.as_deref()
+                                    {
+                                        Self::cleanup_pending_requests_for_turn(
+                                            &mut state, turn_id,
+                                        );
+                                    }
                                     state.current_turn_id = None;
+                                }
+                                if let Some(request_key) = resolved_request_key.as_deref() {
+                                    Self::cleanup_pending_request_by_key(&mut state, request_key);
                                 }
                                 state.pending_events.push_back(event);
                             }
                         }
-                        crabbot_protocol::DaemonRpcStreamEvent::ServerRequest(_)
-                        | crabbot_protocol::DaemonRpcStreamEvent::DecodeError(_) => {}
+                        crabbot_protocol::DaemonRpcStreamEvent::ServerRequest(request) => {
+                            let mapped = Self::fallback_events_from_server_request(
+                                envelope.sequence,
+                                &request,
+                                &mut state,
+                            );
+                            for event in mapped {
+                                state.pending_events.push_back(event);
+                            }
+                        }
+                        crabbot_protocol::DaemonRpcStreamEvent::DecodeError(err) => {
+                            state.pending_events.push_back(crate::protocol::Event {
+                                id: format!("seq-{}", envelope.sequence),
+                                msg: crate::protocol::EventMsg::Error(
+                                    crate::protocol::ErrorEvent {
+                                        message: format!(
+                                            "app-server stream decode error: {}",
+                                            err.message
+                                        ),
+                                        codex_error_info: None,
+                                    },
+                                ),
+                            });
+                        }
                     }
                 }
                 if let Some(event) = state.pending_events.pop_front() {
@@ -6016,6 +6499,7 @@ impl AppServerWsClient {
             | "item/fileChange/requestApproval"
             | "item/mcpToolCall/requestApproval"
             | "item/tool/elicit"
+            | "item/tool/requestUserInput"
             | "execCommandApproval"
             | "applyPatchApproval" => Ok(()),
             // We don't support dynamic tool execution yet; decline gracefully.
@@ -6030,11 +6514,6 @@ impl AppServerWsClient {
                         }
                     ]
                 }
-            })),
-            // Keep protocol unblocked with a schema-compliant empty answer map.
-            "item/tool/requestUserInput" => self.send_json(&json!({
-                "id": request.request_id,
-                "result": { "answers": {} }
             })),
             // Unknown server-initiated request: reply with standard JSON-RPC method-not-found.
             _ => self.send_rpc_error(
