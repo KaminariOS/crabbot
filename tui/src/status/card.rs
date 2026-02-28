@@ -41,7 +41,7 @@ use super::rate_limits::compose_rate_limit_data_many;
 use super::rate_limits::format_status_limit_summary;
 use super::rate_limits::render_status_limit_progress_bar;
 use crate::wrapping::RtOptions;
-use crate::wrapping::word_wrap_lines;
+use crate::wrapping::adaptive_wrap_lines;
 use codex_core::AuthManager;
 
 #[derive(Debug, Clone)]
@@ -185,7 +185,10 @@ impl StatusHistoryCell {
             config_entries.push(("reasoning effort", effort_value));
             config_entries.push((
                 "reasoning summaries",
-                config.model_reasoning_summary.to_string(),
+                config
+                    .model_reasoning_summary
+                    .map(|summary| summary.to_string())
+                    .unwrap_or_else(|| "auto".to_string()),
             ));
         }
         let (model_name, model_details) = compose_model_display(model_name, &config_entries);
@@ -479,7 +482,7 @@ impl HistoryCell for StatusHistoryCell {
         let note_second_line = Line::from(vec![
             Span::from("information on rate limits and credits").cyan(),
         ]);
-        let note_lines = word_wrap_lines(
+        let note_lines = adaptive_wrap_lines(
             [note_first_line, note_second_line],
             RtOptions::new(available_inner_width),
         );

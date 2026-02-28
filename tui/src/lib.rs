@@ -72,6 +72,7 @@ extern crate self as codex_utils_cli;
 extern crate self as codex_utils_elapsed;
 extern crate self as codex_utils_sandbox_summary;
 extern crate self as codex_utils_sleep_inhibitor;
+extern crate self as codex_utils_string;
 extern crate self as rmcp;
 
 const LEGACY_NOTIFICATIONS_TO_OPT_OUT: &[&str] = &[
@@ -457,6 +458,7 @@ pub mod config {
         use serde::Deserializer;
         use serde::Serialize;
         use serde::de::Error as SerdeError;
+        use std::collections::BTreeMap;
         use std::collections::HashMap;
         use std::path::PathBuf;
         use std::time::Duration;
@@ -478,6 +480,11 @@ pub mod config {
                     NotificationMethod::Bel => f.write_str("bel"),
                 }
             }
+        }
+
+        #[derive(Debug, Clone, Default)]
+        pub struct ModelAvailabilityNuxConfig {
+            pub shown_count: BTreeMap<String, u32>,
         }
 
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -799,6 +806,9 @@ pub mod config {
         pub fn get(&self) -> &BTreeMap<String, types::McpServerConfig> {
             &self.0
         }
+        pub fn set(&mut self, map: BTreeMap<String, types::McpServerConfig>) {
+            self.0 = map;
+        }
         pub fn is_empty(&self) -> bool {
             self.0.is_empty()
         }
@@ -835,7 +845,8 @@ pub mod config {
         pub model_provider_id: String,
         pub model_provider: ConfigModelProvider,
         pub permissions: Permissions,
-        pub model_reasoning_summary: ReasoningSummary,
+        pub model_reasoning_summary: Option<ReasoningSummary>,
+        pub model_availability_nux: types::ModelAvailabilityNuxConfig,
         pub model_reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
         pub plan_mode_reasoning_effort: Option<crate::openai_models::ReasoningEffort>,
         pub model_context_window: Option<i64>,
@@ -916,7 +927,8 @@ pub mod config {
                     network: None,
                     windows_sandbox_mode: None,
                 },
-                model_reasoning_summary: ReasoningSummary::Auto,
+                model_reasoning_summary: Some(ReasoningSummary::Auto),
+                model_availability_nux: types::ModelAvailabilityNuxConfig::default(),
                 model_reasoning_effort: None,
                 plan_mode_reasoning_effort: None,
                 model_context_window: None,
@@ -1302,7 +1314,7 @@ pub mod config {
             }
             "model_reasoning_summary" => {
                 if let Ok(summary) = value.clone().try_into::<ReasoningSummary>() {
-                    config.model_reasoning_summary = summary;
+                    config.model_reasoning_summary = Some(summary);
                 }
             }
             "model_reasoning_effort" => {
@@ -1652,6 +1664,18 @@ pub mod config {
             pub fn set_feature_enabled(self, _feature_key: &str, _enabled: bool) -> Self {
                 self
             }
+            pub fn set_realtime_speaker(self, _speaker: Option<&str>) -> Self {
+                self
+            }
+            pub fn set_realtime_microphone(self, _microphone: Option<&str>) -> Self {
+                self
+            }
+            pub fn set_model_availability_nux_count(
+                self,
+                _shown_count: &std::collections::BTreeMap<String, u32>,
+            ) -> Self {
+                self
+            }
             pub fn set_hide_full_access_warning(self, _value: bool) -> Self {
                 self
             }
@@ -1673,6 +1697,13 @@ pub mod config {
             ConfigEdit::SetPath {
                 segments: vec!["tui_status_line".to_string()],
                 value: serde_json::json!(ids),
+            }
+        }
+
+        pub fn syntax_theme_edit(name: &str) -> ConfigEdit {
+            ConfigEdit::SetPath {
+                segments: vec!["tui_theme".to_string()],
+                value: serde_json::json!(name),
             }
         }
     }
@@ -3433,6 +3464,7 @@ impl Default for ThreadManager {
             std::sync::Arc::new(crate::AuthManager::default()),
             crate::protocol::SessionSource::Cli,
             None,
+            crate::models_manager::collaboration_mode_presets::CollaborationModesConfig::default(),
         )
     }
 }
@@ -3443,6 +3475,7 @@ impl ThreadManager {
         _auth_manager: std::sync::Arc<crate::AuthManager>,
         _session_source: crate::protocol::SessionSource,
         _model_catalog: Option<serde_json::Value>,
+        _collaboration_modes: crate::models_manager::collaboration_mode_presets::CollaborationModesConfig,
     ) -> Self {
         let (thread_created_tx, _) = tokio::sync::broadcast::channel(64);
         Self {
@@ -3759,6 +3792,7 @@ impl RolloutRecorder {
         _sources: &[crate::protocol::SessionSource],
         _provider_filter: Option<&[String]>,
         _default_provider: &str,
+        _include_archived: Option<bool>,
     ) -> std::io::Result<ThreadsPage> {
         let backend = get_shim_backend_config();
         let sort_key = match sort_key {
@@ -4051,6 +4085,7 @@ pub mod features {
         SearchTool,
         UseLinuxSandboxBwrap,
         RequestRule,
+        DefaultModeRequestUserInput,
         WindowsSandbox,
         WindowsSandboxElevated,
         Steer,
@@ -4249,6 +4284,12 @@ pub mod features {
             stage: FeatureStage::Stable,
         },
         FeatureSpec {
+            id: Feature::DefaultModeRequestUserInput,
+            key: "default_mode_request_user_input",
+            default_enabled: false,
+            stage: FeatureStage::Stable,
+        },
+        FeatureSpec {
             id: Feature::WindowsSandbox,
             key: "windows_sandbox",
             default_enabled: false,
@@ -4286,7 +4327,6 @@ pub mod skills {
             pub permission_profile: Option<serde_json::Value>,
             pub permissions: Option<serde_json::Value>,
             pub path_to_skills_md: std::path::PathBuf,
-            pub path: std::path::PathBuf,
             pub scope: codex_protocol::protocol::SkillScope,
         }
     }
@@ -5013,6 +5053,13 @@ pub mod config_loader {
 }
 
 pub mod models_manager {
+    pub mod collaboration_mode_presets {
+        #[derive(Debug, Clone, Default)]
+        pub struct CollaborationModesConfig {
+            pub default_mode_request_user_input: bool,
+        }
+    }
+
     pub mod model_presets {
         pub const HIDE_GPT_5_1_CODEX_MAX_MIGRATION_PROMPT_CONFIG: &str =
             "hide_gpt_5_1_codex_max_migration_prompt";
@@ -5267,6 +5314,40 @@ impl CodexLogSnapshot {
 
 pub fn summarize_sandbox_policy(policy: &protocol::SandboxPolicy) -> String {
     policy.to_string()
+}
+
+/// Convert markdown `#L...` hash suffixes to terminal-friendly `:line[:col]` form.
+pub fn normalize_markdown_hash_location_suffix(suffix: &str) -> Option<String> {
+    let fragment = suffix.strip_prefix('#')?;
+    let (start, end) = match fragment.split_once('-') {
+        Some((start, end)) => (start, Some(end)),
+        None => (fragment, None),
+    };
+    let (start_line, start_column) = parse_markdown_hash_location_point(start)?;
+    let mut normalized = String::from(":");
+    normalized.push_str(start_line);
+    if let Some(column) = start_column {
+        normalized.push(':');
+        normalized.push_str(column);
+    }
+    if let Some(end) = end {
+        let (end_line, end_column) = parse_markdown_hash_location_point(end)?;
+        normalized.push('-');
+        normalized.push_str(end_line);
+        if let Some(column) = end_column {
+            normalized.push(':');
+            normalized.push_str(column);
+        }
+    }
+    Some(normalized)
+}
+
+fn parse_markdown_hash_location_point(point: &str) -> Option<(&str, Option<&str>)> {
+    let point = point.strip_prefix('L')?;
+    match point.split_once('C') {
+        Some((line, column)) => Some((line, Some(column))),
+        None => Some((point, None)),
+    }
 }
 
 /// Upstream-compatible backing for `codex_utils_approval_presets`.
@@ -5578,7 +5659,9 @@ pub enum ResolveCwdOutcome {
 
 pub async fn resolve_cwd_for_resume_or_fork(
     _tui: &mut crate::tui::Tui,
+    _config: &crate::config::Config,
     current: &std::path::Path,
+    _thread_id: ThreadId,
     _path: &std::path::Path,
     _action: crate::cwd_prompt::CwdPromptAction,
     _allow_current: bool,
@@ -5731,14 +5814,8 @@ pub async fn run_startup_picker(
     let _ = crate::tui::restore();
 
     match selection {
-        resume_picker::SessionSelection::Resume(path)
-        | resume_picker::SessionSelection::Fork(path) => {
-            Ok(extract_thread_id_from_picker_path(&path).or_else(|| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .map(str::to_string)
-            }))
-        }
+        resume_picker::SessionSelection::Resume(target)
+        | resume_picker::SessionSelection::Fork(target) => Ok(Some(target.thread_id.to_string())),
         resume_picker::SessionSelection::StartFresh | resume_picker::SessionSelection::Exit => {
             Ok(None)
         }
@@ -5855,6 +5932,7 @@ async fn resolve_last_thread_id_for_cli(
         INTERACTIVE_SESSION_SOURCES,
         Some(provider_filter.as_slice()),
         default_provider.as_str(),
+        None,
     )
     .await
     .map_err(|err| anyhow!(err.to_string()))?;
@@ -5898,6 +5976,7 @@ async fn resolve_named_or_id_thread_id_for_cli(
             INTERACTIVE_SESSION_SOURCES,
             Some(provider_filter.as_slice()),
             default_provider.as_str(),
+            None,
         )
         .await
         .map_err(|err| anyhow!(err.to_string()))?;
@@ -5945,9 +6024,17 @@ async fn resolve_session_selection_from_args(
         }
         return Ok(match args.startup_picker {
             Some(StartupPicker::Fork) => {
-                resume_picker::SessionSelection::Fork(std::path::PathBuf::from(trimmed))
+                resume_picker::SessionSelection::Fork(resume_picker::SessionTarget {
+                    path: std::path::PathBuf::from(trimmed),
+                    thread_id: ThreadId::from_string(trimmed)
+                        .map_err(|_| anyhow!("invalid thread id: {trimmed}"))?,
+                })
             }
-            _ => resume_picker::SessionSelection::Resume(std::path::PathBuf::from(trimmed)),
+            _ => resume_picker::SessionSelection::Resume(resume_picker::SessionTarget {
+                path: std::path::PathBuf::from(trimmed),
+                thread_id: ThreadId::from_string(trimmed)
+                    .map_err(|_| anyhow!("invalid thread id: {trimmed}"))?,
+            }),
         });
     }
 
@@ -6068,7 +6155,7 @@ fn apply_tui_config_snapshot(config: &mut crate::config::Config, snapshot: &serd
         .cloned()
         .and_then(|value| serde_json::from_value::<crate::config::ReasoningSummary>(value).ok())
     {
-        config.model_reasoning_summary = reasoning_summary;
+        config.model_reasoning_summary = Some(reasoning_summary);
     }
 
     if let Some(reasoning_effort) = snapshot
@@ -6223,6 +6310,13 @@ fn extract_thread_id_from_picker_path(path: &std::path::Path) -> Option<String> 
         .into_iter()
         .find(|value| ThreadId::from_string(value).is_ok());
     matched
+}
+
+pub async fn resolve_session_thread_id(
+    path: &std::path::Path,
+    _codex_home: Option<&std::path::Path>,
+) -> Option<ThreadId> {
+    extract_thread_id_from_picker_path(path).and_then(|value| ThreadId::from_string(&value).ok())
 }
 
 fn parse_initial_messages_from_thread_rpc_result(

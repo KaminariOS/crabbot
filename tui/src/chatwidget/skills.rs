@@ -193,7 +193,6 @@ fn protocol_skill_to_core(skill: &ProtocolSkillMetadata) -> SkillMetadata {
         permission_profile: None,
         permissions: None,
         path_to_skills_md: skill.path.clone(),
-        path: skill.path.clone(),
         scope: skill.scope,
     }
 }
