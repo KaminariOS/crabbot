@@ -117,7 +117,6 @@ use codex_protocol::protocol::McpToolCallEndEvent;
 use codex_protocol::protocol::Op;
 use codex_protocol::protocol::PatchApplyBeginEvent;
 use codex_protocol::protocol::RateLimitSnapshot;
-use codex_protocol::protocol::ReviewDecision;
 use codex_protocol::protocol::ReviewRequest;
 use codex_protocol::protocol::ReviewTarget;
 use codex_protocol::protocol::SkillMetadata as ProtocolSkillMetadata;
@@ -2581,19 +2580,14 @@ impl ChatWidget {
             .unwrap_or_else(|_| ev.command.join(" "));
         self.notify(Notification::ExecApprovalRequested { command });
 
-        let available_decisions = vec![
-            ReviewDecision::Approved,
-            ReviewDecision::Abort,
-            ReviewDecision::ApprovedForSession,
-        ];
+        let available_decisions = ev.effective_available_decisions();
         let request = ApprovalRequest::Exec {
             id: ev.effective_approval_id(),
             command: ev.command,
             reason: ev.reason,
             available_decisions,
             network_approval_context: ev.network_approval_context,
-            additional_permissions: None,
-            proposed_execpolicy_amendment: ev.proposed_execpolicy_amendment,
+            additional_permissions: ev.additional_permissions,
         };
         self.bottom_pane
             .push_approval_request(request, &self.config.features);
@@ -4178,7 +4172,7 @@ impl ChatWidget {
             sandbox_policy: self.config.permissions.sandbox_policy.get().clone(),
             model: effective_mode.model().to_string(),
             effort: effective_mode.reasoning_effort(),
-            summary: codex_protocol::config_types::ReasoningSummary::Auto,
+            summary: None,
             final_output_json_schema: None,
             collaboration_mode,
             personality,
@@ -4493,7 +4487,8 @@ impl ChatWidget {
             | EventMsg::AgentMessageContentDelta(_)
             | EventMsg::ReasoningContentDelta(_)
             | EventMsg::ReasoningRawContentDelta(_)
-            | EventMsg::DynamicToolCallRequest(_) => {}
+            | EventMsg::DynamicToolCallRequest(_)
+            | EventMsg::DynamicToolCallResponse(_) => {}
             EventMsg::RealtimeConversationStarted(ev) => {
                 if !from_replay {
                     self.on_realtime_conversation_started(ev);
@@ -5157,7 +5152,7 @@ impl ChatWidget {
                 windows_sandbox_level: None,
                 model: Some(switch_model_for_events.clone()),
                 effort: Some(Some(default_effort)),
-                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
+                summary: None,
                 collaboration_mode: None,
                 personality: None,
             }));
@@ -5276,7 +5271,7 @@ impl ChatWidget {
                         sandbox_policy: None,
                         model: None,
                         effort: None,
-                        summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
+                        summary: None,
                         collaboration_mode: None,
                         windows_sandbox_level: None,
                         personality: Some(personality),
@@ -6189,7 +6184,7 @@ impl ChatWidget {
                 windows_sandbox_level: None,
                 model: None,
                 effort: None,
-                summary: Some(codex_protocol::config_types::ReasoningSummary::Auto),
+                summary: None,
                 collaboration_mode: None,
                 personality: None,
             }));

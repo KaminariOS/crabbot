@@ -3089,6 +3089,9 @@ impl CodexThread {
                             network_approval_context,
                             proposed_execpolicy_amendment: proposed_execpolicy_amendment
                                 .and_then(|value| serde_json::from_value(value).ok()),
+                            proposed_network_policy_amendments: None,
+                            additional_permissions: None,
+                            available_decisions: None,
                             parsed_cmd: Vec::new(),
                         },
                     ),
@@ -4306,6 +4309,7 @@ pub mod models {
 
 pub mod user_input {
     pub use codex_protocol::user_input::*;
+    pub const MAX_USER_INPUT_TEXT_CHARS: usize = 32000;
 }
 
 pub mod request_user_input {
@@ -5687,8 +5691,6 @@ mod session_log;
 mod shimmer;
 mod skills_helpers;
 mod slash_command;
-#[path = "bottom_pane/slash_commands.rs"]
-mod slash_commands;
 mod status;
 mod status_indicator_widget;
 mod streaming;
