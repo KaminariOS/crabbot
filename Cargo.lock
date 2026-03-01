@@ -755,25 +755,11 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabbot_codex_app_server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "tokio",
- "url",
-]
-
-[[package]]
-name = "crabbot_crypto"
-version = "0.1.0"
-
-[[package]]
 name = "crabbot_daemon"
 version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
- "crabbot_codex_app_server",
  "crabbot_protocol",
  "futures-util",
  "http-body-util",
@@ -788,27 +774,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabbot_observability"
-version = "0.1.0"
-dependencies = [
- "tracing",
-]
-
-[[package]]
 name = "crabbot_protocol"
 version = "0.1.0"
 dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
-]
-
-[[package]]
-name = "crabbot_storage"
-version = "0.1.0"
-dependencies = [
- "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]

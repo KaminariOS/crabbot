@@ -103,7 +103,6 @@ Daemon:
 - `tui`
 - `crates/protocol`
 - `schemas/openapi.yaml`
-- `expo-app` (legacy/in-repo app workspace still present in this checkout)
 - `docs/milestones`
 - `docs/adr`
 
