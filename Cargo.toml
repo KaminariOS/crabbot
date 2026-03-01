@@ -4,10 +4,6 @@ members = [
   "services/daemon",
   "services/cli",
   "crates/protocol",
-  "crates/codex_app_server",
-  "crates/crypto",
-  "crates/storage",
-  "crates/observability",
 ]
 resolver = "2"
 

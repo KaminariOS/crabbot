@@ -43,10 +43,7 @@ Behavior:
 
 ### 3. Shared Contracts and Runtime Crates
 
-- `crates/protocol`: API, WebSocket, daemon stream, and daemon RPC types
-- `crates/codex_app_server`: typed Codex app-server client and lifecycle/event mapping
-- `crates/storage`: in-memory adapters for Postgres-like records, presence, and object storage
-- `crates/crypto`, `crates/observability`: shared utility crates
+- `crates/protocol`: shared protocol/event types used by daemon, CLI, and TUI
 
 ### 4. Android App Repository
 
@@ -105,10 +102,6 @@ Daemon:
 - `services/cli`
 - `tui`
 - `crates/protocol`
-- `crates/codex_app_server`
-- `crates/storage`
-- `crates/crypto`
-- `crates/observability`
 - `schemas/openapi.yaml`
 - `expo-app` (legacy/in-repo app workspace still present in this checkout)
 - `docs/milestones`

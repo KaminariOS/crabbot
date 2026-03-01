@@ -7,7 +7,6 @@ license.workspace = true
 [dependencies]
 anyhow.workspace = true
 axum = { version = "0.8", features = ["ws"] }
-crabbot_codex_app_server = { path = "../../crates/codex_app_server" }
 crabbot_protocol = { path = "../../crates/protocol" }
 futures-util = "0.3"
 serde.workspace = true
