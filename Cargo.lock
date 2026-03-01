@@ -732,24 +732,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "crabbot_api"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "axum",
- "crabbot_protocol",
- "crabbot_storage",
- "futures-util",
- "http-body-util",
- "jsonwebtoken",
- "serde",
- "serde_json",
- "tokio",
- "tokio-tungstenite",
- "tower",
-]
-
-[[package]]
 name = "crabbot_cli"
 version = "0.1.0"
 dependencies = [

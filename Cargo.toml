@@ -1,7 +1,6 @@
 [workspace]
 members = [
   "tui",
-  "services/api",
   "services/daemon",
   "services/cli",
   "crates/protocol",
