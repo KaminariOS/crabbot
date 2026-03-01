@@ -392,23 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn openapi_contract_keeps_required_m1_paths() {
+    fn openapi_contract_is_present_and_parses() {
         let openapi: serde_json::Value =
             serde_yaml::from_str(include_str!("../../../schemas/openapi.yaml"))
                 .expect("openapi should parse as yaml");
 
-        assert!(openapi["paths"]["/health"]["get"].is_object());
-        assert!(openapi["paths"]["/auth/login"]["post"].is_object());
-        assert!(openapi["paths"]["/auth/refresh"]["post"].is_object());
-        assert!(openapi["paths"]["/sessions"]["get"].is_object());
-        assert!(openapi["paths"]["/sessions"]["post"].is_object());
-        assert!(openapi["paths"]["/sessions/{session_id}"]["get"].is_object());
-        assert!(openapi["paths"]["/sessions/{session_id}/messages"]["get"].is_object());
-        assert!(openapi["paths"]["/sessions/{session_id}/messages"]["post"].is_object());
-        assert!(openapi["paths"]["/realtime/bootstrap"]["get"].is_object());
-        assert!(
-            openapi["components"]["schemas"]["WebSocketEnvelope"]["properties"]["schema_version"]
-                .is_object()
-        );
+        assert_eq!(openapi["openapi"], serde_json::json!("3.1.0"));
+        assert!(openapi["info"]["title"].is_string());
+        assert!(openapi["paths"].is_object());
     }
 }

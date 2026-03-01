@@ -74,9 +74,6 @@ enum TopLevelCommand {
     Fork(ForkCommand),
     /// Manage the local Codex app-server daemon.
     Daemon(DaemonCommand),
-    /// Legacy compatibility subcommand.
-    #[command(hide = true)]
-    Codex(CodexCommand),
 }
 
 #[derive(Debug, Args)]
@@ -616,9 +613,6 @@ fn run_with_state_path(cli: Cli, state_path: &Path) -> Result<String> {
         }
         Some(TopLevelCommand::Daemon(command)) => {
             return run_daemon(command, state_path);
-        }
-        Some(TopLevelCommand::Codex(command)) => {
-            return run_codex(command, state_path);
         }
     };
     let output = output?;
@@ -1677,7 +1671,7 @@ fn render_attach_tui_with_columns_and_fallback(
                             output.push('\n');
                         }
                         output.push_str(&format!(
-                            "[session interrupted] resume with: crab codex resume --session-id {session_id}\n"
+                            "[session interrupted] resume with: crab resume {session_id}\n"
                         ));
                     }
 
@@ -1710,7 +1704,7 @@ fn render_attach_tui_with_columns_and_fallback(
                 ));
                 output.push_str(&format!("prompt: {}\n", payload.prompt));
                 output.push_str(&format!(
-                    "after approval, resume with: crab codex resume --session-id {session_id}\n"
+                    "after approval, resume with: crab resume {session_id}\n"
                 ));
             }
             DaemonStreamEvent::Heartbeat(_) => {}

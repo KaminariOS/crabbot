@@ -199,15 +199,6 @@ fn router_with_state(state: AppState) -> Router {
     Router::new()
         .route("/", get(app_server_ws_proxy))
         .route("/health", get(health))
-        .route("/v1/sessions/start", post(start_session))
-        .route("/v1/sessions/{session_id}/resume", post(resume_session))
-        .route(
-            "/v1/sessions/{session_id}/interrupt",
-            post(interrupt_session),
-        )
-        .route("/v1/sessions/{session_id}/prompt", post(prompt_session))
-        .route("/v1/sessions/{session_id}/status", get(session_status))
-        .route("/v1/sessions/{session_id}/stream", get(session_stream))
         .route("/v1/notifications/register", post(register_push_token))
         .with_state(state)
 }

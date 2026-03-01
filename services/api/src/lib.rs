@@ -16,8 +16,6 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::http::HeaderMap;
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
-use axum::routing::get;
-use axum::routing::post;
 use crabbot_protocol::ApiEvent;
 use crabbot_protocol::AppendMessageRequest;
 use crabbot_protocol::AppendMessageResponse;
@@ -137,19 +135,7 @@ pub fn router() -> Router {
 }
 
 fn router_with_state(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/auth/login", post(login))
-        .route("/auth/refresh", post(refresh))
-        .route("/sessions", get(list_sessions).post(create_session))
-        .route("/sessions/{session_id}", get(get_session))
-        .route(
-            "/sessions/{session_id}/messages",
-            get(list_messages).post(append_message),
-        )
-        .route("/realtime/bootstrap", get(realtime_bootstrap))
-        .route("/realtime", get(realtime_websocket))
-        .with_state(state)
+    Router::new().with_state(state)
 }
 
 fn now_unix_ms() -> u64 {
